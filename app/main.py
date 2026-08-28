@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -82,6 +83,36 @@ def build_orchestrator(
     )
 
 
+_SUPPORTED_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
+
+
+def _sanitize_proxy_environment() -> None:
+    """Make proxy environment variables consumable by httpx.
+
+    httpx only accepts ``http``/``https``/``socks5``/``socks5h`` proxy schemes and
+    raises ``ValueError`` at client construction time for anything else. Real
+    machines often export proxy variables with schemes httpx rejects, e.g. the
+    curl-style ``socks://host:port`` alias (urllib can surface it from either the
+    uppercase or lowercase ``*_proxy`` variable, whichever wins iteration order)
+    or ``socks4://``. Rewrite ``socks://`` to ``socks5://`` and drop variables
+    whose scheme httpx cannot use, so the application starts successfully whether
+    or not a proxy is configured.
+    """
+    for name in list(os.environ):
+        if not name.lower().endswith("_proxy"):
+            continue
+        value = os.environ[name]
+        if not value:
+            continue
+        lowered = value.lower()
+        if lowered.startswith("socks://"):
+            os.environ[name] = "socks5://" + value[len("socks://") :]
+        elif "://" in lowered:
+            scheme = lowered.split("://", 1)[0]
+            if scheme not in _SUPPORTED_PROXY_SCHEMES:
+                del os.environ[name]
+
+
 def create_app(
     settings: Settings | None = None,
     orchestrator: GenerationOrchestrator | None = None,
@@ -96,6 +127,9 @@ def create_app(
             application.state.orchestrator = orchestrator
             yield
             return
+        # Tolerate proxy environments httpx would otherwise reject at client
+        # construction (e.g. `socks://...` exported by common proxy clients).
+        _sanitize_proxy_environment()
         async with (
             httpx.AsyncClient() as client,
             httpx.AsyncClient(trust_env=False) as direct_client,

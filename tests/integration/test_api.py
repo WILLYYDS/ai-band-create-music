@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import httpx
@@ -15,6 +16,18 @@ async def _client(app) -> httpx.AsyncClient:
         transport=httpx.ASGITransport(app=app),
         base_url="http://testserver",
     )
+
+
+def _clear_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset every proxy variable inherited from the host shell.
+
+    Keeps the test deterministic regardless of the machine running it: a
+    developer's shell often exports ``http_proxy``/``all_proxy`` etc., and the
+    uppercase/lowercase variants can shadow the variables a test sets.
+    """
+    for name in list(os.environ):
+        if name.lower().endswith("_proxy"):
+            monkeypatch.delenv(name, raising=False)
 
 
 async def test_health_preserves_legacy_contract(tmp_path: Path) -> None:
@@ -211,11 +224,38 @@ async def test_audio_route_supports_byte_ranges(tmp_path: Path) -> None:
     assert response.headers["content-range"].startswith("bytes 0-2/")
 
 
-async def test_application_lifespan_accepts_socks_proxy_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "proxy_variables",
+    [
+        {},
+        {"ALL_PROXY": "socks5://127.0.0.1:7897"},
+        {"ALL_PROXY": "socks://127.0.0.1:7897"},
+        {"all_proxy": "socks://127.0.0.1:7897"},
+        {"ALL_PROXY": "socks5://127.0.0.1:7897", "all_proxy": "socks://127.0.0.1:7897"},
+        {"HTTP_PROXY": "http://127.0.0.1:7897", "HTTPS_PROXY": "http://127.0.0.1:7897"},
+        {"ALL_PROXY": "http://127.0.0.1:7897"},
+        {"ALL_PROXY": "socks4://127.0.0.1:7897"},
+    ],
+    ids=[
+        "no-proxy",
+        "socks5",
+        "socks-alias",
+        "lowercase-socks-alias",
+        "mixed-case-socks",
+        "http-https",
+        "http-all",
+        "unsupported-socks4-dropped",
+    ],
+)
+async def test_application_lifespan_accepts_proxy_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    proxy_variables: dict[str, str],
 ) -> None:
     settings = make_settings(tmp_path, enable_audio_splitting=False)
-    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:7897")
+    _clear_proxy_environment(monkeypatch)
+    for name, value in proxy_variables.items():
+        monkeypatch.setenv(name, value)
     app = create_app(settings)
 
     async with app.router.lifespan_context(app):
