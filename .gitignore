@@ -1,0 +1,37 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime artifacts and logs
+output/*
+!output/.gitkeep
+.torch-cache/
+*.log
+
+# Local editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# RVC models and indexes are large local runtime assets
+assets/rvc/
