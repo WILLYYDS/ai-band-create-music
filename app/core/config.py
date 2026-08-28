@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Literal
@@ -173,6 +174,8 @@ class Settings(BaseSettings):
         try:
             parsed = float(value) if value is not None else float(self.default_duration_minutes)
         except (TypeError, ValueError):
+            parsed = float(self.default_duration_minutes)
+        if not math.isfinite(parsed):
             parsed = float(self.default_duration_minutes)
         rounded = int(parsed + 0.5) if parsed >= 0 else int(parsed - 0.5)
         return min(self.max_duration_minutes, max(self.min_duration_minutes, rounded))

@@ -289,7 +289,7 @@ async def _save_upload(upload: UploadFile, destination: Path, limit: int) -> Non
             size += len(chunk)
             if size > limit:
                 raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                     detail=f"Audio exceeds the {limit // (1024 * 1024)} MB limit",
                 )
             output.write(chunk)

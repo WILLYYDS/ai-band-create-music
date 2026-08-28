@@ -260,6 +260,8 @@ def create_app(
                 _public_base_url(request, application_settings),
                 request_id,
             )
+        except HTTPException:
+            raise
         except CapacityExceededError as exc:
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -561,7 +563,7 @@ def _stem_trash_path(target, settings: Settings, job_id: str):
 
 def _parse_byte_range(value: str | None, file_size: int) -> tuple[int, int]:
     if not value:
-        return 0, max(0, file_size - 1)
+        return 0, file_size - 1
     if not value.startswith("bytes=") or "," in value:
         raise HTTPException(status_code=416, detail="Invalid byte range")
     start_text, separator, end_text = value[6:].partition("-")

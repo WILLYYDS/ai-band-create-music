@@ -65,6 +65,14 @@ async def test_generate_validates_prompt_boundaries(tmp_path: Path) -> None:
     assert "2000" in too_long.json()["message"]
 
 
+async def test_generate_preserves_not_ready_response(tmp_path: Path) -> None:
+    app = create_app(make_settings(tmp_path))
+    async with await _client(app) as client:
+        response = await client.post("/api/generate", json={"prompt": "ambient"})
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Application is not ready"
+
+
 async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> None:
     settings = make_settings(tmp_path, enable_audio_splitting=True)
     app = create_app(settings, make_orchestrator(settings))
@@ -222,6 +230,17 @@ async def test_audio_route_supports_byte_ranges(tmp_path: Path) -> None:
     assert response.status_code == 206
     assert response.content == b"ID3"
     assert response.headers["content-range"].startswith("bytes 0-2/")
+
+
+async def test_audio_route_returns_empty_file_with_zero_length(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    (settings.output_dir / "empty.mp3").touch()
+    async with await _client(app) as client:
+        response = await client.get("/output/empty.mp3")
+    assert response.status_code == 200
+    assert response.headers["content-length"] == "0"
+    assert response.content == b""
 
 
 @pytest.mark.parametrize(

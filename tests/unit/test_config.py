@@ -19,7 +19,17 @@ def test_default_port_and_prompt_limit(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [(None, 2), ("bad", 2), (0, 1), (1.4, 1), (1.5, 2), (4.8, 5), (20, 5)],
+    [
+        (None, 2),
+        ("bad", 2),
+        ("1e400", 2),
+        ("Infinity", 2),
+        (0, 1),
+        (1.4, 1),
+        (1.5, 2),
+        (4.8, 5),
+        (20, 5),
+    ],
 )
 def test_duration_matches_legacy_clamping(tmp_path: Path, value: object, expected: int) -> None:
     assert make_settings(tmp_path).normalize_duration(value) == expected
