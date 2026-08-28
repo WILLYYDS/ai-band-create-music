@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import math
 import os
 import re
 import shutil
@@ -81,8 +82,8 @@ def resolve_segment(model: str, configured: str, profile: SplitProfile) -> str:
         seconds = float(segment)
     except ValueError as exc:
         raise GenerationError(f"DEMUCS_SEGMENT 必须是正数，当前值：{segment}") from exc
-    if seconds <= 0:
-        raise GenerationError(f"DEMUCS_SEGMENT 必须大于 0，当前值：{segment}")
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise GenerationError(f"DEMUCS_SEGMENT 必须是有限正数，当前值：{segment}")
     maximum = MODEL_MAX_SEGMENT_SECONDS.get(model)
     return str(maximum) if maximum is not None and seconds > maximum else segment
 

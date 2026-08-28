@@ -62,6 +62,12 @@ def test_invalid_segment_is_rejected() -> None:
         resolve_segment("mdx_q", "invalid", SPLIT_PROFILES["fast"])
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e999"])
+def test_non_finite_segment_is_rejected(value: str) -> None:
+    with pytest.raises(GenerationError, match="有限正数"):
+        resolve_segment("mdx_q", value, SPLIT_PROFILES["fast"])
+
+
 def test_stem_outputs_include_original_music_name() -> None:
     assert stem_output_files(Path("普通话摇滚.mp3")) == {
         "vocal": "普通话摇滚_vocal.mp3",

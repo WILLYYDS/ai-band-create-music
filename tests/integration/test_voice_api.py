@@ -34,9 +34,7 @@ async def test_voice_conversion_download_delete_and_restore(tmp_path: Path) -> N
             "/api/voice/result",
             data={"filename": "real_song_rvc_vocal.wav"},
         )
-        direct_download = await client.get(
-            "/output/rvc/real_song_rvc_vocal.wav"
-        )
+        direct_download = await client.get("/output/rvc/real_song_rvc_vocal.wav")
         deleted = await client.request(
             "DELETE",
             "/api/voice/result",

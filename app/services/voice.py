@@ -188,13 +188,9 @@ def install_voice_api(
     async def convert_voice(
         request: Request,
         file: Annotated[UploadFile | None, File(description="Input audio file")] = None,
-        audio: Annotated[
-            UploadFile | None, File(description="Alias of the 'file' field")
-        ] = None,
+        audio: Annotated[UploadFile | None, File(description="Alias of the 'file' field")] = None,
         f0_up_key: Annotated[int, Form(ge=-24, le=24)] = 0,
-        f0_method: Annotated[
-            Literal["harvest", "pm", "crepe", "rmvpe"], Form()
-        ] = "rmvpe",
+        f0_method: Annotated[Literal["harvest", "pm", "crepe", "rmvpe"], Form()] = "rmvpe",
         index_rate: Annotated[float, Form(ge=0.0, le=1.0)] = 0.75,
         filter_radius: Annotated[int, Form(ge=0, le=7)] = 3,
         resample_sr: Annotated[int, Form(ge=0, le=96000)] = 0,
