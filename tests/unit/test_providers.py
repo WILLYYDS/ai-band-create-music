@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 
+from app.core.errors import GenerationError
 from app.services.providers import (
     ElevenLabsMusicProvider,
     GenericMusicProvider,
@@ -13,6 +15,11 @@ from app.services.providers import (
     extract_task_id,
 )
 from tests.helpers import make_settings
+
+
+class StreamingErrorBody(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b'{"detail":{"message":"unauthorized"}}'
 
 
 def test_provider_response_extractors_cover_legacy_shapes() -> None:
@@ -57,6 +64,23 @@ async def test_elevenlabs_uses_composition_plan_and_streams_audio(tmp_path: Path
     assert "composition_plan" in music_body
     assert "prompt" not in music_body
     assert "clear vocal articulation" in music_body["composition_plan"]["positive_global_styles"]
+
+
+async def test_elevenlabs_reads_streaming_error_before_building_message(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, stream=StreamingErrorBody())
+
+    settings = make_settings(
+        tmp_path,
+        music_api_mode="real",
+        music_provider="elevenlabs_music",
+        elevenlabs_api_key="invalid",
+        elevenlabs_music_base_url="https://eleven.test",
+        elevenlabs_use_composition_plan=False,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match="music_generation 权限"):
+            await ElevenLabsMusicProvider(settings, client).generate("[Genre: Rock]", 2, "rock")
 
 
 async def test_generic_provider_accepts_direct_audio_url(tmp_path: Path) -> None:

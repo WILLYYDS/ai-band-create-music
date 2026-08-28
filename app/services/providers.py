@@ -277,6 +277,8 @@ class ElevenLabsMusicProvider:
                 headers=self._headers(accept_audio=True),
                 timeout=self._settings.music_api_timeout_seconds,
             ) as response:
+                if not response.is_success:
+                    await response.aread()
                 response.raise_for_status()
                 await write_stream_atomically(
                     response.aiter_bytes(), target, "ElevenLabs 音乐生成接口返回空音频。"

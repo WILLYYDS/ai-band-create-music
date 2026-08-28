@@ -425,8 +425,15 @@ class OpenAICompatiblePromptExpander:
         )
         response.raise_for_status()
         data = response.json()
-        choice = data.get("choices", [{}])[0]
+        if not isinstance(data, dict):
+            raise ValueError("LLM response JSON must be an object")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ValueError("LLM response choices must contain an object")
+        choice = choices[0]
         message = choice.get("message", {})
+        if not isinstance(message, dict):
+            raise ValueError("LLM response message must be an object")
         content = message.get("content")
         if isinstance(content, list):
             content = "\n".join(

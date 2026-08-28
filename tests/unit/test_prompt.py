@@ -209,6 +209,23 @@ async def test_prompt_expander_reports_actionable_read_timeout(tmp_path: Path) -
             await OpenAICompatiblePromptExpander(settings, client).expand("普通话摇滚")
 
 
+@pytest.mark.parametrize("response_json", [[], "unexpected"])
+async def test_prompt_expander_rejects_non_object_json(
+    tmp_path: Path, response_json: object
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=response_json)
+
+    settings = make_settings(
+        tmp_path,
+        llm_api_key="secret",
+        llm_base_url="https://llm.test/v1",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match="LLM response JSON must be an object"):
+            await OpenAICompatiblePromptExpander(settings, client).expand("普通话摇滚")
+
+
 def test_planning_prompt_adds_clear_vocal_requirements() -> None:
     prompt = build_elevenlabs_planning_prompt("[Genre: Rock]", 3, True)
     assert "Target duration: 3 minutes" in prompt
