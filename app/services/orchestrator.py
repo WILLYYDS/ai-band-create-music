@@ -33,17 +33,23 @@ class GenerationCapacity:
     def active(self) -> int:
         return self._active
 
-    @asynccontextmanager
-    async def slot(self) -> AsyncIterator[None]:
+    async def acquire(self) -> None:
         async with self._lock:
             if self._active >= self.maximum:
                 raise CapacityExceededError("当前生成任务过多，请稍后重试。")
             self._active += 1
+
+    async def release(self) -> None:
+        async with self._lock:
+            self._active = max(0, self._active - 1)
+
+    @asynccontextmanager
+    async def slot(self) -> AsyncIterator[None]:
+        await self.acquire()
         try:
             yield
         finally:
-            async with self._lock:
-                self._active = max(0, self._active - 1)
+            await self.release()
 
 
 class GenerationOrchestrator:
@@ -73,6 +79,7 @@ class GenerationOrchestrator:
         *,
         job_id: str | None = None,
         progress: ProgressCallback | None = None,
+        capacity_reserved: bool = False,
     ) -> dict[str, Any]:
         job_id = job_id or f"job_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
 
@@ -100,10 +107,7 @@ class GenerationOrchestrator:
             if not self.settings.enable_audio_splitting:
                 stems = {name: full_url for name in STEM_NAMES}
                 waveform_paths = {"full": full_path}
-                split_debug: dict[str, Any] = {
-                    "splitterStdout": "",
-                    "splitterStderr": "",
-                }
+                split_debug: dict[str, Any] = {}
                 split_enabled = False
             else:
                 await report("splitting", 65, "Demucs 正在分离音轨")
@@ -120,8 +124,6 @@ class GenerationOrchestrator:
                     for name, file_name in split_result.files.items()
                 }
                 split_debug = {
-                    "splitterStdout": split_result.stdout,
-                    "splitterStderr": split_result.stderr,
                     "splitterDurationMs": split_result.duration_ms,
                 }
                 split_enabled = True
@@ -146,9 +148,14 @@ class GenerationOrchestrator:
             logger.info("generation succeeded job_id=%s request_id=%s", job_id, request_id)
             return response
 
-        async with self.capacity.slot():
+        async def dispatch() -> dict[str, Any]:
             try:
                 return await self.task_dispatcher.submit(job_id, execute)
             except Exception:
                 await self.events.publish(GenerationEvent("generation.failed", job_id, request_id))
                 raise
+
+        if capacity_reserved:
+            return await dispatch()
+        async with self.capacity.slot():
+            return await dispatch()

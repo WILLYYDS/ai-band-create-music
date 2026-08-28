@@ -16,6 +16,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.core.config import Settings
 from app.core.errors import CapacityExceededError, GenerationError
@@ -39,6 +41,68 @@ from app.services.stems import DemucsStemSeparator
 from app.services.voice import RVCEngine, install_voice_api
 
 logger = logging.getLogger(__name__)
+
+
+class RequestSizeLimitMiddleware:
+    def __init__(self, app: ASGIApp, default_limit: int, voice_limit: int) -> None:
+        self.app = app
+        self.default_limit = default_limit
+        self.voice_limit = voice_limit
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        limit = self.voice_limit if scope["path"] == "/api/voice/convert" else self.default_limit
+        content_length = Headers(scope=scope).get("content-length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+                if declared_size < 0:
+                    raise ValueError
+            except ValueError:
+                await JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"success": False, "message": "Content-Length 无效。"},
+                )(scope, receive, send)
+                return
+            if declared_size > limit:
+                await JSONResponse(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    content={"success": False, "message": "请求体过大。"},
+                )(scope, receive, send)
+                return
+
+        received_size = 0
+        too_large = False
+
+        async def limited_receive():
+            nonlocal received_size, too_large
+            if too_large:
+                return {"type": "http.disconnect"}
+            message = await receive()
+            if message["type"] == "http.request":
+                received_size += len(message.get("body", b""))
+                if received_size > limit:
+                    too_large = True
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def limited_send(message):
+            if not too_large:
+                await send(message)
+
+        try:
+            await self.app(scope, limited_receive, limited_send)
+        except Exception:
+            if not too_large:
+                raise
+        if too_large:
+            await JSONResponse(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                content={"success": False, "message": "请求体过大。"},
+            )(scope, receive, send)
 
 
 @dataclass(slots=True)
@@ -157,33 +221,19 @@ def create_app(
     if orchestrator is not None:
         application.state.orchestrator = orchestrator
 
+    cors_origins = application_settings.cors_origin_list
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=application_settings.cors_origin_list,
-        allow_credentials=application_settings.cors_origin_list != ["*"],
+        allow_origins=cors_origins,
+        allow_credentials="*" not in cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    @application.middleware("http")
-    async def reject_oversized_requests(request: Request, call_next):
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                limit = (
-                    application_settings.rvc_max_upload_bytes + 1024 * 1024
-                    if request.url.path == "/api/voice/convert"
-                    else application_settings.request_max_bytes
-                )
-                too_large = int(content_length) > limit
-            except ValueError:
-                too_large = False
-            if too_large:
-                return JSONResponse(
-                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                    content={"success": False, "message": "请求体过大。"},
-                )
-        return await call_next(request)
+    application.add_middleware(
+        RequestSizeLimitMiddleware,
+        default_limit=application_settings.request_max_bytes,
+        voice_limit=application_settings.rvc_max_upload_bytes + 1024 * 1024,
+    )
 
     @application.get("/api/health")
     async def health(request: Request) -> dict[str, object]:
@@ -295,20 +345,21 @@ def create_app(
                 content={"success": False, "message": str(exc)},
             )
 
-        jobs: dict[str, GenerationJob] = request.app.state.jobs
-        active_count = sum(job.status in {"pending", "running"} for job in jobs.values())
-        if active_count >= _orchestrator(request).capacity.maximum:
+        active_orchestrator = _orchestrator(request)
+        try:
+            await active_orchestrator.capacity.acquire()
+        except CapacityExceededError:
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 content={"success": False, "message": "当前生成任务过多，请稍后重试。"},
             )
 
+        jobs: dict[str, GenerationJob] = request.app.state.jobs
         job_id = f"job_{int(asyncio.get_running_loop().time() * 1000)}_{uuid4().hex[:8]}"
         job = GenerationJob(job_id)
         jobs[job_id] = job
         base_url = _public_base_url(request, application_settings)
         request_id = request.headers.get("X-Request-ID") or uuid4().hex
-        active_orchestrator = _orchestrator(request)
 
         async def report(stage: str, progress: int, message: str) -> None:
             job.status = "running"
@@ -327,6 +378,7 @@ def create_app(
                     request_id,
                     job_id=job_id,
                     progress=report,
+                    capacity_reserved=True,
                 )
                 job.status = "succeeded"
                 job.stage = "completed"
@@ -342,6 +394,8 @@ def create_app(
                 job.stage = "failed"
                 job.message = "音乐生成失败"
                 job.error = str(exc)
+            finally:
+                await active_orchestrator.capacity.release()
 
         job.task = asyncio.create_task(execute(), name=job_id)
         return {"jobId": job_id, "status": job.status}
@@ -473,7 +527,11 @@ def create_app(
             target = _output_path_from_url(deleted["url"], application_settings)
             trash = _stem_trash_path(target, application_settings, job_id)
             if not trash.is_file():
-                raise OSError("deleted stem file is missing")
+                del job.deleted_stems[stem_name]
+                return JSONResponse(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    content={"success": False, "message": "删除的音轨文件已不存在，无法恢复。"},
+                )
             target.parent.mkdir(parents=True, exist_ok=True)
             trash.replace(target)
         except (OSError, ValueError):

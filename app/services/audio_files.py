@@ -70,10 +70,15 @@ async def download_audio(
     trusted_local_root: Path,
 ) -> Path:
     if not audio_url.lower().startswith(("http://", "https://")):
+        trusted_local_root = trusted_local_root.resolve()
         local_path = Path(audio_url).expanduser()
         if not local_path.is_absolute():
             local_path = trusted_local_root / local_path
         local_path = local_path.resolve()
+        try:
+            local_path.relative_to(trusted_local_root)
+        except ValueError as exc:
+            raise GenerationError("音乐生成接口返回了不受信任的本地音频路径。") from exc
         require_readable_file(local_path, "音乐生成接口返回的本地音频文件不可读")
         return local_path
 

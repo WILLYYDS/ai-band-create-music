@@ -52,6 +52,15 @@ async def test_health_preserves_legacy_contract(tmp_path: Path) -> None:
     }
 
 
+async def test_cors_wildcard_never_allows_credentials(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, cors_origins="*,https://ui.test")
+    app = create_app(settings, make_orchestrator(settings))
+    async with await _client(app) as client:
+        response = await client.get("/api/health", headers={"Origin": "https://evil.test"})
+    assert response.headers["access-control-allow-origin"] == "*"
+    assert "access-control-allow-credentials" not in response.headers
+
+
 async def test_generate_validates_prompt_boundaries(tmp_path: Path) -> None:
     settings = make_settings(tmp_path, prompt_max_chars=2000)
     app = create_app(settings, make_orchestrator(settings))
@@ -88,6 +97,8 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
         assert body["stems"]["vocal"].endswith("_vocal.mp3")
         assert body["stems"]["drums"].endswith("_drums.mp3")
         assert body["waveforms"] == {}
+        assert "splitterStdout" not in body["debug"]
+        assert "splitterStderr" not in body["debug"]
         audio = await client.get(body["stems"]["vocal"])
     assert audio.status_code == 200
     assert audio.headers["content-type"].startswith("audio/mpeg")
@@ -132,9 +143,7 @@ async def test_async_job_can_be_cancelled(tmp_path: Path) -> None:
         created = await client.post("/api/jobs", json={"prompt": "取消任务"})
         job_id = created.json()["jobId"]
         await blocker.started.wait()
-        cancelled = await client.patch(
-            f"/api/jobs/{job_id}", json={"status": "cancelled"}
-        )
+        cancelled = await client.patch(f"/api/jobs/{job_id}", json={"status": "cancelled"})
         await asyncio.sleep(0)
 
     assert cancelled.status_code == 200
@@ -158,9 +167,7 @@ async def test_async_job_deleted_stem_stays_deleted(tmp_path: Path) -> None:
         deleted = await client.delete(f"/api/jobs/{job_id}/stems/vocal")
         refreshed = await client.get(f"/api/jobs/{job_id}")
         missing_file = await client.get(vocal_url)
-        hidden_trash = await client.get(
-            f"/output/.trash/{job_id}/{Path(vocal_url).name}"
-        )
+        hidden_trash = await client.get(f"/output/.trash/{job_id}/{Path(vocal_url).name}")
         restored = await client.put(f"/api/jobs/{job_id}/stems/vocal")
         restored_file = await client.get(vocal_url)
 
@@ -172,6 +179,31 @@ async def test_async_job_deleted_stem_stays_deleted(tmp_path: Path) -> None:
     assert restored.status_code == 200
     assert "vocal" in restored.json()["result"]["stems"]
     assert restored_file.status_code == 200
+
+
+async def test_restore_forgets_missing_trash_file(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    app = create_app(settings, make_orchestrator(settings))
+    async with await _client(app) as client:
+        created = await client.post("/api/jobs", json={"prompt": "永久删除分轨"})
+        job_id = created.json()["jobId"]
+        for _ in range(20):
+            completed = await client.get(f"/api/jobs/{job_id}")
+            if completed.json()["status"] == "succeeded":
+                break
+            await asyncio.sleep(0)
+
+        vocal_url = completed.json()["result"]["stems"]["vocal"]
+        await client.delete(f"/api/jobs/{job_id}/stems/vocal")
+        trash = settings.output_dir / ".trash" / job_id / Path(vocal_url).name
+        trash.unlink()
+        missing = await client.put(f"/api/jobs/{job_id}/stems/vocal")
+        retried = await client.put(f"/api/jobs/{job_id}/stems/vocal")
+
+    assert missing.status_code == 404
+    assert "已不存在" in missing.json()["message"]
+    assert retried.status_code == 404
+    assert "没有可恢复" in retried.json()["message"]
 
 
 async def test_split_disabled_returns_full_track_compatibility_stems(tmp_path: Path) -> None:
@@ -193,8 +225,38 @@ async def test_request_size_limit_returns_413(tmp_path: Path) -> None:
             content=b"x" * 1025,
             headers={"content-type": "application/json"},
         )
-    assert response.status_code == 413
+    assert response.status_code == 413, response.text
     assert response.json()["success"] is False
+
+
+async def test_streamed_request_size_limit_returns_413(tmp_path: Path) -> None:
+    async def oversized_body():
+        yield b'{"prompt":"' + b"x" * 600
+        yield b"x" * 600 + b'"}'
+
+    settings = make_settings(tmp_path, request_max_bytes=1024)
+    app = create_app(settings, make_orchestrator(settings))
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            content=oversized_body(),
+            headers={"content-type": "application/json"},
+        )
+    assert response.status_code == 413, response.text
+    assert response.json()["success"] is False
+
+
+async def test_invalid_content_length_returns_400(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            content=b"{" + b'"prompt":"ambient"}',
+            headers={"content-type": "application/json", "content-length": "invalid"},
+        )
+    assert response.status_code == 400
+    assert "Content-Length" in response.json()["message"]
 
 
 async def test_concurrent_generation_returns_429_without_queueing(tmp_path: Path) -> None:
@@ -210,6 +272,22 @@ async def test_concurrent_generation_returns_429_without_queueing(tmp_path: Path
         first_response = await first
     assert second.status_code == 429
     assert first_response.status_code == 200
+    assert orchestrator.capacity.active == 0
+
+
+async def test_sync_generation_blocks_job_admission(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, max_concurrent_generations=1)
+    blocker = BlockingPromptExpander()
+    orchestrator = make_orchestrator(settings, prompt_expander=blocker)
+    app = create_app(settings, orchestrator)
+    async with await _client(app) as client:
+        generation = asyncio.create_task(client.post("/api/generate", json={"prompt": "sync"}))
+        await blocker.started.wait()
+        job = await client.post("/api/jobs", json={"prompt": "job"})
+        blocker.release.set()
+        generated = await generation
+    assert job.status_code == 429
+    assert generated.status_code == 200
     assert orchestrator.capacity.active == 0
 
 
