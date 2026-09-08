@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -8,7 +9,12 @@ import httpx
 import pytest
 
 from app.main import create_app
-from tests.helpers import BlockingPromptExpander, make_orchestrator, make_settings
+from tests.helpers import (
+    BlockingPromptExpander,
+    StubMusicProvider,
+    make_orchestrator,
+    make_settings,
+)
 
 
 async def _client(app) -> httpx.AsyncClient:
@@ -92,6 +98,8 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
         )
         assert response.status_code == 200
         body = response.json()
+        assert body["durationMinutes"] == 3
+        assert body["debug"]["music"]["durationMinutes"] == 3
         assert body["splitEnabled"] is True
         assert list(body["stems"]) == ["vocal", "drums", "bass", "other"]
         assert body["stems"]["vocal"].endswith("_vocal.mp3")
@@ -104,6 +112,57 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
     assert audio.headers["content-type"].startswith("audio/mpeg")
     assert audio.headers["cache-control"] == "no-store"
     assert audio.content == b"ID3-stem-audio"
+
+
+async def test_generate_preserves_auto_duration(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    app = create_app(settings, make_orchestrator(settings))
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            json={"prompt": "自动长度普通话歌曲", "durationMinutes": "auto"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["durationMinutes"] == "auto"
+    assert response.json()["debug"]["music"]["durationMinutes"] is None
+
+
+async def test_generate_selects_provider_per_request(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    orchestrator = make_orchestrator(settings)
+    orchestrator.music_providers = {
+        name: StubMusicProvider(settings.mock_full_song_path, name)
+        for name in ("minimax_music", "elevenlabs_music")
+    }
+    app = create_app(settings, orchestrator)
+
+    async with await _client(app) as client:
+        for provider in orchestrator.music_providers:
+            response = await client.post(
+                "/api/generate", json={"prompt": "rock", "provider": provider}
+            )
+            assert response.status_code == 200
+            assert response.json()["debug"]["music"]["provider"] == provider
+
+
+async def test_ai_talk_lyrics_are_tagged_before_music_generation(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    orchestrator = make_orchestrator(settings)
+    provider = StubMusicProvider(settings.mock_full_song_path)
+    orchestrator.music_provider = provider
+    app = create_app(settings, orchestrator)
+
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            json={"prompt": ("[歌词与创作内容]\n第一句\n第二句\n\n[风格要求]\n梦幻流行")},
+        )
+
+    assert response.status_code == 200
+    assert provider.user_prompt == (
+        "[歌词与创作内容]\n[Verse]\n第一句\n第二句\n\n[风格要求]\n梦幻流行"
+    )
 
 
 async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
@@ -120,6 +179,15 @@ async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
         assert running.json()["status"] == "running"
         assert running.json()["stage"] == "expanding_prompt"
         assert running.json()["progress"] == 10
+        assert running.json()["prompt"] == "真实进度"
+        assert running.json()["structuredPrompt"] is None
+        prompt_file = settings.output_dir / "jobs" / job_id / "prompts.json"
+        assert json.loads(prompt_file.read_text(encoding="utf-8")) == {
+            "jobId": job_id,
+            "prompt": "真实进度",
+            "structuredPrompt": None,
+            "lyrics": None,
+        }
 
         blocker.release.set()
         for _ in range(20):
@@ -130,6 +198,15 @@ async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
 
     body = completed.json()
     assert body["progress"] == 100
+    assert body["prompt"] == "真实进度"
+    assert body["structuredPrompt"] == "[Genre: Test]"
+    assert body["lyrics"] == "[Verse]\n自动生成的测试歌词"
+    assert json.loads(prompt_file.read_text(encoding="utf-8")) == {
+        "jobId": job_id,
+        "prompt": "真实进度",
+        "structuredPrompt": "[Genre: Test]",
+        "lyrics": "[Verse]\n自动生成的测试歌词",
+    }
     assert body["result"]["splitEnabled"] is True
     assert set(body["result"]["stems"]) == {"vocal", "drums", "bass", "other"}
 

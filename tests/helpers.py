@@ -15,6 +15,19 @@ class StubPromptExpander:
     async def expand(self, user_prompt: str) -> str:
         return f"[Genre: Test], [Source: {user_prompt}]"
 
+    async def prepare(
+        self, user_prompt: str, duration_minutes: int | None = None
+    ) -> tuple[str, str]:
+        if user_prompt.startswith("[歌词与创作内容]"):
+            lyrics = user_prompt.split("\n\n[风格要求]", 1)[0].split("\n", 1)[1]
+            return await self.expand(user_prompt), f"[Verse]\n{lyrics}"
+        return await self.expand(user_prompt), "[Verse]\n自动生成的测试歌词"
+
+    async def write_lyrics(
+        self, structured_prompt: str, user_prompt: str, duration_minutes: int
+    ) -> str:
+        return "[Verse]\n自动生成的测试歌词"
+
 
 class BlockingPromptExpander:
     def __init__(self) -> None:
@@ -26,15 +39,30 @@ class BlockingPromptExpander:
         await self.release.wait()
         return "[Genre: Test]"
 
+    async def prepare(
+        self, user_prompt: str, duration_minutes: int | None = None
+    ) -> tuple[str, str]:
+        return await self.expand(user_prompt), "[Verse]\n自动生成的测试歌词"
+
+    async def write_lyrics(
+        self, structured_prompt: str, user_prompt: str, duration_minutes: int
+    ) -> str:
+        return "[Verse]\n自动生成的测试歌词"
+
 
 class StubMusicProvider:
-    def __init__(self, source: Path) -> None:
+    def __init__(self, source: Path, name: str = "stub") -> None:
         self.source = source
+        self.name = name
+        self.user_prompt = ""
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int, user_prompt: str
+        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
     ) -> MusicResult:
-        return MusicResult(self.source, {"provider": "stub"})
+        self.user_prompt = user_prompt
+        return MusicResult(
+            self.source, {"provider": self.name, "durationMinutes": duration_minutes}
+        )
 
 
 class StubStemSeparator:

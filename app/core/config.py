@@ -55,7 +55,9 @@ class Settings(BaseSettings):
     llm_disable_thinking: bool = True
 
     music_api_mode: Literal["mock", "real"] = "mock"
-    music_provider: Literal["generic", "suno_api", "elevenlabs_music"] = "generic"
+    music_provider: Literal["generic", "suno_api", "elevenlabs_music", "minimax_music"] = (
+        "minimax_music"
+    )
     mock_full_song_path: Path = PROJECT_ROOT / "output" / "mock_full.mp3"
     music_api_key: SecretStr | None = None
     music_api_base_url: str = ""
@@ -82,6 +84,12 @@ class Settings(BaseSettings):
     suno_model: str = "v4.5-all"
     suno_model_fallbacks: str = ""
     suno_use_default_model_fallbacks: bool = False
+
+    minimax_base_url: str = "http://127.0.0.1:8111"
+    minimax_model: str = "MiniMaxAI/MiniMax-Music3"
+    minimax_seed: int = 42
+    minimax_num_inference_steps: int = Field(default=30, ge=1, le=100)
+    minimax_timeout_seconds: float = Field(default=7200, gt=0)
 
     enable_audio_splitting: bool = False
     split_profile: Literal["fast", "balanced", "quality"] = "fast"
@@ -138,6 +146,7 @@ class Settings(BaseSettings):
         "public_base_url",
         "llm_base_url",
         "elevenlabs_music_base_url",
+        "minimax_base_url",
         "music_api_base_url",
     )
     @classmethod

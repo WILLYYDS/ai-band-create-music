@@ -108,6 +108,9 @@ class RequestSizeLimitMiddleware:
 @dataclass(slots=True)
 class GenerationJob:
     job_id: str
+    prompt: str
+    structured_prompt: str | None = None
+    lyrics: str | None = None
     status: str = "pending"
     stage: str = "pending"
     progress: int = 0
@@ -120,6 +123,9 @@ class GenerationJob:
     def response(self) -> dict[str, Any]:
         return {
             "jobId": self.job_id,
+            "prompt": self.prompt,
+            "structuredPrompt": self.structured_prompt,
+            "lyrics": self.lyrics,
             "status": self.status,
             "stage": self.stage,
             "progress": self.progress,
@@ -132,18 +138,24 @@ class GenerationJob:
 def build_orchestrator(
     settings: Settings,
     client: httpx.AsyncClient,
-    elevenlabs_client: httpx.AsyncClient | None = None,
+    direct_client: httpx.AsyncClient | None = None,
 ) -> GenerationOrchestrator:
     # Instantiate the reserved local cache so the wiring point stays explicit. The
     # current pipeline intentionally performs no cache reads or writes.
     NullCache()
+    music_providers = {
+        name: create_music_provider(settings, client, direct_client, name)
+        for name in ("minimax_music", "elevenlabs_music")
+    }
     return GenerationOrchestrator(
         settings=settings,
         prompt_expander=OpenAICompatiblePromptExpander(settings, client),
-        music_provider=create_music_provider(settings, client, elevenlabs_client),
+        music_provider=music_providers.get(settings.music_provider)
+        or create_music_provider(settings, client, direct_client),
         stem_separator=DemucsStemSeparator(settings),
         task_dispatcher=InlineTaskDispatcher(),
         events=NullEventPublisher(),
+        music_providers=music_providers,
     )
 
 
@@ -198,11 +210,8 @@ def create_app(
             httpx.AsyncClient() as client,
             httpx.AsyncClient(trust_env=False) as direct_client,
         ):
-            elevenlabs_client = (
-                direct_client if application_settings.elevenlabs_bypass_global_proxy else client
-            )
             application.state.orchestrator = build_orchestrator(
-                application_settings, client, elevenlabs_client
+                application_settings, client, direct_client
             )
             yield
 
@@ -309,6 +318,7 @@ def create_app(
                 duration,
                 _public_base_url(request, application_settings),
                 request_id,
+                provider=payload.provider,
             )
         except HTTPException:
             raise
@@ -356,16 +366,26 @@ def create_app(
 
         jobs: dict[str, GenerationJob] = request.app.state.jobs
         job_id = f"job_{int(asyncio.get_running_loop().time() * 1000)}_{uuid4().hex[:8]}"
-        job = GenerationJob(job_id)
+        job = GenerationJob(job_id=job_id, prompt=prompt)
         jobs[job_id] = job
         base_url = _public_base_url(request, application_settings)
         request_id = request.headers.get("X-Request-ID") or uuid4().hex
 
-        async def report(stage: str, progress: int, message: str) -> None:
+        async def report(
+            stage: str,
+            progress: int,
+            message: str,
+            structured_prompt: str | None,
+            lyrics: str | None,
+        ) -> None:
             job.status = "running"
             job.stage = stage
             job.progress = progress
             job.message = message
+            if structured_prompt is not None:
+                job.structured_prompt = structured_prompt
+            if lyrics is not None:
+                job.lyrics = lyrics
 
         async def execute() -> None:
             try:
@@ -379,6 +399,7 @@ def create_app(
                     job_id=job_id,
                     progress=report,
                     capacity_reserved=True,
+                    provider=payload.provider,
                 )
                 job.status = "succeeded"
                 job.stage = "completed"
@@ -591,12 +612,17 @@ def _orchestrator(request: Request) -> GenerationOrchestrator:
     return active
 
 
-def _generation_parameters(payload: GenerateRequest, settings: Settings) -> tuple[str, int]:
+def _generation_parameters(payload: GenerateRequest, settings: Settings) -> tuple[str, int | None]:
     prompt = payload.prompt.strip()
     if not prompt:
         raise ValueError("prompt 不能为空，请输入歌曲风格描述。")
     if len(prompt) > settings.prompt_max_chars:
         raise ValueError(f"prompt 不能超过 {settings.prompt_max_chars} 个字符。")
+    if (
+        isinstance(payload.durationMinutes, str)
+        and payload.durationMinutes.strip().lower() == "auto"
+    ):
+        return prompt, None
     return prompt, settings.normalize_duration(payload.durationMinutes)
 
 

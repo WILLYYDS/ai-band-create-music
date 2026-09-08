@@ -15,6 +15,16 @@ def test_default_port_and_prompt_limit(tmp_path: Path) -> None:
     assert settings.llm_disable_thinking is True
     assert settings.task_backend == "inline"
     assert settings.cache_backend == "none"
+    assert settings.music_provider == "minimax_music"
+
+
+def test_minimax_music_defaults_and_provider(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, music_provider="minimax_music")
+    assert settings.minimax_base_url == "http://127.0.0.1:8111"
+    assert settings.minimax_model == "MiniMaxAI/MiniMax-Music3"
+    assert settings.minimax_seed == 42
+    assert settings.minimax_num_inference_steps == 30
+    assert settings.minimax_timeout_seconds == 7200
 
 
 @pytest.mark.parametrize(

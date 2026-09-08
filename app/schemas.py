@@ -10,6 +10,7 @@ class GenerateRequest(BaseModel):
 
     prompt: str
     durationMinutes: int | float | str | None = None
+    provider: Literal["minimax_music", "elevenlabs_music"] | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -21,8 +22,9 @@ class GenerateResponse(BaseModel):
     success: bool = True
     jobId: str
     prompt: str
-    durationMinutes: int
+    durationMinutes: int | Literal["auto"]
     structuredPrompt: str
+    lyrics: str
     fullTrack: str
     stems: dict[str, str]
     stemUrls: list[str]
@@ -44,6 +46,9 @@ class UpdateGenerationJobRequest(BaseModel):
 
 class GenerationJobResponse(BaseModel):
     jobId: str
+    prompt: str
+    structuredPrompt: str | None = None
+    lyrics: str | None = None
     status: Literal["pending", "running", "succeeded", "failed", "cancelled"]
     stage: str
     progress: int

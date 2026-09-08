@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -14,13 +15,40 @@ from app.core.errors import CapacityExceededError
 from app.infrastructure.events import EventPublisher, GenerationEvent
 from app.infrastructure.queue import TaskDispatcher
 from app.services.audio_files import build_public_audio_url, ensure_file_under_root
-from app.services.prompt import PromptExpander
+from app.services.prompt import PromptExpander, split_generation_prompt
 from app.services.providers import MusicProvider
 from app.services.stems import STEM_NAMES, StemSeparator
 from app.services.waveforms import extract_waveforms
 
 logger = logging.getLogger(__name__)
-ProgressCallback = Callable[[str, int, str], Awaitable[None]]
+ProgressCallback = Callable[[str, int, str, str | None, str | None], Awaitable[None]]
+
+
+def save_job_prompts(
+    output_dir: Path,
+    job_id: str,
+    prompt: str,
+    structured_prompt: str | None = None,
+    lyrics: str | None = None,
+) -> Path:
+    target = output_dir / "jobs" / job_id / "prompts.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "jobId": job_id,
+                "prompt": prompt,
+                "structuredPrompt": structured_prompt,
+                "lyrics": lyrics,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return target
 
 
 class GenerationCapacity:
@@ -61,10 +89,12 @@ class GenerationOrchestrator:
         stem_separator: StemSeparator,
         task_dispatcher: TaskDispatcher,
         events: EventPublisher,
+        music_providers: dict[str, MusicProvider] | None = None,
     ) -> None:
         self.settings = settings
         self.prompt_expander = prompt_expander
         self.music_provider = music_provider
+        self.music_providers = music_providers or {}
         self.stem_separator = stem_separator
         self.task_dispatcher = task_dispatcher
         self.events = events
@@ -73,27 +103,55 @@ class GenerationOrchestrator:
     async def generate(
         self,
         user_prompt: str,
-        duration_minutes: int,
+        duration_minutes: int | None,
         public_base_url: str,
         request_id: str,
         *,
         job_id: str | None = None,
         progress: ProgressCallback | None = None,
         capacity_reserved: bool = False,
+        provider: str | None = None,
     ) -> dict[str, Any]:
         job_id = job_id or f"job_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
 
-        async def report(stage: str, value: int, message: str) -> None:
+        async def report(
+            stage: str,
+            value: int,
+            message: str,
+            structured_prompt: str | None = None,
+            lyrics: str | None = None,
+        ) -> None:
             if progress is not None:
-                await progress(stage, value, message)
+                await progress(stage, value, message, structured_prompt, lyrics)
 
         async def execute() -> dict[str, Any]:
+            save_job_prompts(self.settings.output_dir, job_id, user_prompt)
             await self.events.publish(GenerationEvent("generation.started", job_id, request_id))
             await report("expanding_prompt", 10, "正在扩写音乐创作提示")
-            structured_prompt = await self.prompt_expander.expand(user_prompt)
-            await report("generating_music", 25, "ElevenLabs 正在生成完整音乐")
-            music_result = await self.music_provider.generate(
-                structured_prompt, duration_minutes, user_prompt
+            _, style = split_generation_prompt(user_prompt)
+            structured_prompt, lyrics = await self.prompt_expander.prepare(
+                user_prompt,
+                duration_minutes or self.settings.default_duration_minutes,
+            )
+            provider_prompt = f"[歌词与创作内容]\n{lyrics}"
+            if style:
+                provider_prompt += f"\n\n[风格要求]\n{style}"
+            save_job_prompts(
+                self.settings.output_dir,
+                job_id,
+                user_prompt,
+                structured_prompt,
+                lyrics,
+            )
+            await report(
+                "generating_music",
+                25,
+                "音乐模型正在生成完整音乐",
+                structured_prompt,
+                lyrics,
+            )
+            music_result = await self.music_providers.get(provider, self.music_provider).generate(
+                structured_prompt, duration_minutes, provider_prompt
             )
             await report("saving_audio", 60, "正在保存完整音乐")
             full_path = await ensure_file_under_root(
@@ -135,8 +193,9 @@ class GenerationOrchestrator:
                 "success": True,
                 "jobId": job_id,
                 "prompt": user_prompt,
-                "durationMinutes": duration_minutes,
+                "durationMinutes": duration_minutes if duration_minutes is not None else "auto",
                 "structuredPrompt": structured_prompt,
+                "lyrics": lyrics,
                 "fullTrack": full_url,
                 "stems": stems,
                 "stemUrls": list(stems.values()),

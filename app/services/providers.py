@@ -12,11 +12,16 @@ from app.core.config import PROJECT_ROOT, Settings
 from app.core.errors import GenerationError
 from app.services.audio_files import download_audio, require_readable_file, write_stream_atomically
 from app.services.prompt import (
+    OpenAICompatiblePromptExpander,
     _http_failure_message,
     build_elevenlabs_planning_prompt,
     enhance_elevenlabs_composition_plan,
     looks_like_chinese_music_request,
+    split_generation_prompt,
+    truncate_lyrics,
 )
+
+MINIMAX_GENERATE_PATH = "/v1/audio/speech"
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,8 +32,12 @@ class MusicResult:
 
 class MusicProvider(Protocol):
     async def generate(
-        self, structured_prompt: str, duration_minutes: int, user_prompt: str
+        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
     ) -> MusicResult: ...
+
+
+def _effective_duration(settings: Settings, duration_minutes: int | None) -> int:
+    return duration_minutes if duration_minutes is not None else settings.default_duration_minutes
 
 
 def extract_task_id(data: Any) -> str | None:
@@ -110,7 +119,7 @@ class MockMusicProvider:
         self._settings = settings
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int, user_prompt: str
+        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
     ) -> MusicResult:
         require_readable_file(
             self._settings.mock_full_song_path,
@@ -133,12 +142,13 @@ class GenericMusicProvider:
         }
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int, user_prompt: str
+        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
     ) -> MusicResult:
         if not self._settings.music_api_base_url:
             raise GenerationError(
                 "音乐生成失败：MUSIC_API_MODE=real 时必须配置 MUSIC_API_BASE_URL。"
             )
+        duration_minutes = _effective_duration(self._settings, duration_minutes)
         try:
             response = await self._client.post(
                 f"{self._settings.music_api_base_url}{self._settings.music_generate_path}",
@@ -227,8 +237,9 @@ class ElevenLabsMusicProvider:
         return headers
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int, user_prompt: str
+        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
     ) -> MusicResult:
+        duration_minutes = _effective_duration(self._settings, duration_minutes)
         music_length_ms = duration_minutes * 60 * 1000
         clear_chinese = (
             self._settings.elevenlabs_clear_chinese_vocal_mode
@@ -238,8 +249,9 @@ class ElevenLabsMusicProvider:
             self._settings.elevenlabs_use_composition_plan
             and not self._settings.elevenlabs_force_instrumental
         )
+        lyrics, _ = split_generation_prompt(user_prompt)
         planning_prompt = build_elevenlabs_planning_prompt(
-            structured_prompt, duration_minutes, clear_chinese
+            structured_prompt, duration_minutes, clear_chinese, lyrics
         )
         try:
             if use_plan:
@@ -344,12 +356,13 @@ class SunoMusicProvider:
         return list(dict.fromkeys(value for value in values if value))
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int, user_prompt: str
+        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
     ) -> MusicResult:
         if not self._settings.music_api_base_url:
             raise GenerationError(
                 "音乐生成失败：MUSIC_PROVIDER=suno_api 时必须配置 MUSIC_API_BASE_URL。"
             )
+        duration_minutes = _effective_duration(self._settings, duration_minutes)
         failures: list[str] = []
         data: Any = None
         for model in self._models():
@@ -412,15 +425,114 @@ class SunoMusicProvider:
         )
 
 
+class MiniMaxMusicProvider:
+    """Client for the self-hosted MiniMax Music 3 service."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        client: httpx.AsyncClient,
+        lyrics_writer: OpenAICompatiblePromptExpander | None = None,
+    ) -> None:
+        self._settings = settings
+        self._client = client
+        self._lyrics_writer = lyrics_writer or OpenAICompatiblePromptExpander(settings, client)
+
+    async def generate(
+        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
+    ) -> MusicResult:
+        if not self._settings.minimax_base_url:
+            raise GenerationError("MiniMax 音乐生成失败：MINIMAX_BASE_URL 不能为空。")
+        try:
+            lyrics_duration = _effective_duration(self._settings, duration_minutes)
+            lyrics, _ = split_generation_prompt(user_prompt)
+            if not lyrics:
+                lyrics = await self._lyrics_writer.write_lyrics(
+                    structured_prompt,
+                    user_prompt,
+                    lyrics_duration,
+                )
+            lyrics = truncate_lyrics(lyrics)
+            if len(lyrics) < 10:
+                raise GenerationError("MiniMax 音乐生成失败：生成的歌词不足 10 个字符。")
+            target = self._settings.output_dir / f"full_song_minimax_{time.time_ns()}.wav"
+            request_body = {
+                "model": self._settings.minimax_model,
+                "input": lyrics,
+                "instructions": structured_prompt,
+                "seed": self._settings.minimax_seed,
+                "num_inference_steps": self._settings.minimax_num_inference_steps,
+                "response_format": "wav",
+                "stream": False,
+            }
+            if duration_minutes is not None:
+                request_body["audio_duration"] = duration_minutes * 60
+            async with self._client.stream(
+                "POST",
+                f"{self._settings.minimax_base_url}{MINIMAX_GENERATE_PATH}",
+                json=request_body,
+                headers={"Content-Type": "application/json", "Accept": "audio/wav"},
+                timeout=httpx.Timeout(
+                    self._settings.minimax_timeout_seconds,
+                    connect=min(10, self._settings.minimax_timeout_seconds),
+                ),
+            ) as response:
+                if not response.is_success:
+                    await response.aread()
+                response.raise_for_status()
+                await write_stream_atomically(
+                    response.aiter_bytes(), target, "MiniMax Music 3 服务返回空音频。"
+                )
+            return MusicResult(
+                target,
+                {
+                    "provider": "minimax_music",
+                    "modelId": self._settings.minimax_model,
+                    "mode": "self_hosted_wav",
+                    "seed": self._settings.minimax_seed,
+                    "numInferenceSteps": self._settings.minimax_num_inference_steps,
+                },
+            )
+        except GenerationError:
+            raise
+        except httpx.ConnectError as exc:
+            raise GenerationError(
+                "MiniMax Music 3 服务无法直连："
+                f"{self._settings.minimax_base_url}{MINIMAX_GENERATE_PATH}。"
+                "请求已绕过系统代理；请确认服务监听地址、端口和防火墙配置。"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise GenerationError(
+                f"MiniMax Music 3 服务调用失败：{_http_failure_message(exc)}"
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise GenerationError(
+                f"MiniMax Music 3 服务调用失败：{_http_failure_message(exc)}"
+            ) from exc
+
+
 def create_music_provider(
     settings: Settings,
     client: httpx.AsyncClient,
-    elevenlabs_client: httpx.AsyncClient | None = None,
+    direct_client: httpx.AsyncClient | None = None,
+    provider: str | None = None,
 ) -> MusicProvider:
     if settings.music_api_mode == "mock":
         return MockMusicProvider(settings)
-    if settings.music_provider == "elevenlabs_music":
-        return ElevenLabsMusicProvider(settings, elevenlabs_client or client)
-    if settings.music_provider == "suno_api":
+    selected = provider or settings.music_provider
+    if selected == "elevenlabs_music":
+        elevenlabs_client = (
+            direct_client
+            if settings.elevenlabs_bypass_global_proxy and direct_client is not None
+            else client
+        )
+        return ElevenLabsMusicProvider(settings, elevenlabs_client)
+    if selected == "suno_api":
         return SunoMusicProvider(settings, client)
+    if selected == "minimax_music":
+        return MiniMaxMusicProvider(
+            settings,
+            direct_client or client,
+            OpenAICompatiblePromptExpander(settings, client),
+        )
     return GenericMusicProvider(settings, client)

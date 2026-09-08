@@ -29,7 +29,8 @@ cp .env.example .env
 Blackwell `sm_120`；Demucs 和 RVC 共用这一套 CUDA 环境，不再安装 CPU Torch。
 运行拆轨或默认的 RVC 配置需要可用的 NVIDIA 驱动和 CUDA GPU。
 
-编辑 `.env`，至少配置 LLM Key。真实 ElevenLabs 模式还需要配置：
+编辑 `.env`，至少配置 LLM Key。`MUSIC_PROVIDER` 只是请求未传 `provider` 时的默认值；
+MiniMax 和 ElevenLabs 的配置可以同时保留。真实 ElevenLabs 模式还需要配置：
 
 ```env
 MUSIC_API_MODE=real
@@ -42,11 +43,29 @@ ELEVENLABS_API_KEY=...
 ENABLE_AUDIO_SPLITTING=true
 ```
 
+自部署 MiniMax Music 3 使用兼容的 `/v1/audio/speech` 接口：
+
+```env
+MUSIC_API_MODE=real
+MUSIC_PROVIDER=minimax_music
+MINIMAX_BASE_URL=http://127.0.0.1:8111
+MINIMAX_MODEL=MiniMaxAI/MiniMax-Music3
+MINIMAX_SEED=42
+MINIMAX_NUM_INFERENCE_STEPS=30
+MINIMAX_TIMEOUT_SECONDS=7200
+LLM_API_KEY=...
+```
+
+后端将 LLM 生成的歌词作为 `input`，结构化音乐描述作为 `instructions`，并将返回的
+44.1 kHz WAV 直接保存到 `output`。前端传 `durationMinutes: "auto"` 时不发送
+`audio_duration`，由模型自行结束；传 `1` 到 `5` 时会换算为对应秒数。如果两个服务
+分别运行在 Docker 容器中，请将 `MINIMAX_BASE_URL` 改为可达的容器服务名或宿主机地址。
+
 音乐 Prompt 扩写建议使用非推理模型。推理模型可能先输出很长的思考过程，增加
 延迟并触发读取超时。遇到 LLM `ReadTimeout` 时，应先确认 `LLM_MODEL`，再根据
 服务延迟调整 `LLM_TIMEOUT_SECONDS`；后端不会自动重试网络超时，以免产生重复调用。
-分类格式的合格扩写结果必须包含 8–14 个详细英文制作标签，覆盖风格与年代、速度与
-拍号、情绪、配器、人声、编曲结构以及制作与混音，目标长度为 350–1200 字符。
+分类格式的合格扩写结果必须包含 8 个简洁英文制作标签，覆盖风格与年代、速度与拍号、
+情绪、配器、人声、编曲结构、制作与混音以及排除项，目标长度为 350–900 字符。
 同时兼容 Qwen 返回的单方括号扁平制作标签列表，但至少需要 10 个标签和 280 字符。
 未指定的要素由 LLM 做协调一致的专业补充，短标签翻译不会再被当作扩写成功。
 
@@ -97,12 +116,13 @@ curl -X POST http://127.0.0.1:8010/api/voice/convert \
 `DELETE /api/voice/result` 软删除结果，`PUT /api/voice/result` 恢复结果；三个请求均以
 表单字段 `filename` 传入文件名。
 
-生成音乐：
+生成音乐。`provider` 可传 `minimax_music` 或 `elevenlabs_music`，不传时使用
+`MUSIC_PROVIDER`：
 
 ```bash
 curl -X POST http://127.0.0.1:8010/api/generate \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"明亮的普通话摇滚，清晰女声和有力鼓组","durationMinutes":2}'
+  -d '{"prompt":"明亮的普通话摇滚，清晰女声和有力鼓组","durationMinutes":2,"provider":"minimax_music"}'
 ```
 
 前端使用异步任务接口，以便刷新后恢复任务并显示真实阶段进度：
