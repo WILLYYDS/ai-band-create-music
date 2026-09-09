@@ -100,25 +100,23 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
         body = response.json()
         assert body["durationMinutes"] == 3
         assert body["debug"]["music"]["durationMinutes"] == 3
-        assert body["splitEnabled"] is True
-        assert list(body["stems"]) == ["vocal", "drums", "bass", "other"]
-        assert body["stems"]["vocal"].endswith("_vocal.mp3")
-        assert body["stems"]["drums"].endswith("_drums.mp3")
+        assert body["splitEnabled"] is False
+        assert body["stems"] == {}
         assert body["waveforms"] == {}
         assert "splitterStdout" not in body["debug"]
         assert "splitterStderr" not in body["debug"]
-        audio = await client.get(body["stems"]["vocal"])
+        audio = await client.get(body["fullTrack"])
     assert audio.status_code == 200
     assert audio.headers["content-type"].startswith("audio/mpeg")
     assert audio.headers["cache-control"] == "no-store"
-    assert audio.content == b"ID3-stem-audio"
+    assert audio.content == b"ID3-full-audio"
 
 
 @pytest.mark.parametrize(
     "duration_field",
     [{"durationMinutes": "auto"}, {"durationMinutes": None}, {}],
 )
-async def test_generate_preserves_auto_duration(
+async def test_generate_resolves_auto_duration(
     tmp_path: Path, duration_field: dict[str, object]
 ) -> None:
     settings = make_settings(tmp_path, enable_audio_splitting=False)
@@ -130,8 +128,10 @@ async def test_generate_preserves_auto_duration(
         )
 
     assert response.status_code == 200
-    assert response.json()["durationMinutes"] == "auto"
-    assert response.json()["debug"]["music"]["durationMinutes"] is None
+    body = response.json()
+    assert body["durationMinutes"] == "auto"
+    assert body["requestedDurationSeconds"] == 60
+    assert body["debug"]["music"]["durationMinutes"] == 1
 
 
 async def test_generate_selects_provider_per_request(tmp_path: Path) -> None:
@@ -367,7 +367,7 @@ async def test_split_disabled_returns_full_track_compatibility_stems(tmp_path: P
         response = await client.post("/api/generate", json={"prompt": "ambient"})
     body = response.json()
     assert body["splitEnabled"] is False
-    assert set(body["stems"].values()) == {body["fullTrack"]}
+    assert body["stems"] == {}
 
 
 async def test_request_size_limit_returns_413(tmp_path: Path) -> None:

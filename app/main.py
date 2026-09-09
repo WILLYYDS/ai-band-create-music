@@ -292,7 +292,7 @@ def create_app(
                 "clearChineseVocalMode": application_settings.elevenlabs_clear_chinese_vocal_mode,
             },
             "splitting": {
-                "enabled": application_settings.enable_audio_splitting,
+                "enabled": False,
                 "pythonCommand": sys.executable,
                 "profile": application_settings.split_profile,
                 "model": application_settings.demucs_model or None,

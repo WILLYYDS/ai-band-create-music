@@ -15,13 +15,19 @@ from app.core.errors import CapacityExceededError
 from app.infrastructure.events import EventPublisher, GenerationEvent
 from app.infrastructure.queue import TaskDispatcher
 from app.services.audio_files import build_public_audio_url, ensure_file_under_root
-from app.services.prompt import PromptExpander, split_generation_prompt
+from app.services.prompt import (
+    PromptExpander,
+    estimate_music_duration_seconds,
+    split_generation_prompt,
+)
 from app.services.providers import MusicProvider
-from app.services.stems import STEM_NAMES, StemSeparator
+from app.services.stems import StemSeparator
 from app.services.waveforms import extract_waveforms
 
 logger = logging.getLogger(__name__)
-ProgressCallback = Callable[[str, int, str, str | None, str | None], Awaitable[None]]
+ProgressCallback = Callable[
+    [str, int | None, str, str | None, str | None, int | None, int | None], Awaitable[None]
+]
 
 
 def save_job_prompts(
@@ -124,23 +130,36 @@ class GenerationOrchestrator:
 
         async def report(
             stage: str,
-            value: int,
+            value: int | None,
             message: str,
             structured_prompt: str | None = None,
             lyrics: str | None = None,
+            step: int | None = None,
+            total_steps: int | None = None,
         ) -> None:
             if progress is not None:
-                await progress(stage, value, message, structured_prompt, lyrics)
+                await progress(stage, value, message, structured_prompt, lyrics, step, total_steps)
 
         async def execute() -> dict[str, Any]:
             save_job_prompts(self.settings.output_dir, job_id, user_prompt)
             await self.events.publish(GenerationEvent("generation.started", job_id, request_id))
-            await report("expanding_prompt", 10, "正在扩写音乐创作提示")
+            await report("expanding_prompt", None, "正在处理歌词与音乐风格")
             _, style = split_generation_prompt(user_prompt)
             structured_prompt, lyrics = await self.prompt_expander.prepare(
                 user_prompt,
-                duration_minutes or self.settings.default_duration_minutes,
+                duration_minutes,
             )
+            duration_seconds = (
+                duration_minutes * 60
+                if duration_minutes is not None
+                else estimate_music_duration_seconds(
+                    lyrics,
+                    f"{style}\n{structured_prompt}",
+                    minimum=self.settings.min_duration_minutes * 60,
+                    maximum=self.settings.max_duration_minutes * 60,
+                )
+            )
+            model_duration_minutes = duration_seconds / 60
             provider_prompt = f"[歌词与创作内容]\n{lyrics}"
             if style:
                 provider_prompt += f"\n\n[风格要求]\n{style}"
@@ -157,64 +176,59 @@ class GenerationOrchestrator:
                 song_number = index + 1
                 await report(
                     "generating_music",
-                    25 + index * 35,
+                    None,
                     f"音乐模型正在生成第 {song_number}/{effective_count} 首",
                     structured_prompt,
                     lyrics,
                 )
+
+                async def provider_progress(
+                    stage: str,
+                    step: int | None,
+                    total_steps: int | None,
+                    song_number: int = song_number,
+                ) -> None:
+                    await report(
+                        stage,
+                        None,
+                        f"音乐模型正在生成第 {song_number}/{effective_count} 首",
+                        step=step,
+                        total_steps=total_steps,
+                    )
+
                 music_result = await music_provider.generate(
                     structured_prompt,
-                    duration_minutes,
+                    model_duration_minutes,
                     provider_prompt,
                     variation=index,
+                    progress=provider_progress,
+                    job_id=job_id,
                 )
-                await report("saving_audio", 45 + index * 35, f"正在保存第 {song_number} 首")
+                await report("saving_audio", None, f"正在保存第 {song_number} 首")
                 full_path = await ensure_file_under_root(
                     music_result.audio_path,
                     self.settings.output_dir,
-                    f"full_song_{job_id}_{song_number}.mp3",
+                    f"full_song_{job_id}_{song_number}{music_result.audio_path.suffix}",
                 )
                 full_relative = full_path.relative_to(self.settings.output_dir)
                 full_url = build_public_audio_url(public_base_url, full_relative)
 
-                if not self.settings.enable_audio_splitting:
-                    stems = {name: full_url for name in STEM_NAMES}
-                    waveform_paths = {"full": full_path}
-                    split_debug: dict[str, Any] = {}
-                    split_enabled = False
-                else:
-                    await report(
-                        "splitting",
-                        50 + index * 35,
-                        f"Demucs 正在分离第 {song_number} 首",
-                    )
-                    relative_output = Path("jobs") / job_id / f"song_{song_number}"
-                    split_result = await self.stem_separator.split(
-                        full_path, self.settings.output_dir / relative_output
-                    )
-                    stems = {
-                        name: build_public_audio_url(public_base_url, relative_output / file_name)
-                        for name, file_name in split_result.files.items()
-                    }
-                    waveform_paths = {
-                        name: self.settings.output_dir / relative_output / file_name
-                        for name, file_name in split_result.files.items()
-                    }
-                    split_debug = {"splitterDurationMs": split_result.duration_ms}
-                    split_enabled = True
-
+                await report("waveform", None, f"正在提取第 {song_number} 首真实波形")
                 outputs.append(
                     {
                         "fullTrack": full_url,
-                        "stems": stems,
-                        "stemUrls": list(stems.values()),
-                        "waveforms": await extract_waveforms(waveform_paths),
-                        "splitEnabled": split_enabled,
-                        "debug": {"music": music_result.debug, **split_debug},
+                        "stems": {},
+                        "stemUrls": [],
+                        "waveforms": await extract_waveforms({"full": full_path}),
+                        "splitEnabled": False,
+                        "durationSeconds": music_result.debug.get(
+                            "durationSeconds", duration_seconds
+                        ),
+                        "debug": {"music": music_result.debug},
                     }
                 )
 
-            await report("finalizing", 95, "正在校验并整理输出文件")
+            await report("finalizing", None, "正在校验并整理输出文件")
             primary = outputs[0]
             response = {
                 "success": True,
@@ -224,6 +238,9 @@ class GenerationOrchestrator:
                 "structuredPrompt": structured_prompt,
                 "lyrics": lyrics,
                 "count": effective_count,
+                "requestedCount": count,
+                "provider": selected_provider,
+                "requestedDurationSeconds": duration_seconds,
                 "alternatives": outputs[1:],
                 "warning": warning,
                 **primary,

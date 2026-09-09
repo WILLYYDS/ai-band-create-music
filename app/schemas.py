@@ -21,6 +21,7 @@ class ErrorResponse(BaseModel):
 
 class MusicOutput(BaseModel):
     fullTrack: str
+    durationSeconds: float | None = None
     stems: dict[str, str]
     stemUrls: list[str]
     waveforms: dict[str, list[float]]
@@ -31,6 +32,10 @@ class MusicOutput(BaseModel):
 class GenerateResponse(MusicOutput):
     success: bool = True
     jobId: str
+    createdAt: str | None = None
+    provider: str | None = None
+    requestedCount: int | None = None
+    requestedDurationSeconds: float | None = None
     prompt: str
     durationMinutes: int | Literal["auto"]
     structuredPrompt: str
