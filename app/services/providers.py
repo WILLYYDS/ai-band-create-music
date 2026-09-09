@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import quote
+from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 
@@ -18,10 +21,10 @@ from app.services.prompt import (
     enhance_elevenlabs_composition_plan,
     looks_like_chinese_music_request,
     split_generation_prompt,
-    truncate_lyrics,
 )
 
-MINIMAX_GENERATE_PATH = "/v1/audio/speech"
+MINIMAX_GENERATE_PATH = "/v1/audio/jobs"
+ProviderProgressCallback = Callable[[str, int | None, int | None], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,14 +37,16 @@ class MusicProvider(Protocol):
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: int | None,
+        duration_minutes: float | None,
         user_prompt: str,
         *,
         variation: int = 0,
+        progress: ProviderProgressCallback | None = None,
+        job_id: str | None = None,
     ) -> MusicResult: ...
 
 
-def _effective_duration(settings: Settings, duration_minutes: int | None) -> int:
+def _effective_duration(settings: Settings, duration_minutes: float | None) -> float:
     return duration_minutes if duration_minutes is not None else settings.default_duration_minutes
 
 
@@ -126,10 +131,12 @@ class MockMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: int | None,
+        duration_minutes: float | None,
         user_prompt: str,
         *,
         variation: int = 0,
+        progress: ProviderProgressCallback | None = None,
+        job_id: str | None = None,
     ) -> MusicResult:
         require_readable_file(
             self._settings.mock_full_song_path,
@@ -154,10 +161,12 @@ class GenericMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: int | None,
+        duration_minutes: float | None,
         user_prompt: str,
         *,
         variation: int = 0,
+        progress: ProviderProgressCallback | None = None,
+        job_id: str | None = None,
     ) -> MusicResult:
         if not self._settings.music_api_base_url:
             raise GenerationError(
@@ -254,13 +263,15 @@ class ElevenLabsMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: int | None,
+        duration_minutes: float | None,
         user_prompt: str,
         *,
         variation: int = 0,
+        progress: ProviderProgressCallback | None = None,
+        job_id: str | None = None,
     ) -> MusicResult:
         duration_minutes = _effective_duration(self._settings, duration_minutes)
-        music_length_ms = duration_minutes * 60 * 1000
+        music_length_ms = round(duration_minutes * 60 * 1000)
         clear_chinese = (
             self._settings.elevenlabs_clear_chinese_vocal_mode
             and looks_like_chinese_music_request(user_prompt, structured_prompt)
@@ -378,10 +389,12 @@ class SunoMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: int | None,
+        duration_minutes: float | None,
         user_prompt: str,
         *,
         variation: int = 0,
+        progress: ProviderProgressCallback | None = None,
+        job_id: str | None = None,
     ) -> MusicResult:
         if not self._settings.music_api_base_url:
             raise GenerationError(
@@ -466,10 +479,12 @@ class MiniMaxMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: int | None,
+        duration_minutes: float | None,
         user_prompt: str,
         *,
         variation: int = 0,
+        progress: ProviderProgressCallback | None = None,
+        job_id: str | None = None,
     ) -> MusicResult:
         if not self._settings.minimax_base_url:
             raise GenerationError("MiniMax 音乐生成失败：MINIMAX_BASE_URL 不能为空。")
@@ -482,7 +497,6 @@ class MiniMaxMusicProvider:
                     user_prompt,
                     lyrics_duration,
                 )
-            lyrics = truncate_lyrics(lyrics)
             if len(lyrics) < 10:
                 raise GenerationError("MiniMax 音乐生成失败：生成的歌词不足 10 个字符。")
             target = self._settings.output_dir / f"full_song_minimax_{time.time_ns()}.wav"
@@ -495,30 +509,83 @@ class MiniMaxMusicProvider:
                 "response_format": "wav",
                 "stream": False,
             }
+            if job_id:
+                request_body["jobId"] = uuid5(NAMESPACE_URL, f"{job_id}:{variation}").hex
             if duration_minutes is not None:
                 request_body["audio_duration"] = duration_minutes * 60
-            async with self._client.stream(
-                "POST",
-                f"{self._settings.minimax_base_url}{MINIMAX_GENERATE_PATH}",
+            else:
+                request_body["auto_duration_hint"] = user_prompt
+            url = f"{self._settings.minimax_base_url}{MINIMAX_GENERATE_PATH}"
+            response = await self._client.post(
+                url,
                 json=request_body,
-                headers={"Content-Type": "application/json", "Accept": "audio/wav"},
-                timeout=httpx.Timeout(
-                    self._settings.minimax_timeout_seconds,
-                    connect=min(10, self._settings.minimax_timeout_seconds),
-                ),
-            ) as response:
-                if not response.is_success:
-                    await response.aread()
-                response.raise_for_status()
-                await write_stream_atomically(
-                    response.aiter_bytes(), target, "MiniMax Music 3 服务返回空音频。"
-                )
+                timeout=self._settings.minimax_timeout_seconds,
+            )
+            response.raise_for_status()
+            remote_id = response.json().get("jobId")
+            if not isinstance(remote_id, str) or not remote_id:
+                raise GenerationError("MiniMax 未返回 jobId。")
+
+            job_url = f"{url}/{quote(str(remote_id), safe='')}"
+            started = time.monotonic()
+            try:
+                while True:
+                    remaining = self._settings.minimax_timeout_seconds - (
+                        time.monotonic() - started
+                    )
+                    if remaining <= 0:
+                        raise GenerationError("MiniMax 音乐生成任务超时。")
+                    response = await self._client.get(job_url, timeout=min(30, remaining))
+                    response.raise_for_status()
+                    state = response.json()
+                    step, total = state.get("step"), state.get("totalSteps")
+                    if step is not None and (type(step) is not int or step < 0):
+                        raise GenerationError("MiniMax 返回无效 step。")
+                    if total is not None and (type(total) is not int or total < 0):
+                        raise GenerationError("MiniMax 返回无效 totalSteps。")
+                    if progress:
+                        await progress(state.get("stage") or "generating_music", step, total)
+                    if state["status"] == "succeeded":
+                        break
+                    if state["status"] in {"failed", "cancelled"}:
+                        raise GenerationError(state.get("error") or "MiniMax 音乐生成失败。")
+                    if state["status"] not in {"pending", "running"}:
+                        raise GenerationError("MiniMax 返回未知任务状态。")
+                    await asyncio.sleep(min(self._settings.music_poll_interval_seconds, remaining))
+            except (asyncio.CancelledError, Exception):
+                try:
+                    await self._client.delete(job_url, timeout=10)
+                except httpx.HTTPError:
+                    pass
+                raise
+            try:
+                async with self._client.stream(
+                    "GET",
+                    f"{job_url}/audio",
+                    timeout=self._settings.minimax_timeout_seconds,
+                ) as response:
+                    if not response.is_success:
+                        await response.aread()
+                    response.raise_for_status()
+                    await write_stream_atomically(
+                        response.aiter_bytes(), target, "MiniMax Music 3 服务返回空音频。"
+                    )
+            finally:
+                # The durable local copy belongs to history; release the remote temporary WAV.
+                try:
+                    await self._client.delete(job_url, timeout=10)
+                except httpx.HTTPError:
+                    pass
             return MusicResult(
                 target,
                 {
                     "provider": "minimax_music",
                     "modelId": self._settings.minimax_model,
                     "mode": "self_hosted_wav",
+                    "jobId": remote_id,
+                    "step": step,
+                    "totalSteps": total,
+                    "durationSeconds": state.get("durationSeconds"),
                     "seed": self._settings.minimax_seed + variation,
                     "numInferenceSteps": self._settings.minimax_num_inference_steps,
                 },

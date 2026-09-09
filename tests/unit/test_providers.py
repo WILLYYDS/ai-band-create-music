@@ -63,7 +63,7 @@ async def test_minimax_provider_uses_direct_client(tmp_path: Path) -> None:
 
     def direct_handler(request: httpx.Request) -> httpx.Response:
         direct_requests.append(request)
-        return httpx.Response(200, content=b"RIFF\x00\x00\x00\x00WAVEminimax")
+        return minimax_response(request)
 
     settings = make_settings(tmp_path, music_api_mode="real")
     async with (
@@ -83,7 +83,7 @@ async def test_minimax_provider_uses_direct_client(tmp_path: Path) -> None:
         )
 
     assert not proxied_requests
-    assert direct_requests[0].url == "http://127.0.0.1:8111/v1/audio/speech"
+    assert direct_requests[0].url == "http://127.0.0.1:8111/v1/audio/jobs"
 
 
 async def test_elevenlabs_uses_composition_plan_and_streams_audio(tmp_path: Path) -> None:
@@ -164,11 +164,7 @@ async def test_minimax_provider_streams_self_hosted_wav(tmp_path: Path) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "audio/wav"},
-            content=b"RIFF\x00\x00\x00\x00WAVEminimax",
-        )
+        return minimax_response(request)
 
     settings = make_settings(
         tmp_path,
@@ -182,7 +178,7 @@ async def test_minimax_provider_streams_self_hosted_wav(tmp_path: Path) -> None:
         )
 
     body = json.loads(requests[0].content)
-    assert requests[0].url.path == "/v1/audio/speech"
+    assert requests[0].url.path == "/v1/audio/jobs"
     assert "authorization" not in requests[0].headers
     assert body["model"] == "MiniMaxAI/MiniMax-Music3"
     assert body["instructions"] == "[Genre: Rock]"
@@ -192,6 +188,7 @@ async def test_minimax_provider_streams_self_hosted_wav(tmp_path: Path) -> None:
     assert body["response_format"] == "wav"
     assert body["stream"] is False
     assert "audio_duration" not in body
+    assert body["auto_duration_hint"] == "rock"
     assert "max_new_tokens" not in body
     assert result.audio_path.suffix == ".wav"
     assert result.audio_path.read_bytes() == b"RIFF\x00\x00\x00\x00WAVEminimax"
@@ -203,7 +200,7 @@ async def test_minimax_provider_sends_selected_duration(tmp_path: Path) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, content=b"RIFF\x00\x00\x00\x00WAVEminimax")
+        return minimax_response(request)
 
     settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -219,7 +216,7 @@ async def test_minimax_provider_offsets_seed_for_alternatives(tmp_path: Path) ->
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, content=b"RIFF\x00\x00\x00\x00WAVEminimax")
+        return minimax_response(request)
 
     settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -235,7 +232,7 @@ async def test_minimax_provider_preserves_create_page_lyrics(tmp_path: Path) -> 
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, content=b"RIFF\x00\x00\x00\x00WAVEminimax")
+        return minimax_response(request)
 
     settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -268,8 +265,18 @@ async def test_minimax_provider_reports_direct_connection_target(tmp_path: Path)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(
             GenerationError,
-            match=r"192\.168\.1\.4:8111/v1/audio/speech.*绕过系统代理",
+            match=r"192\.168\.1\.4:8111/v1/audio/jobs.*绕过系统代理",
         ):
             await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
                 "[Genre: Rock]", 1, "rock"
             )
+
+
+def minimax_response(request):
+    if request.method == "POST":
+        return httpx.Response(202, json={"jobId": "remote-job"})
+    if request.url.path.endswith("/audio"):
+        return httpx.Response(200, content=b"RIFF\x00\x00\x00\x00WAVEminimax")
+    return httpx.Response(
+        200, json={"status": "succeeded", "stage": "completed", "step": None, "totalSteps": None}
+    )
