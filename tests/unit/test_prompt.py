@@ -228,6 +228,14 @@ def test_create_prompt_splits_lyrics_from_style() -> None:
     assert style == "梦幻流行、空灵女声"
 
 
+def test_create_prompt_splits_crlf_lyrics_from_style() -> None:
+    lyrics, style = split_generation_prompt(
+        "[歌词与创作内容]\r\n第一句\r\n第二句\r\n\r\n[风格要求]\r\n梦幻流行"
+    )
+    assert lyrics == "第一句\n第二句"
+    assert style == "梦幻流行"
+
+
 async def test_prompt_expander_only_sends_style_and_disables_doubao_thinking(
     tmp_path: Path,
 ) -> None:
@@ -322,6 +330,38 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
     assert body["response_format"] == {"type": "json_object"}
 
 
+async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "taggedLyrics": (
+                                        "[Verse]\n自动生成第一句\n自动生成第二句"
+                                    ),
+                                    "styleTags": "[Genre: Rock]",
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    settings = make_settings(tmp_path, llm_api_key="secret")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await OpenAICompatiblePromptExpander(settings, client).prepare("[风格要求]\n男声摇滚", 1)
+
+    assert json.loads(requests[0].content)["response_format"] == {"type": "json_object"}
+
+
 async def test_prepare_generates_lyrics_and_style_in_one_request(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
@@ -365,6 +405,65 @@ async def test_prepare_generates_lyrics_and_style_in_one_request(tmp_path: Path)
     body = json.loads(requests[0].content)
     assert "同时生成原创歌词和音乐风格说明" in body["messages"][0]["content"]
     assert "目标时长：约 1 分钟" in body["messages"][1]["content"]
+
+
+async def test_prepare_extracts_json_surrounded_by_commentary(tmp_path: Path) -> None:
+    payload = json.dumps(
+        {
+            "taggedLyrics": "[Verse]\n自动生成第一句\n自动生成第二句",
+            "styleTags": "[Genre: Rock]",
+        },
+        ensure_ascii=False,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": f"Here is the JSON:\n```json\n{payload}\n```\nDone."}}
+                ]
+            },
+        )
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        structured, lyrics = await OpenAICompatiblePromptExpander(settings, client).prepare(
+            "[风格要求]\n男声摇滚",
+            1,
+        )
+
+    assert structured == "[Genre: Rock]"
+    assert lyrics == "[Verse]\n自动生成第一句\n自动生成第二句"
+
+
+async def test_prepare_retries_once_after_invalid_json(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        content = "not json"
+        if len(requests) == 2:
+            content = json.dumps(
+                {
+                    "taggedLyrics": "[Verse]\n自动生成第一句\n自动生成第二句",
+                    "styleTags": "[Genre: Rock]",
+                },
+                ensure_ascii=False,
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        structured, _ = await OpenAICompatiblePromptExpander(settings, client).prepare(
+            "[风格要求]\n男声摇滚",
+            1,
+        )
+
+    assert structured == "[Genre: Rock]"
+    assert len(requests) == 2
+    retry_body = json.loads(requests[1].content)
+    assert retry_body["messages"][-1]["content"].startswith("上次响应不是有效")
 
 
 async def test_prepare_accepts_concise_style_and_adds_missing_verse_tag(tmp_path: Path) -> None:

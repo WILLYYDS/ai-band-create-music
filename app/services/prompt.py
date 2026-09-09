@@ -118,7 +118,7 @@ class PromptExpander(Protocol):
 
 def split_generation_prompt(user_prompt: str) -> tuple[str, str]:
     """Split the exact section format sent by the Create page."""
-    prompt = user_prompt.strip()
+    prompt = user_prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
     lyrics_marker = "[歌词与创作内容]"
     style_marker = "[风格要求]"
     if prompt.startswith(lyrics_marker):
@@ -136,6 +136,27 @@ def normalize_llm_output(raw_content: object) -> str:
     content = re.sub(r"^```[a-z]*\s*", "", content, flags=re.IGNORECASE)
     content = re.sub(r"```$", "", content)
     return content.strip().strip("\"'").strip()
+
+
+def extract_json_object(raw_content: object) -> dict[str, Any]:
+    """Extract the first JSON object from an otherwise chatty LLM response."""
+    content = normalize_llm_output(raw_content)
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            return parsed
+    except (TypeError, ValueError):
+        pass
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", content):
+        try:
+            parsed, _ = decoder.raw_decode(content[match.start() :])
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("模型未返回 JSON 对象")
 
 
 def extract_tagged_lyrics(raw_content: object, original_lyrics: str) -> str | None:
@@ -512,65 +533,89 @@ class OpenAICompatiblePromptExpander:
                 request_body["chat_template_kwargs"] = {"enable_thinking": False}
             elif "doubao" in self._settings.llm_model.lower():
                 request_body["thinking"] = {"type": "disabled"}
-                request_body["response_format"] = {"type": "json_object"}
+        if "doubao" in self._settings.llm_model.lower() or self._settings.llm_url.startswith(
+            "https://api.openai.com/"
+        ):
+            request_body["response_format"] = {"type": "json_object"}
         try:
-            response = await self._client.post(
-                self._settings.llm_url,
-                json=request_body,
-                headers={
-                    "Authorization": f"Bearer {self._settings.llm_api_key.get_secret_value()}",
-                    "Content-Type": "application/json",
-                },
-                timeout=httpx.Timeout(
-                    self._settings.llm_timeout_seconds,
-                    connect=min(10, self._settings.llm_timeout_seconds),
-                ),
-            )
-            response.raise_for_status()
-            data = response.json()
-            content = data["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                content = "\n".join(
-                    str(part.get("text") or part.get("content") or "")
-                    for part in content
-                    if isinstance(part, dict)
-                )
-            prepared = json.loads(normalize_llm_output(content))
-            if not isinstance(prepared, dict):
-                raise ValueError("模型未返回 JSON 对象")
-            tagged_content = (
-                prepared.get("taggedLyrics")
-                or prepared.get("tagged_lyrics")
-                or prepared.get("lyrics")
-            )
-            if isinstance(tagged_content, list):
-                tagged_content = "\n".join(str(line) for line in tagged_content)
-            if generate_lyrics:
-                tagged = normalize_llm_output(tagged_content)
-                if tagged and not LYRICS_SECTION_PATTERN.search(tagged):
-                    tagged = f"[Verse]\n{tagged}"
-            else:
-                tagged = extract_tagged_lyrics(tagged_content, lyrics) or f"[Verse]\n{lyrics}"
-            style_tags = (
-                prepared.get("styleTags")
-                or prepared.get("style_tags")
-                or prepared.get("structuredPrompt")
-                or prepared.get("style")
-            )
-            if isinstance(style_tags, list):
-                style_tags = ", ".join(str(tag) for tag in style_tags)
-            elif isinstance(style_tags, dict):
-                style_tags = json.dumps(style_tags, ensure_ascii=False)
-            structured = extract_structured_music_tags(style_tags) or normalize_llm_output(
-                style_tags
-            )
-            if not tagged or len(tagged) < 10 or not LYRICS_SECTION_PATTERN.search(tagged):
-                raise ValueError(
-                    "模型未生成结构化歌词" if generate_lyrics else "模型修改了歌词或未添加段落标签"
-                )
-            if not structured:
-                raise ValueError("模型未返回风格描述")
-            return structured, tagged
+            original_messages = list(request_body["messages"])
+            rejected_content = ""
+            for attempt in range(2):
+                if attempt:
+                    request_body["messages"] = [
+                        *original_messages,
+                        {"role": "assistant", "content": rejected_content[:2000]},
+                        {
+                            "role": "user",
+                            "content": "上次响应不是有效的目标 JSON。请修正后只输出 JSON 对象。",
+                        },
+                    ]
+                try:
+                    response = await self._client.post(
+                        self._settings.llm_url,
+                        json=request_body,
+                        headers={
+                            "Authorization": (
+                                f"Bearer {self._settings.llm_api_key.get_secret_value()}"
+                            ),
+                            "Content-Type": "application/json",
+                        },
+                        timeout=httpx.Timeout(
+                            self._settings.llm_timeout_seconds,
+                            connect=min(10, self._settings.llm_timeout_seconds),
+                        ),
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    content = data["choices"][0]["message"]["content"]
+                    if isinstance(content, list):
+                        content = "\n".join(
+                            str(part.get("text") or part.get("content") or "")
+                            for part in content
+                            if isinstance(part, dict)
+                        )
+                    rejected_content = str(content or "")
+                    prepared = extract_json_object(content)
+                    tagged_content = (
+                        prepared.get("taggedLyrics")
+                        or prepared.get("tagged_lyrics")
+                        or prepared.get("lyrics")
+                    )
+                    if isinstance(tagged_content, list):
+                        tagged_content = "\n".join(str(line) for line in tagged_content)
+                    if generate_lyrics:
+                        tagged = normalize_llm_output(tagged_content)
+                        if tagged and not LYRICS_SECTION_PATTERN.search(tagged):
+                            tagged = f"[Verse]\n{tagged}"
+                    else:
+                        tagged = extract_tagged_lyrics(tagged_content, lyrics) or (
+                            f"[Verse]\n{lyrics}"
+                        )
+                    style_tags = (
+                        prepared.get("styleTags")
+                        or prepared.get("style_tags")
+                        or prepared.get("structuredPrompt")
+                        or prepared.get("style")
+                    )
+                    if isinstance(style_tags, list):
+                        style_tags = ", ".join(str(tag) for tag in style_tags)
+                    elif isinstance(style_tags, dict):
+                        style_tags = json.dumps(style_tags, ensure_ascii=False)
+                    structured = extract_structured_music_tags(style_tags) or normalize_llm_output(
+                        style_tags
+                    )
+                    if not tagged or len(tagged) < 10 or not LYRICS_SECTION_PATTERN.search(tagged):
+                        raise ValueError(
+                            "模型未生成结构化歌词"
+                            if generate_lyrics
+                            else "模型修改了歌词或未添加段落标签"
+                        )
+                    if not structured:
+                        raise ValueError("模型未返回风格描述")
+                    return structured, tagged
+                except (ValueError, KeyError, IndexError, TypeError):
+                    if attempt:
+                        raise
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
             raise GenerationError(f"歌词与风格处理失败：{_http_failure_message(exc)}") from exc
 

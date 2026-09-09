@@ -644,7 +644,7 @@ def _generation_parameters(payload: GenerateRequest, settings: Settings) -> tupl
         raise ValueError("prompt 不能为空，请输入歌曲风格描述。")
     if len(prompt) > settings.prompt_max_chars:
         raise ValueError(f"prompt 不能超过 {settings.prompt_max_chars} 个字符。")
-    if (
+    if payload.durationMinutes is None or (
         isinstance(payload.durationMinutes, str)
         and payload.durationMinutes.strip().lower() == "auto"
     ):

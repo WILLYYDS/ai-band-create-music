@@ -114,13 +114,19 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
     assert audio.content == b"ID3-stem-audio"
 
 
-async def test_generate_preserves_auto_duration(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "duration_field",
+    [{"durationMinutes": "auto"}, {"durationMinutes": None}, {}],
+)
+async def test_generate_preserves_auto_duration(
+    tmp_path: Path, duration_field: dict[str, object]
+) -> None:
     settings = make_settings(tmp_path, enable_audio_splitting=False)
     app = create_app(settings, make_orchestrator(settings))
     async with await _client(app) as client:
         response = await client.post(
             "/api/generate",
-            json={"prompt": "自动长度普通话歌曲", "durationMinutes": "auto"},
+            json={"prompt": "自动长度普通话歌曲", **duration_field},
         )
 
     assert response.status_code == 200
