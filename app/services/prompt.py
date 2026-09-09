@@ -97,6 +97,16 @@ LYRICS_SECTION_PATTERN = re.compile(
     r"Bridge(?: \d+)?|Instrumental(?: Break)?|Solo|Outro)\]",
     re.IGNORECASE,
 )
+EXPLICIT_MINUTES_PATTERN = re.compile(
+    r"(?<!\d)(\d+(?:\.\d+)?|[一二三四五六])\s*(?:分钟|分鐘|分|minutes?|mins?)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+EXPLICIT_SECONDS_PATTERN = re.compile(
+    r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:秒钟|秒鐘|秒|seconds?|secs?)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+BPM_PATTERN = re.compile(r"(?<!\d)([4-9]\d|1\d{2}|2[0-4]\d)\s*bpm\b", re.IGNORECASE)
+CHINESE_NUMBERS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
 FORBIDDEN_LYRICS_CONSTRAINT_PATTERN = re.compile(
     r"(?:[,;]\s*)?\bno (?:lyrics(?:\s+or\s+melody(?:\s+generation)?)?|"
     r"vocals?|melody(?:\s+generation)?)\b",
@@ -118,14 +128,14 @@ class PromptExpander(Protocol):
 
 def split_generation_prompt(user_prompt: str) -> tuple[str, str]:
     """Split the exact section format sent by the Create page."""
-    prompt = user_prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
+    prompt = user_prompt.strip()
     lyrics_marker = "[歌词与创作内容]"
     style_marker = "[风格要求]"
     if prompt.startswith(lyrics_marker):
-        lyrics, separator, style = (
-            prompt[len(lyrics_marker) :].strip().partition(f"\n{style_marker}\n")
+        parts = re.split(
+            r"(?:\r\n|\n|\r)\[风格要求\](?:\r\n|\n|\r)", prompt[len(lyrics_marker) :], maxsplit=1
         )
-        return lyrics.strip(), style.strip() if separator else ""
+        return parts[0].strip(), parts[1].strip() if len(parts) > 1 else ""
     if prompt.startswith(style_marker):
         return "", prompt[len(style_marker) :].strip()
     return "", prompt
@@ -136,6 +146,63 @@ def normalize_llm_output(raw_content: object) -> str:
     content = re.sub(r"^```[a-z]*\s*", "", content, flags=re.IGNORECASE)
     content = re.sub(r"```$", "", content)
     return content.strip().strip("\"'").strip()
+
+
+def estimate_music_duration_seconds(
+    lyrics: str,
+    style: str,
+    *,
+    minimum: int = 60,
+    maximum: int = 360,
+) -> int:
+    """Choose a deterministic song length from explicit style hints or singable lyrics."""
+    context = style.replace("：", ":")
+    minute_match = EXPLICIT_MINUTES_PATTERN.search(context)
+    second_match = EXPLICIT_SECONDS_PATTERN.search(context)
+    if minute_match:
+        raw = minute_match.group(1)
+        requested = float(CHINESE_NUMBERS.get(raw, raw)) * 60
+    elif second_match:
+        requested = float(second_match.group(1))
+    else:
+        bpm_match = BPM_PATTERN.search(context)
+        bpm = int(bpm_match.group(1)) if bpm_match else 96
+        lowered = context.lower()
+        if not bpm_match and any(
+            word in lowered for word in ("slow", "ballad", "ambient", "舒缓", "慢", "空灵")
+        ):
+            bpm = 72
+        elif not bpm_match and any(
+            word in lowered for word in ("fast", "uptempo", "punk", "快速", "高速", "激烈")
+        ):
+            bpm = 132
+
+        lyric_lines = [
+            line.strip()
+            for line in lyrics.splitlines()
+            if line.strip() and not re.fullmatch(r"\s*\[[^\]]+\]\s*", line)
+        ]
+        plain = "\n".join(lyric_lines)
+        chinese_characters = len(re.findall(r"[\u3400-\u9fff]", plain))
+        latin_words = len(re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)?", plain))
+        singable_units = chinese_characters + latin_words * 1.5
+        units_per_second = max(1.25, min(2.75, bpm / 50))
+        requested = singable_units / units_per_second + len(lyric_lines) * 0.8
+
+        sections = [match.group(0).lower() for match in LYRICS_SECTION_PATTERN.finditer(lyrics)]
+        requested += sum(
+            10
+            if "intro" in section or "outro" in section
+            else 14
+            if "instrumental" in section or "solo" in section
+            else 2
+            for section in sections
+        )
+        if not sections:
+            requested += 16
+
+    clamped = max(minimum, min(maximum, requested))
+    return int(round(clamped / 5) * 5)
 
 
 def extract_json_object(raw_content: object) -> dict[str, Any]:
@@ -363,11 +430,11 @@ def looks_like_chinese_music_request(*values: object) -> bool:
 
 def build_elevenlabs_planning_prompt(
     structured_prompt: str,
-    duration_minutes: int,
+    duration_minutes: float,
     clear_chinese_vocal_mode: bool,
     lyrics: str = "",
 ) -> str:
-    requirements = [structured_prompt, f"Target duration: {duration_minutes} minutes."]
+    requirements = [structured_prompt, f"Target duration: {duration_minutes:g} minutes."]
     if clear_chinese_vocal_mode:
         requirements.append(
             " ".join(
@@ -506,10 +573,12 @@ class OpenAICompatiblePromptExpander:
         lyrics, style = split_generation_prompt(user_prompt)
         generate_lyrics = not lyrics
         if generate_lyrics:
-            request_content = (
-                f"创作要求：\n{style or user_prompt}\n\n"
-                f"目标时长：约 {duration_minutes or self._settings.default_duration_minutes} 分钟"
+            duration_instruction = (
+                f"目标时长：约 {duration_minutes} 分钟"
+                if duration_minutes is not None
+                else "目标时长：自动。根据风格写出自然完整的歌词，不要为凑固定时长重复或灌水。"
             )
+            request_content = f"创作要求：\n{style or user_prompt}\n\n{duration_instruction}"
         else:
             request_content = f"歌词：\n{lyrics}\n\n风格要求：\n{style or '请补充协调的音乐风格'}"
         request_body: dict[str, object] = {
@@ -587,6 +656,8 @@ class OpenAICompatiblePromptExpander:
                         tagged = normalize_llm_output(tagged_content)
                         if tagged and not LYRICS_SECTION_PATTERN.search(tagged):
                             tagged = f"[Verse]\n{tagged}"
+                    elif LYRICS_SECTION_PATTERN.search(lyrics):
+                        tagged = lyrics
                     else:
                         tagged = extract_tagged_lyrics(tagged_content, lyrics) or (
                             f"[Verse]\n{lyrics}"
@@ -620,7 +691,7 @@ class OpenAICompatiblePromptExpander:
             raise GenerationError(f"歌词与风格处理失败：{_http_failure_message(exc)}") from exc
 
     async def write_lyrics(
-        self, structured_prompt: str, user_prompt: str, duration_minutes: int
+        self, structured_prompt: str, user_prompt: str, duration_minutes: float
     ) -> str:
         if self._settings.llm_api_key is None:
             raise GenerationError("歌词生成失败：缺少 LLM_API_KEY 环境变量。")
@@ -647,7 +718,7 @@ class OpenAICompatiblePromptExpander:
                             "",
                             language,
                             (
-                                f"目标时长约 {duration_minutes} 分钟，行数与之匹配，"
+                                f"目标时长约 {duration_minutes:g} 分钟，行数与之匹配，"
                                 "总长不超过 3500 字符。"
                             ),
                         ]

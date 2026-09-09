@@ -11,6 +11,7 @@ from app.services.prompt import (
     build_elevenlabs_planning_prompt,
     effective_llm_output_tokens,
     enhance_elevenlabs_composition_plan,
+    estimate_music_duration_seconds,
     extract_structured_music_tags,
     extract_tagged_lyrics,
     is_expanded_music_prompt,
@@ -232,8 +233,19 @@ def test_create_prompt_splits_crlf_lyrics_from_style() -> None:
     lyrics, style = split_generation_prompt(
         "[歌词与创作内容]\r\n第一句\r\n第二句\r\n\r\n[风格要求]\r\n梦幻流行"
     )
-    assert lyrics == "第一句\n第二句"
+    assert lyrics == "第一句\r\n第二句"
     assert style == "梦幻流行"
+
+
+def test_auto_duration_uses_explicit_style_or_lyrics_and_tempo() -> None:
+    lyrics = "[Verse]\n" + "月光落在窗台\n" * 20 + "[Chorus]\n" + "我仍等待你回来\n" * 12
+    assert estimate_music_duration_seconds(lyrics, "男声，一分钟左右") == 60
+    assert estimate_music_duration_seconds(lyrics, "90 seconds") == 90
+    assert estimate_music_duration_seconds("一句", "流行") == 60
+    assert estimate_music_duration_seconds("长歌词" * 1000, "慢板") == 360
+    assert estimate_music_duration_seconds(lyrics, "slow ballad") > estimate_music_duration_seconds(
+        lyrics, "fast punk"
+    )
 
 
 async def test_prompt_expander_only_sends_style_and_disables_doubao_thinking(
@@ -343,9 +355,7 @@ async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> 
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "taggedLyrics": (
-                                        "[Verse]\n自动生成第一句\n自动生成第二句"
-                                    ),
+                                    "taggedLyrics": ("[Verse]\n自动生成第一句\n自动生成第二句"),
                                     "styleTags": "[Genre: Rock]",
                                 }
                             )
@@ -362,7 +372,7 @@ async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> 
     assert json.loads(requests[0].content)["response_format"] == {"type": "json_object"}
 
 
-async def test_prepare_generates_lyrics_and_style_in_one_request(tmp_path: Path) -> None:
+async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -396,7 +406,7 @@ async def test_prepare_generates_lyrics_and_style_in_one_request(tmp_path: Path)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         structured, lyrics = await OpenAICompatiblePromptExpander(settings, client).prepare(
             "[风格要求]\n男声、摇滚",
-            1,
+            None,
         )
 
     assert structured == EXPANDED_MANDARIN_ROCK_PROMPT
@@ -404,7 +414,7 @@ async def test_prepare_generates_lyrics_and_style_in_one_request(tmp_path: Path)
     assert len(requests) == 1
     body = json.loads(requests[0].content)
     assert "同时生成原创歌词和音乐风格说明" in body["messages"][0]["content"]
-    assert "目标时长：约 1 分钟" in body["messages"][1]["content"]
+    assert "目标时长：自动" in body["messages"][1]["content"]
 
 
 async def test_prepare_extracts_json_surrounded_by_commentary(tmp_path: Path) -> None:
@@ -497,7 +507,16 @@ async def test_prepare_accepts_concise_style_and_adds_missing_verse_tag(tmp_path
     assert lyrics == "[Verse]\n自动生成第一句\n自动生成第二句"
 
 
-async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "original",
+    [
+        "原歌词第一句\n原歌词第二句",
+        "[Intro]\r\n\r\n[Verse 1]\r\n  原歌词第一句  \r\n\r\n[Chorus]\r\n原歌词第二句",
+    ],
+)
+async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(
+    tmp_path: Path, original: str
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -520,10 +539,10 @@ async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(tmp_pa
     settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         _, lyrics = await OpenAICompatiblePromptExpander(settings, client).prepare(
-            "[歌词与创作内容]\n原歌词第一句\n原歌词第二句\n\n[风格要求]\n摇滚"
+            f"[歌词与创作内容]\n{original}\n\n[风格要求]\n摇滚"
         )
 
-    assert lyrics == "[Verse]\n原歌词第一句\n原歌词第二句"
+    assert lyrics == (original if original.startswith("[") else f"[Verse]\n{original}")
 
 
 async def test_prepare_accepts_style_tags_as_json_array(tmp_path: Path) -> None:

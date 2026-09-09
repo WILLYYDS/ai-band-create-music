@@ -38,7 +38,8 @@ def test_minimax_music_defaults_and_provider(tmp_path: Path) -> None:
         (1.4, 1),
         (1.5, 2),
         (4.8, 5),
-        (20, 5),
+        (6, 6),
+        (20, 6),
     ],
 )
 def test_duration_matches_legacy_clamping(tmp_path: Path, value: object, expected: int) -> None:
@@ -54,3 +55,5 @@ def test_invalid_duration_range_is_rejected(tmp_path: Path) -> None:
             min_duration_minutes=5,
             max_duration_minutes=2,
         )
+    with pytest.raises(ValidationError):
+        make_settings(tmp_path, max_duration_minutes=7)

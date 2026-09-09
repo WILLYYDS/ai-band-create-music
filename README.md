@@ -57,9 +57,11 @@ LLM_API_KEY=...
 ```
 
 后端将 LLM 生成的歌词作为 `input`，结构化音乐描述作为 `instructions`，并将返回的
-44.1 kHz WAV 直接保存到 `output`。前端传 `durationMinutes: "auto"` 时不发送
-`audio_duration`，由模型自行结束；传 `1` 到 `5` 时会换算为对应秒数。如果两个服务
-分别运行在 Docker 容器中，请将 `MINIMAX_BASE_URL` 改为可达的容器服务名或宿主机地址。
+44.1 kHz WAV 直接保存到 `output`。前端传 `durationMinutes: "auto"` 时，后端会在歌词
+生成或标签化、风格扩写完成后，根据明确时长描述、歌词长度、段落、BPM 与快慢风格计算
+60–360 秒的目标时长，并将明确秒数发送给音乐模型；传 `1` 到 `6` 时直接换算为对应秒数。
+如果两个服务分别运行在 Docker 容器中，请将 `MINIMAX_BASE_URL` 改为可达的容器服务名
+或宿主机地址。
 
 音乐 Prompt 扩写建议使用非推理模型。推理模型可能先输出很长的思考过程，增加
 延迟并触发读取超时。遇到 LLM `ReadTimeout` 时，应先确认 `LLM_MODEL`，再根据

@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     request_max_bytes: int = Field(default=16_384, ge=1024, le=1_048_576)
     default_duration_minutes: int = 2
     min_duration_minutes: int = Field(default=1, ge=1)
-    max_duration_minutes: int = Field(default=5, ge=1)
+    max_duration_minutes: int = Field(default=6, ge=1, le=6)
     max_concurrent_generations: int = Field(default=1, ge=1)
 
     llm_api_key: SecretStr | None = None
