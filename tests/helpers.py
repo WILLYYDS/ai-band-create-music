@@ -55,11 +55,18 @@ class StubMusicProvider:
         self.source = source
         self.name = name
         self.user_prompt = ""
+        self.variations: list[int] = []
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
+        self,
+        structured_prompt: str,
+        duration_minutes: int | None,
+        user_prompt: str,
+        *,
+        variation: int = 0,
     ) -> MusicResult:
         self.user_prompt = user_prompt
+        self.variations.append(variation)
         return MusicResult(
             self.source, {"provider": self.name, "durationMinutes": duration_minutes}
         )

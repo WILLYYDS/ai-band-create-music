@@ -111,8 +111,16 @@ class GenerationOrchestrator:
         progress: ProgressCallback | None = None,
         capacity_reserved: bool = False,
         provider: str | None = None,
+        count: int = 1,
     ) -> dict[str, Any]:
         job_id = job_id or f"job_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
+        selected_provider = provider or self.settings.music_provider
+        effective_count = count if selected_provider == "minimax_music" else 1
+        warning = (
+            "ElevenLabs Music 暂不支持单次生成两首，已按一首生成。"
+            if count == 2 and selected_provider == "elevenlabs_music"
+            else None
+        )
 
         async def report(
             stage: str,
@@ -143,52 +151,71 @@ class GenerationOrchestrator:
                 structured_prompt,
                 lyrics,
             )
-            await report(
-                "generating_music",
-                25,
-                "音乐模型正在生成完整音乐",
-                structured_prompt,
-                lyrics,
-            )
-            music_result = await self.music_providers.get(provider, self.music_provider).generate(
-                structured_prompt, duration_minutes, provider_prompt
-            )
-            await report("saving_audio", 60, "正在保存完整音乐")
-            full_path = await ensure_file_under_root(
-                music_result.audio_path,
-                self.settings.output_dir,
-                f"full_song_{job_id}.mp3",
-            )
-            full_relative = full_path.relative_to(self.settings.output_dir)
-            full_url = build_public_audio_url(public_base_url, full_relative)
-
-            if not self.settings.enable_audio_splitting:
-                stems = {name: full_url for name in STEM_NAMES}
-                waveform_paths = {"full": full_path}
-                split_debug: dict[str, Any] = {}
-                split_enabled = False
-            else:
-                await report("splitting", 65, "Demucs 正在分离音轨")
-                relative_output = Path("jobs") / job_id
-                split_result = await self.stem_separator.split(
-                    full_path, self.settings.output_dir / relative_output
+            outputs: list[dict[str, Any]] = []
+            music_provider = self.music_providers.get(selected_provider, self.music_provider)
+            for index in range(effective_count):
+                song_number = index + 1
+                await report(
+                    "generating_music",
+                    25 + index * 35,
+                    f"音乐模型正在生成第 {song_number}/{effective_count} 首",
+                    structured_prompt,
+                    lyrics,
                 )
-                stems = {
-                    name: build_public_audio_url(public_base_url, relative_output / file_name)
-                    for name, file_name in split_result.files.items()
-                }
-                waveform_paths = {
-                    name: self.settings.output_dir / relative_output / file_name
-                    for name, file_name in split_result.files.items()
-                }
-                split_debug = {
-                    "splitterDurationMs": split_result.duration_ms,
-                }
-                split_enabled = True
+                music_result = await music_provider.generate(
+                    structured_prompt,
+                    duration_minutes,
+                    provider_prompt,
+                    variation=index,
+                )
+                await report("saving_audio", 45 + index * 35, f"正在保存第 {song_number} 首")
+                full_path = await ensure_file_under_root(
+                    music_result.audio_path,
+                    self.settings.output_dir,
+                    f"full_song_{job_id}_{song_number}.mp3",
+                )
+                full_relative = full_path.relative_to(self.settings.output_dir)
+                full_url = build_public_audio_url(public_base_url, full_relative)
+
+                if not self.settings.enable_audio_splitting:
+                    stems = {name: full_url for name in STEM_NAMES}
+                    waveform_paths = {"full": full_path}
+                    split_debug: dict[str, Any] = {}
+                    split_enabled = False
+                else:
+                    await report(
+                        "splitting",
+                        50 + index * 35,
+                        f"Demucs 正在分离第 {song_number} 首",
+                    )
+                    relative_output = Path("jobs") / job_id / f"song_{song_number}"
+                    split_result = await self.stem_separator.split(
+                        full_path, self.settings.output_dir / relative_output
+                    )
+                    stems = {
+                        name: build_public_audio_url(public_base_url, relative_output / file_name)
+                        for name, file_name in split_result.files.items()
+                    }
+                    waveform_paths = {
+                        name: self.settings.output_dir / relative_output / file_name
+                        for name, file_name in split_result.files.items()
+                    }
+                    split_debug = {"splitterDurationMs": split_result.duration_ms}
+                    split_enabled = True
+
+                outputs.append(
+                    {
+                        "fullTrack": full_url,
+                        "stems": stems,
+                        "stemUrls": list(stems.values()),
+                        "waveforms": await extract_waveforms(waveform_paths),
+                        "splitEnabled": split_enabled,
+                        "debug": {"music": music_result.debug, **split_debug},
+                    }
+                )
 
             await report("finalizing", 95, "正在校验并整理输出文件")
-            waveforms = await extract_waveforms(waveform_paths)
-
+            primary = outputs[0]
             response = {
                 "success": True,
                 "jobId": job_id,
@@ -196,12 +223,10 @@ class GenerationOrchestrator:
                 "durationMinutes": duration_minutes if duration_minutes is not None else "auto",
                 "structuredPrompt": structured_prompt,
                 "lyrics": lyrics,
-                "fullTrack": full_url,
-                "stems": stems,
-                "stemUrls": list(stems.values()),
-                "waveforms": waveforms,
-                "splitEnabled": split_enabled,
-                "debug": {"music": music_result.debug, **split_debug},
+                "count": effective_count,
+                "alternatives": outputs[1:],
+                "warning": warning,
+                **primary,
             }
             await self.events.publish(GenerationEvent("generation.succeeded", job_id, request_id))
             logger.info("generation succeeded job_id=%s request_id=%s", job_id, request_id)

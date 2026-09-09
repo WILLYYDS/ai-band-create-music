@@ -32,7 +32,12 @@ class MusicResult:
 
 class MusicProvider(Protocol):
     async def generate(
-        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
+        self,
+        structured_prompt: str,
+        duration_minutes: int | None,
+        user_prompt: str,
+        *,
+        variation: int = 0,
     ) -> MusicResult: ...
 
 
@@ -119,7 +124,12 @@ class MockMusicProvider:
         self._settings = settings
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
+        self,
+        structured_prompt: str,
+        duration_minutes: int | None,
+        user_prompt: str,
+        *,
+        variation: int = 0,
     ) -> MusicResult:
         require_readable_file(
             self._settings.mock_full_song_path,
@@ -142,7 +152,12 @@ class GenericMusicProvider:
         }
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
+        self,
+        structured_prompt: str,
+        duration_minutes: int | None,
+        user_prompt: str,
+        *,
+        variation: int = 0,
     ) -> MusicResult:
         if not self._settings.music_api_base_url:
             raise GenerationError(
@@ -237,7 +252,12 @@ class ElevenLabsMusicProvider:
         return headers
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
+        self,
+        structured_prompt: str,
+        duration_minutes: int | None,
+        user_prompt: str,
+        *,
+        variation: int = 0,
     ) -> MusicResult:
         duration_minutes = _effective_duration(self._settings, duration_minutes)
         music_length_ms = duration_minutes * 60 * 1000
@@ -356,7 +376,12 @@ class SunoMusicProvider:
         return list(dict.fromkeys(value for value in values if value))
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
+        self,
+        structured_prompt: str,
+        duration_minutes: int | None,
+        user_prompt: str,
+        *,
+        variation: int = 0,
     ) -> MusicResult:
         if not self._settings.music_api_base_url:
             raise GenerationError(
@@ -439,7 +464,12 @@ class MiniMaxMusicProvider:
         self._lyrics_writer = lyrics_writer or OpenAICompatiblePromptExpander(settings, client)
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int | None, user_prompt: str
+        self,
+        structured_prompt: str,
+        duration_minutes: int | None,
+        user_prompt: str,
+        *,
+        variation: int = 0,
     ) -> MusicResult:
         if not self._settings.minimax_base_url:
             raise GenerationError("MiniMax 音乐生成失败：MINIMAX_BASE_URL 不能为空。")
@@ -460,7 +490,7 @@ class MiniMaxMusicProvider:
                 "model": self._settings.minimax_model,
                 "input": lyrics,
                 "instructions": structured_prompt,
-                "seed": self._settings.minimax_seed,
+                "seed": self._settings.minimax_seed + variation,
                 "num_inference_steps": self._settings.minimax_num_inference_steps,
                 "response_format": "wav",
                 "stream": False,
@@ -489,7 +519,7 @@ class MiniMaxMusicProvider:
                     "provider": "minimax_music",
                     "modelId": self._settings.minimax_model,
                     "mode": "self_hosted_wav",
-                    "seed": self._settings.minimax_seed,
+                    "seed": self._settings.minimax_seed + variation,
                     "numInferenceSteps": self._settings.minimax_num_inference_steps,
                 },
             )

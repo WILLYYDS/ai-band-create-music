@@ -146,6 +146,47 @@ async def test_generate_selects_provider_per_request(tmp_path: Path) -> None:
             assert response.json()["debug"]["music"]["provider"] == provider
 
 
+async def test_minimax_count_two_returns_two_results(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    orchestrator = make_orchestrator(settings)
+    provider = StubMusicProvider(settings.mock_full_song_path, "minimax_music")
+    orchestrator.music_providers = {"minimax_music": provider}
+    app = create_app(settings, orchestrator)
+
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            json={"prompt": "两首摇滚", "provider": "minimax_music", "count": 2},
+        )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["count"] == 2
+    assert len(body["alternatives"]) == 1
+    assert provider.variations == [0, 1]
+
+
+async def test_elevenlabs_count_two_warns_and_generates_one(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    orchestrator = make_orchestrator(settings)
+    provider = StubMusicProvider(settings.mock_full_song_path, "elevenlabs_music")
+    orchestrator.music_providers = {"elevenlabs_music": provider}
+    app = create_app(settings, orchestrator)
+
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            json={"prompt": "两首摇滚", "provider": "elevenlabs_music", "count": 2},
+        )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["count"] == 1
+    assert body["alternatives"] == []
+    assert "暂不支持" in body["warning"]
+    assert provider.variations == [0]
+
+
 async def test_ai_talk_lyrics_are_tagged_before_music_generation(tmp_path: Path) -> None:
     settings = make_settings(tmp_path, enable_audio_splitting=False)
     orchestrator = make_orchestrator(settings)
@@ -256,6 +297,36 @@ async def test_async_job_deleted_stem_stays_deleted(tmp_path: Path) -> None:
     assert restored.status_code == 200
     assert "vocal" in restored.json()["result"]["stems"]
     assert restored_file.status_code == 200
+
+
+async def test_async_second_song_stem_can_be_deleted_and_restored(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    orchestrator = make_orchestrator(settings)
+    provider = StubMusicProvider(settings.mock_full_song_path, "minimax_music")
+    orchestrator.music_providers = {"minimax_music": provider}
+    app = create_app(settings, orchestrator)
+
+    async with await _client(app) as client:
+        created = await client.post(
+            "/api/jobs",
+            json={"prompt": "两首摇滚", "provider": "minimax_music", "count": 2},
+        )
+        job_id = created.json()["jobId"]
+        for _ in range(20):
+            completed = await client.get(f"/api/jobs/{job_id}")
+            if completed.json()["status"] == "succeeded":
+                break
+            await asyncio.sleep(0)
+
+        deleted = await client.delete(f"/api/jobs/{job_id}/stems/vocal?song=1")
+        after_delete = (await client.get(f"/api/jobs/{job_id}")).json()
+        restored = await client.put(f"/api/jobs/{job_id}/stems/vocal?song=1")
+
+    assert deleted.status_code == 204
+    assert "vocal" in after_delete["result"]["stems"]
+    assert "vocal" not in after_delete["result"]["alternatives"][0]["stems"]
+    assert restored.status_code == 200
+    assert "vocal" in restored.json()["result"]["alternatives"][0]["stems"]
 
 
 async def test_restore_forgets_missing_trash_file(tmp_path: Path) -> None:

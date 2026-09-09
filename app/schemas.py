@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class GenerateRequest(BaseModel):
@@ -11,6 +11,7 @@ class GenerateRequest(BaseModel):
     prompt: str
     durationMinutes: int | float | str | None = None
     provider: Literal["minimax_music", "elevenlabs_music"] | None = None
+    count: Literal[1, 2] = 1
 
 
 class ErrorResponse(BaseModel):
@@ -18,19 +19,25 @@ class ErrorResponse(BaseModel):
     message: str
 
 
-class GenerateResponse(BaseModel):
-    success: bool = True
-    jobId: str
-    prompt: str
-    durationMinutes: int | Literal["auto"]
-    structuredPrompt: str
-    lyrics: str
+class MusicOutput(BaseModel):
     fullTrack: str
     stems: dict[str, str]
     stemUrls: list[str]
     waveforms: dict[str, list[float]]
     splitEnabled: bool
     debug: dict[str, Any]
+
+
+class GenerateResponse(MusicOutput):
+    success: bool = True
+    jobId: str
+    prompt: str
+    durationMinutes: int | Literal["auto"]
+    structuredPrompt: str
+    lyrics: str
+    count: Literal[1, 2] = 1
+    alternatives: list[MusicOutput] = Field(default_factory=list)
+    warning: str | None = None
 
 
 class CreateGenerationJobResponse(BaseModel):
@@ -53,5 +60,6 @@ class GenerationJobResponse(BaseModel):
     stage: str
     progress: int
     message: str
+    warning: str | None = None
     result: GenerateResponse | None = None
     error: str | None = None

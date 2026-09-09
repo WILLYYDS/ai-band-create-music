@@ -214,6 +214,22 @@ async def test_minimax_provider_sends_selected_duration(tmp_path: Path) -> None:
     assert json.loads(requests[0].content)["audio_duration"] == 60
 
 
+async def test_minimax_provider_offsets_seed_for_alternatives(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=b"RIFF\x00\x00\x00\x00WAVEminimax")
+
+    settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
+            "[Genre: Rock]", 1, "rock", variation=1
+        )
+
+    assert json.loads(requests[0].content)["seed"] == settings.minimax_seed + 1
+
+
 async def test_minimax_provider_preserves_create_page_lyrics(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 

@@ -115,6 +115,7 @@ class GenerationJob:
     stage: str = "pending"
     progress: int = 0
     message: str = "任务已创建"
+    warning: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
     task: asyncio.Task[None] | None = None
@@ -130,9 +131,22 @@ class GenerationJob:
             "stage": self.stage,
             "progress": self.progress,
             "message": self.message,
+            "warning": self.warning,
             "result": self.result,
             "error": self.error,
         }
+
+
+def _song_result(job: GenerationJob, song: int) -> dict[str, Any] | None:
+    if job.result is None or song < 0:
+        return None
+    if song == 0:
+        return job.result
+    alternatives = job.result.get("alternatives")
+    if not isinstance(alternatives, list) or song > len(alternatives):
+        return None
+    result = alternatives[song - 1]
+    return result if isinstance(result, dict) else None
 
 
 def build_orchestrator(
@@ -319,6 +333,7 @@ def create_app(
                 _public_base_url(request, application_settings),
                 request_id,
                 provider=payload.provider,
+                count=payload.count,
             )
         except HTTPException:
             raise
@@ -366,7 +381,13 @@ def create_app(
 
         jobs: dict[str, GenerationJob] = request.app.state.jobs
         job_id = f"job_{int(asyncio.get_running_loop().time() * 1000)}_{uuid4().hex[:8]}"
-        job = GenerationJob(job_id=job_id, prompt=prompt)
+        selected_provider = payload.provider or application_settings.music_provider
+        warning = (
+            "ElevenLabs Music 暂不支持单次生成两首，已按一首生成。"
+            if payload.count == 2 and selected_provider == "elevenlabs_music"
+            else None
+        )
+        job = GenerationJob(job_id=job_id, prompt=prompt, warning=warning)
         jobs[job_id] = job
         base_url = _public_base_url(request, application_settings)
         request_id = request.headers.get("X-Request-ID") or uuid4().hex
@@ -400,6 +421,7 @@ def create_app(
                     progress=report,
                     capacity_reserved=True,
                     provider=payload.provider,
+                    count=payload.count,
                 )
                 job.status = "succeeded"
                 job.stage = "completed"
@@ -463,25 +485,26 @@ def create_app(
         status_code=status.HTTP_204_NO_CONTENT,
         responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
     )
-    async def delete_generation_stem(job_id: str, stem_name: str, request: Request):
+    async def delete_generation_stem(job_id: str, stem_name: str, request: Request, song: int = 0):
         job = request.app.state.jobs.get(job_id)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "生成任务不存在。"},
             )
-        if job.status != "succeeded" or job.result is None:
+        result = _song_result(job, song)
+        if job.status != "succeeded" or result is None:
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"success": False, "message": "生成任务尚未完成，无法删除音轨。"},
             )
-        if not job.result.get("splitEnabled"):
+        if not result.get("splitEnabled"):
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"success": False, "message": "完整混音不能作为分轨删除。"},
             )
 
-        stems = job.result.get("stems", {})
+        stems = result.get("stems", {})
         stem_url = stems.get(stem_name)
         if not stem_url:
             return JSONResponse(
@@ -492,7 +515,7 @@ def create_app(
             target = _output_path_from_url(stem_url, application_settings)
             if not target.is_file():
                 raise OSError("stem file is missing")
-            trash = _stem_trash_path(target, application_settings, job_id)
+            trash = _stem_trash_path(target, application_settings, job_id, song)
             trash.parent.mkdir(parents=True, exist_ok=True)
             trash.unlink(missing_ok=True)
             target.replace(trash)
@@ -503,14 +526,15 @@ def create_app(
                 content={"success": False, "message": "删除音轨文件失败。"},
             )
         stem_index = list(stems).index(stem_name)
-        waveforms = job.result.get("waveforms")
-        job.deleted_stems[stem_name] = {
+        waveforms = result.get("waveforms")
+        deleted_key = f"{song}:{stem_name}"
+        job.deleted_stems[deleted_key] = {
             "url": stem_url,
             "index": stem_index,
             "waveform": waveforms.get(stem_name) if isinstance(waveforms, dict) else None,
         }
         del stems[stem_name]
-        job.result["stemUrls"] = list(stems.values())
+        result["stemUrls"] = list(stems.values())
         if isinstance(waveforms, dict):
             waveforms.pop(stem_name, None)
         job.message = f"音轨 {stem_name} 已删除"
@@ -521,23 +545,25 @@ def create_app(
         response_model=GenerationJobResponse,
         responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
     )
-    async def restore_generation_stem(job_id: str, stem_name: str, request: Request):
+    async def restore_generation_stem(job_id: str, stem_name: str, request: Request, song: int = 0):
         job = request.app.state.jobs.get(job_id)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "生成任务不存在。"},
             )
-        if job.status != "succeeded" or job.result is None:
+        result = _song_result(job, song)
+        if job.status != "succeeded" or result is None:
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"success": False, "message": "生成任务尚未完成，无法恢复音轨。"},
             )
 
-        stems = job.result.get("stems", {})
+        stems = result.get("stems", {})
         if stem_name in stems:
             return job.response()
-        deleted = job.deleted_stems.get(stem_name)
+        deleted_key = f"{song}:{stem_name}"
+        deleted = job.deleted_stems.get(deleted_key)
         if deleted is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -546,9 +572,9 @@ def create_app(
 
         try:
             target = _output_path_from_url(deleted["url"], application_settings)
-            trash = _stem_trash_path(target, application_settings, job_id)
+            trash = _stem_trash_path(target, application_settings, job_id, song)
             if not trash.is_file():
-                del job.deleted_stems[stem_name]
+                del job.deleted_stems[deleted_key]
                 return JSONResponse(
                     status_code=status.HTTP_404_NOT_FOUND,
                     content={"success": False, "message": "删除的音轨文件已不存在，无法恢复。"},
@@ -564,12 +590,12 @@ def create_app(
 
         items = list(stems.items())
         items.insert(min(deleted["index"], len(items)), (stem_name, deleted["url"]))
-        job.result["stems"] = dict(items)
-        job.result["stemUrls"] = list(job.result["stems"].values())
-        waveforms = job.result.get("waveforms")
+        result["stems"] = dict(items)
+        result["stemUrls"] = list(result["stems"].values())
+        waveforms = result.get("waveforms")
         if isinstance(waveforms, dict) and deleted["waveform"] is not None:
             waveforms[stem_name] = deleted["waveform"]
-        del job.deleted_stems[stem_name]
+        del job.deleted_stems[deleted_key]
         job.message = f"音轨 {stem_name} 已恢复"
         return job.response()
 
@@ -641,8 +667,9 @@ def _output_path_from_url(audio_url: str, settings: Settings):
     return target
 
 
-def _stem_trash_path(target, settings: Settings, job_id: str):
-    return settings.output_dir.resolve() / ".trash" / job_id / target.name
+def _stem_trash_path(target, settings: Settings, job_id: str, song: int = 0):
+    root = settings.output_dir.resolve() / ".trash" / job_id
+    return root / (f"song_{song + 1}" if song else "") / target.name
 
 
 def _parse_byte_range(value: str | None, file_size: int) -> tuple[int, int]:
