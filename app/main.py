@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -39,6 +43,7 @@ from app.services.prompt import OpenAICompatiblePromptExpander, effective_llm_ou
 from app.services.providers import create_music_provider
 from app.services.stems import DemucsStemSeparator
 from app.services.voice import RVCEngine, install_voice_api
+from app.services.waveforms import extract_waveforms
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +118,10 @@ class GenerationJob:
     lyrics: str | None = None
     status: str = "pending"
     stage: str = "pending"
-    progress: int = 0
+    progress: int | None = None
+    step: int | None = None
+    total_steps: int | None = None
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     message: str = "任务已创建"
     warning: str | None = None
     result: dict[str, Any] | None = None
@@ -124,6 +132,9 @@ class GenerationJob:
     def response(self) -> dict[str, Any]:
         return {
             "jobId": self.job_id,
+            "createdAt": self.created_at,
+            "step": self.step,
+            "totalSteps": self.total_steps,
             "prompt": self.prompt,
             "structuredPrompt": self.structured_prompt,
             "lyrics": self.lyrics,
@@ -135,6 +146,143 @@ class GenerationJob:
             "result": self.result,
             "error": self.error,
         }
+
+    def save(self, output_dir: Path) -> None:
+        target = output_dir / "jobs" / self.job_id / "job.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f"job.{uuid4().hex}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump(
+                    {**self.response(), "deletedStems": self.deleted_stems},
+                    stream,
+                    ensure_ascii=False,
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def load_jobs(output_dir: Path) -> dict[str, GenerationJob]:
+    jobs = {}
+    for target in (output_dir / "jobs").glob("*/job.json"):
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+            validated = GenerationJobResponse.model_validate(data)
+            if validated.jobId != target.parent.name:
+                raise ValueError("jobId does not match directory")
+            job = GenerationJob(
+                job_id=validated.jobId,
+                prompt=validated.prompt,
+                created_at=validated.createdAt,
+                structured_prompt=validated.structuredPrompt,
+                lyrics=validated.lyrics,
+                status=validated.status,
+                stage=validated.stage,
+                progress=validated.progress,
+                step=validated.step,
+                total_steps=validated.totalSteps,
+                message=validated.message,
+                warning=validated.warning,
+                error=validated.error,
+                result=data.get("result"),
+                deleted_stems=data.get("deletedStems", {}),
+            )
+            if job.status in {"pending", "running"}:
+                job.status = job.stage = "failed"
+                job.progress = job.step = job.total_steps = None
+                job.error = job.message = "服务器重启，生成任务已中断。"
+                job.save(output_dir)
+            jobs[job.job_id] = job
+        except (OSError, ValueError, TypeError):
+            logger.exception("Unable to load job metadata: %s", target)
+    return jobs
+
+
+async def import_legacy_songs(
+    jobs: dict[str, GenerationJob], settings: Settings, base: str, candidates: list[Path]
+) -> None:
+    represented = set()
+    fingerprints = set()
+    legacy_prompts = {}
+    for prompt_file in (settings.output_dir / "jobs").glob("*/prompts.json"):
+        try:
+            metadata = json.loads(prompt_file.read_text(encoding="utf-8"))
+            if isinstance(metadata, dict):
+                for stem in prompt_file.parent.rglob("full_song_*"):
+                    legacy_prompts[stem.stem.rsplit("_", 1)[0]] = metadata
+                legacy_prompts[prompt_file.parent.name] = metadata
+        except (OSError, ValueError):
+            logger.warning("Unable to read legacy prompts: %s", prompt_file)
+
+    def fingerprint(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    for job in jobs.values():
+        if job.result:
+            for result in [job.result, *job.result.get("alternatives", [])]:
+                try:
+                    path = _output_path_from_url(result["fullTrack"], settings)
+                    represented.add(path)
+                    fingerprints.add(fingerprint(path))
+                except (KeyError, ValueError, OSError):
+                    pass
+    for path in candidates:
+        if path.suffix.lower() not in {".wav", ".mp3", ".flac", ".ogg", ".m4a"}:
+            continue
+        job_id = "legacy_" + hashlib.sha256(path.name.encode()).hexdigest()[:20]
+        if path.resolve() in represented or job_id in jobs or not path.is_file():
+            continue
+        try:
+            digest = fingerprint(path)
+        except OSError:
+            logger.exception("Unable to read legacy audio: %s", path)
+            continue
+        if digest in fingerprints or path.stat().st_size == 0:
+            continue
+        created = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+        metadata = legacy_prompts.get(path.stem, {})
+        if not metadata and path.stem.startswith("full_song_job_"):
+            metadata = legacy_prompts.get(
+                path.stem.removeprefix("full_song_").rsplit("_", 1)[0], {}
+            )
+        job = GenerationJob(
+            job_id=job_id,
+            prompt=metadata.get("prompt") or path.stem,
+            structured_prompt=metadata.get("structuredPrompt"),
+            lyrics=metadata.get("lyrics"),
+            created_at=created,
+            status="succeeded",
+            stage="completed",
+            progress=100,
+            message="已导入历史完整歌曲",
+        )
+        job.result = {
+            "success": True,
+            "jobId": job_id,
+            "createdAt": created,
+            "prompt": job.prompt,
+            "structuredPrompt": job.structured_prompt or "",
+            "lyrics": job.lyrics or "",
+            "durationMinutes": "auto",
+            "count": 1,
+            "alternatives": [],
+            "fullTrack": f"{base}/output/{quote(path.name)}",
+            "stems": {},
+            "stemUrls": [],
+            "waveforms": await extract_waveforms({"full": path}),
+            "splitEnabled": False,
+            "debug": {"imported": True},
+        }
+        job.save(settings.output_dir)
+        jobs[job_id] = job
+        fingerprints.add(digest)
 
 
 def _song_result(job: GenerationJob, song: int) -> dict[str, Any] | None:
@@ -237,9 +385,10 @@ def create_app(
         lifespan=lifespan,
     )
     application.state.settings = application_settings
-    # ponytail: process-local task state is enough for the single-worker local service;
-    # move this registry to Redis only when multiple workers or restart recovery is required.
-    application.state.jobs: dict[str, GenerationJob] = {}
+    application.state.jobs = load_jobs(application_settings.output_dir)
+    history_lock = asyncio.Lock()
+    legacy_imported = False
+    legacy_candidates = sorted(application_settings.output_dir.glob("full_song_*"))
     install_voice_api(application, application_settings, voice_engine)
     if orchestrator is not None:
         application.state.orchestrator = orchestrator
@@ -326,34 +475,69 @@ def create_app(
                 content={"success": False, "message": str(exc)},
             )
         request_id = request.headers.get("X-Request-ID") or uuid4().hex
+        job = GenerationJob(job_id=f"job_{uuid4().hex}", prompt=prompt)
+        job.save(application_settings.output_dir)
+        request.app.state.jobs[job.job_id] = job
+
+        async def report(stage, progress, message, structured, lyrics, step, total):
+            job.status = "running"
+            job.stage, job.progress, job.message = stage, progress, message
+            job.step, job.total_steps = step, total
+            if structured is not None:
+                job.structured_prompt = structured
+            if lyrics is not None:
+                job.lyrics = lyrics
+            job.save(application_settings.output_dir)
+
         try:
-            return await _orchestrator(request).generate(
+            result = await _orchestrator(request).generate(
                 prompt,
                 duration,
                 _public_base_url(request, application_settings),
                 request_id,
+                job_id=job.job_id,
+                progress=report,
                 provider=payload.provider,
                 count=payload.count,
             )
-        except HTTPException:
+            job.result = result
+            job.status, job.stage, job.progress = "succeeded", "completed", 100
+            job.message = "音乐生成完成"
+            result["createdAt"] = job.created_at
+            job.save(application_settings.output_dir)
+            request.app.state.jobs[job.job_id] = job
+            return result
+        except HTTPException as exc:
+            job.error = str(exc)
             raise
         except CapacityExceededError as exc:
+            job.error = str(exc)
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 content={"success": False, "message": str(exc)},
             )
         except GenerationError as exc:
+            job.error = str(exc)
             logger.exception("generation failed request_id=%s", request_id)
             return JSONResponse(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 content={"success": False, "message": str(exc)},
             )
-        except Exception:
+        except Exception as exc:
+            job.error = str(exc)
             logger.exception("unexpected generation failure request_id=%s", request_id)
             return JSONResponse(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 content={"success": False, "message": "生成失败，请查看后端日志。"},
             )
+        finally:
+            if job.result is None:
+                job.status = job.stage = "failed"
+                job.progress = None
+                job.error = job.error or "生成任务已中断。"
+                job.message = job.error
+            job.step = job.total_steps = None
+            job.save(application_settings.output_dir)
 
     @application.post(
         "/api/jobs",
@@ -388,30 +572,41 @@ def create_app(
             else None
         )
         job = GenerationJob(job_id=job_id, prompt=prompt, warning=warning)
+        try:
+            job.save(application_settings.output_dir)
+        except Exception:
+            await active_orchestrator.capacity.release()
+            raise
         jobs[job_id] = job
         base_url = _public_base_url(request, application_settings)
         request_id = request.headers.get("X-Request-ID") or uuid4().hex
 
         async def report(
             stage: str,
-            progress: int,
+            progress: int | None,
             message: str,
             structured_prompt: str | None,
             lyrics: str | None,
+            step: int | None = None,
+            total_steps: int | None = None,
         ) -> None:
             job.status = "running"
             job.stage = stage
             job.progress = progress
+            job.step = step
+            job.total_steps = total_steps
             job.message = message
             if structured_prompt is not None:
                 job.structured_prompt = structured_prompt
             if lyrics is not None:
                 job.lyrics = lyrics
+            job.save(application_settings.output_dir)
 
         async def execute() -> None:
             try:
                 job.status = "running"
                 job.message = "服务器正在生成音乐"
+                job.save(application_settings.output_dir)
                 job.result = await active_orchestrator.generate(
                     prompt,
                     duration,
@@ -424,6 +619,7 @@ def create_app(
                     count=payload.count,
                 )
                 job.status = "succeeded"
+                job.result["createdAt"] = job.created_at
                 job.stage = "completed"
                 job.progress = 100
                 job.message = "音乐生成完成"
@@ -438,10 +634,35 @@ def create_app(
                 job.message = "音乐生成失败"
                 job.error = str(exc)
             finally:
+                job.step = job.total_steps = None
+                if job.status != "succeeded":
+                    job.progress = None
                 await active_orchestrator.capacity.release()
+                job.save(application_settings.output_dir)
 
         job.task = asyncio.create_task(execute(), name=job_id)
         return {"jobId": job_id, "status": job.status}
+
+    @application.get("/api/jobs")
+    async def generation_history(request: Request):
+        nonlocal legacy_imported
+        async with history_lock:
+            if not legacy_imported:
+                await import_legacy_songs(
+                    request.app.state.jobs,
+                    application_settings,
+                    _public_base_url(request, application_settings),
+                    legacy_candidates,
+                )
+                legacy_imported = True
+        return {
+            "jobs": [
+                job.response()
+                for job in sorted(
+                    request.app.state.jobs.values(), key=lambda job: job.created_at, reverse=True
+                )
+            ]
+        }
 
     @application.get(
         "/api/jobs/{job_id}",
@@ -478,6 +699,8 @@ def create_app(
             job.status = "cancelled"
             job.stage = "cancelled"
             job.message = "任务已取消"
+            job.progress = job.step = job.total_steps = None
+            job.save(application_settings.output_dir)
         return job.response()
 
     @application.delete(
@@ -538,6 +761,7 @@ def create_app(
         if isinstance(waveforms, dict):
             waveforms.pop(stem_name, None)
         job.message = f"音轨 {stem_name} 已删除"
+        job.save(application_settings.output_dir)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @application.put(
@@ -597,6 +821,7 @@ def create_app(
             waveforms[stem_name] = deleted["waveform"]
         del job.deleted_stems[deleted_key]
         job.message = f"音轨 {stem_name} 已恢复"
+        job.save(application_settings.output_dir)
         return job.response()
 
     @application.get("/output/{file_path:path}")

@@ -225,7 +225,9 @@ async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
         running = await client.get(f"/api/jobs/{job_id}")
         assert running.json()["status"] == "running"
         assert running.json()["stage"] == "expanding_prompt"
-        assert running.json()["progress"] == 10
+        assert running.json()["progress"] is None
+        assert running.json()["step"] is None
+        assert running.json()["totalSteps"] is None
         assert running.json()["prompt"] == "真实进度"
         assert running.json()["structuredPrompt"] is None
         prompt_file = settings.output_dir / "jobs" / job_id / "prompts.json"
@@ -254,8 +256,8 @@ async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
         "structuredPrompt": "[Genre: Test]",
         "lyrics": "[Verse]\n自动生成的测试歌词",
     }
-    assert body["result"]["splitEnabled"] is True
-    assert set(body["result"]["stems"]) == {"vocal", "drums", "bass", "other"}
+    assert body["result"]["splitEnabled"] is False
+    assert body["result"]["stems"] == {}
 
 
 async def test_async_job_can_be_cancelled(tmp_path: Path) -> None:
@@ -287,6 +289,8 @@ async def test_async_job_deleted_stem_stays_deleted(tmp_path: Path) -> None:
                 break
             await asyncio.sleep(0)
 
+        seed_legacy_stems(app, settings, job_id)
+        completed = await client.get(f"/api/jobs/{job_id}")
         vocal_url = completed.json()["result"]["stems"]["vocal"]
         deleted = await client.delete(f"/api/jobs/{job_id}/stems/vocal")
         refreshed = await client.get(f"/api/jobs/{job_id}")
@@ -324,6 +328,7 @@ async def test_async_second_song_stem_can_be_deleted_and_restored(tmp_path: Path
                 break
             await asyncio.sleep(0)
 
+        seed_legacy_stems(app, settings, job_id)
         deleted = await client.delete(f"/api/jobs/{job_id}/stems/vocal?song=1")
         after_delete = (await client.get(f"/api/jobs/{job_id}")).json()
         restored = await client.put(f"/api/jobs/{job_id}/stems/vocal?song=1")
@@ -347,6 +352,8 @@ async def test_restore_forgets_missing_trash_file(tmp_path: Path) -> None:
                 break
             await asyncio.sleep(0)
 
+        seed_legacy_stems(app, settings, job_id)
+        completed = await client.get(f"/api/jobs/{job_id}")
         vocal_url = completed.json()["result"]["stems"]["vocal"]
         await client.delete(f"/api/jobs/{job_id}/stems/vocal")
         trash = settings.output_dir / ".trash" / job_id / Path(vocal_url).name
@@ -511,3 +518,14 @@ async def test_application_lifespan_accepts_proxy_environment(
 
     async with app.router.lifespan_context(app):
         assert app.state.orchestrator is not None
+
+
+def seed_legacy_stems(app, settings, job_id):
+    job = app.state.jobs[job_id]
+    for index, result in enumerate([job.result, *job.result.get("alternatives", [])]):
+        path = settings.output_dir / "jobs" / job_id / f"legacy_{index}_vocal.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"ID3-legacy-stem")
+        url = f"http://testserver/output/{path.relative_to(settings.output_dir)}"
+        result.update(stems={"vocal": url}, stemUrls=[url], splitEnabled=True)
+    job.save(settings.output_dir)

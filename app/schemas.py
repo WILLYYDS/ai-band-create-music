@@ -58,12 +58,15 @@ class UpdateGenerationJobRequest(BaseModel):
 
 class GenerationJobResponse(BaseModel):
     jobId: str
+    createdAt: str
     prompt: str
     structuredPrompt: str | None = None
     lyrics: str | None = None
     status: Literal["pending", "running", "succeeded", "failed", "cancelled"]
     stage: str
-    progress: int
+    progress: int | None = None
+    step: int | None = None
+    totalSteps: int | None = None
     message: str
     warning: str | None = None
     result: GenerateResponse | None = None
