@@ -54,7 +54,13 @@ QWEN_FLAT_MUSIC_PROMPT = (
     "Verse-Chorus Structure, Wide Stereo Mix, High-Fidelity Production, Dynamic Swells, "
     "Subtle Reverb, No Distortion, No Lo-Fi, No Auto-Tune Overuse]"
 )
-ONE_MINUTE_LYRICS = "[Verse]\n" + "\n".join(f"第 {index} 句歌词" for index in range(8))
+
+
+def generated_lyrics(line_count: int) -> str:
+    return "[Verse]\n" + "\n".join(f"第 {index} 句歌词" for index in range(line_count))
+
+
+ONE_MINUTE_LYRICS = generated_lyrics(8)
 
 
 def test_normalize_llm_output_removes_fences_and_quotes() -> None:
@@ -387,6 +393,7 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        lyrics = generated_lyrics(2 if len(requests) == 1 else 23)
         return httpx.Response(
             200,
             json={
@@ -395,9 +402,7 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "taggedLyrics": (
-                                        "[Verse]\n自动生成第一句\n[Chorus]\n自动生成第二句"
-                                    ),
+                                    "taggedLyrics": lyrics,
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
                                     "durationSeconds": 155,
                                     "durationPlan": {
@@ -428,9 +433,9 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
         )
 
     assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
-    assert prepared.lyrics.startswith("[Verse]")
+    assert prepared.lyrics == generated_lyrics(23)
     assert prepared.duration_seconds == 155
-    assert len(requests) == 1
+    assert len(requests) == 2
     body = json.loads(requests[0].content)
     assert "同时生成原创歌词和音乐风格说明" in body["messages"][0]["content"]
     assert "目标时长：自动" in body["messages"][1]["content"]
@@ -455,7 +460,7 @@ async def test_prepare_retries_excess_auto_intro_and_outro_budget(tmp_path: Path
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "taggedLyrics": "[Verse]\n第一句\n第二句",
+                                    "taggedLyrics": generated_lyrics(26),
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
                                     "durationSeconds": 180,
                                     "durationPlan": {
@@ -492,7 +497,7 @@ async def test_prepare_retries_generated_lyrics_with_custom_stage_directions(
         lyrics = (
             "[Guitar Solo]\n（25 秒吉他独奏）\n第一句"
             if len(requests) == 1
-            else "[Solo]\n[Verse]\n第一句"
+            else generated_lyrics(12)
         )
         return httpx.Response(
             200,
@@ -523,7 +528,7 @@ async def test_prepare_retries_generated_lyrics_with_custom_stage_directions(
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         prepared = await OpenAICompatiblePromptExpander(settings, client).prepare("男声摇滚")
 
-    assert prepared.lyrics == "[Solo]\n[Verse]\n第一句"
+    assert prepared.lyrics == generated_lyrics(12)
     assert len(requests) == 2
 
 
@@ -650,7 +655,7 @@ async def test_prepare_retries_concise_style_and_adds_missing_verse_tag(tmp_path
 @pytest.mark.parametrize(
     "invalid_lyrics",
     [
-        "[Verse]\n" + "\n".join(f"第 {index} 句" for index in range(21)),
+        generated_lyrics(23),
         "[Verse]\n" + "过" * 33 + "\n" + "\n".join(f"第 {index} 句" for index in range(7)),
     ],
 )

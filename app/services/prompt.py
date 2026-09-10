@@ -131,7 +131,8 @@ def lyrics_duration_instruction(
             f"{maximum_seconds} 秒内最短且足够的生成上限，并在 JSON 的 durationSeconds "
             "返回整数秒数。"
             "audio_duration 只是模型可提前结束的上限，不是必须填满的目标；请逐段估算演唱、独奏、"
-            "前奏和尾奏时间，不要增加安全余量。按 BPM 计算每小节秒数，每句歌词通常占 1-2 小节；"
+            "前奏和尾奏时间，不要增加安全余量。按 BPM 计算每小节秒数，每句歌词通常占 1-2 小节、"
+            "应能在 2-6 秒内唱完；"
             "前奏、过渡和尾奏合计应尽量控制在 20 秒内，尾奏不得超过 5 秒，明确要求的独奏时长"
             "单独计入。durationPlan 必须包含整数 vocalSeconds、introAndTransitionsSeconds、"
             "soloAndInstrumentalSeconds、outroSeconds，四项之和必须等于 durationSeconds。"
@@ -755,16 +756,14 @@ class OpenAICompatiblePromptExpander:
                         lyric_lines = [
                             line for line in lines if not LYRICS_SECTION_PATTERN.fullmatch(line)
                         ]
-                        if len(lyric_lines) > round(duration_seconds / 3) or any(
-                            len(line) > 32 for line in lyric_lines
-                        ):
-                            raise ValueError("模型生成的歌词超过指定时长可容纳的长度")
-                        if duration_minutes is not None and not (
+                        if any(len(line) > 32 for line in lyric_lines):
+                            raise ValueError("模型生成了超过 32 个字符的歌词行")
+                        if not (
                             (duration_plan["vocalSeconds"] + 5) // 6
                             <= len(lyric_lines)
                             <= duration_plan["vocalSeconds"] // 2
                         ):
-                            raise ValueError("模型生成的歌词句数与固定时长预算不一致")
+                            raise ValueError("模型生成的歌词句数与演唱时长预算不一致")
                     return PreparedPrompt(structured, tagged, duration_seconds)
                 except (ValueError, KeyError, IndexError, TypeError):
                     if attempt:
