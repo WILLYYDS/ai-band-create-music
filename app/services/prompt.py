@@ -140,13 +140,20 @@ def lyrics_duration_instruction(
     max_lines = round(duration_minutes * 20)
     duration_seconds = round(duration_minutes * 60)
     json_instruction = (
-        f"JSON 的 durationSeconds 必须为 {duration_seconds}。" if include_json_duration else ""
+        f"JSON 的 durationSeconds 必须为 {duration_seconds}。"
+        "durationPlan 必须包含整数 vocalSeconds、introAndTransitionsSeconds、"
+        "soloAndInstrumentalSeconds、outroSeconds，四项之和必须严格等于目标秒数；"
+        "根据 vocalSeconds 和 BPM 决定歌词句数，每句通常占 1-2 小节。"
+        if include_json_duration
+        else ""
     )
     return (
         f"目标时长：严格 {duration_seconds} 秒（约 {duration_minutes:g} 分钟）；"
         f"{json_instruction}必须让全部歌词在目标时长内完整唱完，"
         f"并为前奏、间奏和尾奏留出时间；歌词最多 {max_lines} 行（结构标签不计），"
-        "每行简短，宁可少写，也不要让结尾歌词被截断；歌词唱完后绝对不能继续演唱。"
+        "每句应能在 2-6 秒内唱完，每行不超过 32 个字符，宁可少写，也不要让结尾歌词被截断；"
+        "前奏、过渡和尾奏合计"
+        "不得超过 15 秒，尾奏不得超过 5 秒；歌词唱完后绝对不能继续演唱。"
     )
 
 
@@ -715,6 +722,17 @@ class OpenAICompatiblePromptExpander:
                         raise ValueError("模型未返回至少 8 个详细风格标签")
                     if duration_minutes is None:
                         duration_seconds = prepared.get("durationSeconds")
+                        if type(duration_seconds) is not int or not (
+                            self._settings.min_duration_minutes * 60
+                            <= duration_seconds
+                            <= self._settings.max_duration_minutes * 60
+                        ):
+                            raise ValueError("模型未返回范围内的整数 durationSeconds")
+                    else:
+                        duration_seconds = duration_minutes * 60
+                        if generate_lyrics and prepared.get("durationSeconds") != duration_seconds:
+                            raise ValueError("模型返回的 durationSeconds 与指定时长不一致")
+                    if duration_minutes is None or generate_lyrics:
                         duration_plan = prepared.get("durationPlan")
                         plan_fields = (
                             "vocalSeconds",
@@ -722,22 +740,31 @@ class OpenAICompatiblePromptExpander:
                             "soloAndInstrumentalSeconds",
                             "outroSeconds",
                         )
-                        if type(duration_seconds) is not int or not (
-                            self._settings.min_duration_minutes * 60
-                            <= duration_seconds
-                            <= self._settings.max_duration_minutes * 60
-                        ):
-                            raise ValueError("模型未返回范围内的整数 durationSeconds")
                         if (
                             not isinstance(duration_plan, dict)
                             or any(type(duration_plan.get(key)) is not int for key in plan_fields)
                             or any(duration_plan[key] < 0 for key in plan_fields)
                             or duration_plan["outroSeconds"] > 5
+                            or duration_plan["introAndTransitionsSeconds"]
+                            + duration_plan["outroSeconds"]
+                            > 15
                             or sum(duration_plan[key] for key in plan_fields) != duration_seconds
                         ):
                             raise ValueError("模型未返回与总时长一致的 durationPlan")
-                    else:
-                        duration_seconds = duration_minutes * 60
+                    if generate_lyrics:
+                        lyric_lines = [
+                            line for line in lines if not LYRICS_SECTION_PATTERN.fullmatch(line)
+                        ]
+                        if len(lyric_lines) > round(duration_seconds / 3) or any(
+                            len(line) > 32 for line in lyric_lines
+                        ):
+                            raise ValueError("模型生成的歌词超过指定时长可容纳的长度")
+                        if duration_minutes is not None and not (
+                            (duration_plan["vocalSeconds"] + 5) // 6
+                            <= len(lyric_lines)
+                            <= duration_plan["vocalSeconds"] // 2
+                        ):
+                            raise ValueError("模型生成的歌词句数与固定时长预算不一致")
                     return PreparedPrompt(structured, tagged, duration_seconds)
                 except (ValueError, KeyError, IndexError, TypeError):
                     if attempt:

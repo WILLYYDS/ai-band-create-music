@@ -54,6 +54,7 @@ QWEN_FLAT_MUSIC_PROMPT = (
     "Verse-Chorus Structure, Wide Stereo Mix, High-Fidelity Production, Dynamic Swells, "
     "Subtle Reverb, No Distortion, No Lo-Fi, No Auto-Tune Overuse]"
 )
+ONE_MINUTE_LYRICS = "[Verse]\n" + "\n".join(f"第 {index} 句歌词" for index in range(8))
 
 
 def test_normalize_llm_output_removes_fences_and_quotes() -> None:
@@ -353,8 +354,15 @@ async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> 
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "taggedLyrics": ("[Verse]\n自动生成第一句\n自动生成第二句"),
+                                    "taggedLyrics": ONE_MINUTE_LYRICS,
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                                    "durationSeconds": 60,
+                                    "durationPlan": {
+                                        "vocalSeconds": 45,
+                                        "introAndTransitionsSeconds": 10,
+                                        "soloAndInstrumentalSeconds": 0,
+                                        "outroSeconds": 5,
+                                    },
                                 }
                             )
                         }
@@ -519,8 +527,15 @@ async def test_prepare_retries_generated_lyrics_with_custom_stage_directions(
 async def test_prepare_extracts_json_surrounded_by_commentary(tmp_path: Path) -> None:
     payload = json.dumps(
         {
-            "taggedLyrics": "[Verse]\n自动生成第一句\n自动生成第二句",
+            "taggedLyrics": ONE_MINUTE_LYRICS,
             "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+            "durationSeconds": 60,
+            "durationPlan": {
+                "vocalSeconds": 45,
+                "introAndTransitionsSeconds": 10,
+                "soloAndInstrumentalSeconds": 0,
+                "outroSeconds": 5,
+            },
         },
         ensure_ascii=False,
     )
@@ -543,7 +558,7 @@ async def test_prepare_extracts_json_surrounded_by_commentary(tmp_path: Path) ->
         )
 
     assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
-    assert prepared.lyrics == "[Verse]\n自动生成第一句\n自动生成第二句"
+    assert prepared.lyrics == ONE_MINUTE_LYRICS
     assert prepared.duration_seconds == 60
 
 
@@ -556,8 +571,15 @@ async def test_prepare_retries_once_after_invalid_json(tmp_path: Path) -> None:
         if len(requests) == 2:
             content = json.dumps(
                 {
-                    "taggedLyrics": "[Verse]\n自动生成第一句\n自动生成第二句",
+                    "taggedLyrics": ONE_MINUTE_LYRICS,
                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                    "durationSeconds": 60,
+                    "durationPlan": {
+                        "vocalSeconds": 45,
+                        "introAndTransitionsSeconds": 10,
+                        "soloAndInstrumentalSeconds": 0,
+                        "outroSeconds": 5,
+                    },
                 },
                 ensure_ascii=False,
             )
@@ -589,12 +611,19 @@ async def test_prepare_retries_concise_style_and_adds_missing_verse_tag(tmp_path
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "lyrics": "自动生成第一句\n自动生成第二句",
+                                    "lyrics": ONE_MINUTE_LYRICS.removeprefix("[Verse]\n"),
                                     "style": (
                                         "[Genre: Rock]"
                                         if len(requests) == 1
                                         else EXPANDED_MANDARIN_ROCK_PROMPT
                                     ),
+                                    "durationSeconds": 60,
+                                    "durationPlan": {
+                                        "vocalSeconds": 45,
+                                        "introAndTransitionsSeconds": 10,
+                                        "soloAndInstrumentalSeconds": 0,
+                                        "outroSeconds": 5,
+                                    },
                                 }
                             )
                         }
@@ -611,7 +640,56 @@ async def test_prepare_retries_concise_style_and_adds_missing_verse_tag(tmp_path
         )
 
     assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
-    assert prepared.lyrics == "[Verse]\n自动生成第一句\n自动生成第二句"
+    assert prepared.lyrics == ONE_MINUTE_LYRICS
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize(
+    "invalid_lyrics",
+    [
+        "[Verse]\n" + "\n".join(f"第 {index} 句" for index in range(21)),
+        "[Verse]\n" + "过" * 33 + "\n" + "\n".join(f"第 {index} 句" for index in range(7)),
+    ],
+)
+async def test_prepare_retries_lyrics_that_do_not_fit_fixed_duration(
+    tmp_path: Path, invalid_lyrics: str
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "taggedLyrics": (
+                                        invalid_lyrics if len(requests) == 1 else ONE_MINUTE_LYRICS
+                                    ),
+                                    "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                                    "durationSeconds": 60,
+                                    "durationPlan": {
+                                        "vocalSeconds": 45,
+                                        "introAndTransitionsSeconds": 10,
+                                        "soloAndInstrumentalSeconds": 0,
+                                        "outroSeconds": 5,
+                                    },
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare("男声摇滚", 1)
+
+    assert prepared.lyrics == ONE_MINUTE_LYRICS
     assert len(requests) == 2
 
 
