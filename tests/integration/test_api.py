@@ -99,7 +99,7 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
         assert response.status_code == 200
         body = response.json()
         assert body["durationMinutes"] == 3
-        assert body["debug"]["music"]["durationMinutes"] == 3
+        assert body["debug"]["music"]["durationSeconds"] == 180
         assert body["splitEnabled"] is False
         assert body["stems"] == {}
         assert body["waveforms"] == {}
@@ -116,7 +116,7 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
     "duration_field",
     [{"durationMinutes": "auto"}, {"durationMinutes": None}, {}],
 )
-async def test_generate_resolves_auto_duration(
+async def test_generate_uses_llm_duration_for_auto(
     tmp_path: Path, duration_field: dict[str, object]
 ) -> None:
     settings = make_settings(tmp_path, enable_audio_splitting=False)
@@ -130,8 +130,8 @@ async def test_generate_resolves_auto_duration(
     assert response.status_code == 200
     body = response.json()
     assert body["durationMinutes"] == "auto"
-    assert body["requestedDurationSeconds"] == 60
-    assert body["debug"]["music"]["durationMinutes"] == 1
+    assert body["requestedDurationSeconds"] == 150
+    assert body["debug"]["music"]["durationSeconds"] == 150
 
 
 async def test_generate_selects_provider_per_request(tmp_path: Path) -> None:
@@ -231,12 +231,16 @@ async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
         assert running.json()["prompt"] == "真实进度"
         assert running.json()["structuredPrompt"] is None
         prompt_file = settings.output_dir / "jobs" / job_id / "prompts.json"
-        assert json.loads(prompt_file.read_text(encoding="utf-8")) == {
-            "jobId": job_id,
-            "prompt": "真实进度",
-            "structuredPrompt": None,
-            "lyrics": None,
-        }
+        initial_diagnostics = json.loads(prompt_file.read_text(encoding="utf-8"))
+        assert initial_diagnostics["jobId"] == job_id
+        assert initial_diagnostics["prompt"] == "真实进度"
+        assert initial_diagnostics["structuredPrompt"] is None
+        assert initial_diagnostics["lyrics"] is None
+        assert initial_diagnostics["provider"] == "minimax_music"
+        assert initial_diagnostics["requestedDurationMinutes"] == "auto"
+        assert initial_diagnostics["requestedCount"] == 1
+        assert initial_diagnostics["effectiveCount"] == 1
+        assert initial_diagnostics["requestId"]
 
         blocker.release.set()
         for _ in range(20):
@@ -250,12 +254,14 @@ async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
     assert body["prompt"] == "真实进度"
     assert body["structuredPrompt"] == "[Genre: Test]"
     assert body["lyrics"] == "[Verse]\n自动生成的测试歌词"
-    assert json.loads(prompt_file.read_text(encoding="utf-8")) == {
-        "jobId": job_id,
-        "prompt": "真实进度",
-        "structuredPrompt": "[Genre: Test]",
-        "lyrics": "[Verse]\n自动生成的测试歌词",
-    }
+    final_diagnostics = json.loads(prompt_file.read_text(encoding="utf-8"))
+    assert final_diagnostics["structuredPrompt"] == "[Genre: Test]"
+    assert final_diagnostics["lyrics"] == "[Verse]\n自动生成的测试歌词"
+    assert final_diagnostics["style"] == "真实进度"
+    assert final_diagnostics["providerPrompt"].startswith("[歌词与创作内容]")
+    assert final_diagnostics["durationSource"] == "llm"
+    assert final_diagnostics["effectiveDurationSeconds"] == 150
+    assert final_diagnostics["effectiveDurationMinutes"] == 2.5
     assert body["result"]["splitEnabled"] is False
     assert body["result"]["stems"] == {}
 

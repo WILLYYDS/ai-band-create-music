@@ -46,7 +46,7 @@ async def test_minimax_actual_progress_terminal_and_cancellation(tmp_path, outco
         provider = MiniMaxMusicProvider(settings, http)
         call = provider.generate(
             "rock",
-            None,
+            180,
             f"[歌词与创作内容]\n{lyrics.rstrip()}",
             progress=progress,
             job_id="local-job",

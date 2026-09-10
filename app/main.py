@@ -38,6 +38,7 @@ from app.schemas import (
     UpdateGenerationJobRequest,
 )
 from app.services.audio_files import detect_audio_content_type
+from app.services.job_files import read_job_diagnostics
 from app.services.orchestrator import GenerationOrchestrator
 from app.services.prompt import OpenAICompatiblePromptExpander, effective_llm_output_tokens
 from app.services.providers import create_music_provider
@@ -153,11 +154,11 @@ class GenerationJob:
         temporary = target.with_name(f"job.{uuid4().hex}.tmp")
         try:
             with temporary.open("w", encoding="utf-8") as stream:
-                json.dump(
-                    {**self.response(), "deletedStems": self.deleted_stems},
-                    stream,
-                    ensure_ascii=False,
-                )
+                payload = {**self.response(), "deletedStems": self.deleted_stems}
+                diagnostics = read_job_diagnostics(output_dir, self.job_id)
+                if diagnostics:
+                    payload["diagnostics"] = diagnostics
+                json.dump(payload, stream, ensure_ascii=False)
                 stream.flush()
                 os.fsync(stream.fileno())
             temporary.replace(target)

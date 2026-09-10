@@ -14,6 +14,7 @@ import httpx
 from app.core.config import PROJECT_ROOT, Settings
 from app.core.errors import GenerationError
 from app.services.audio_files import download_audio, require_readable_file, write_stream_atomically
+from app.services.job_files import update_provider_diagnostic
 from app.services.prompt import (
     OpenAICompatiblePromptExpander,
     _http_failure_message,
@@ -37,7 +38,7 @@ class MusicProvider(Protocol):
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: float | None,
+        duration_seconds: int,
         user_prompt: str,
         *,
         variation: int = 0,
@@ -45,9 +46,16 @@ class MusicProvider(Protocol):
         job_id: str | None = None,
     ) -> MusicResult: ...
 
-
-def _effective_duration(settings: Settings, duration_minutes: float | None) -> float:
-    return duration_minutes if duration_minutes is not None else settings.default_duration_minutes
+def _response_diagnostic(response: httpx.Response) -> dict[str, Any]:
+    try:
+        body = response.json()
+    except ValueError:
+        body = response.text
+    return {
+        "statusCode": response.status_code,
+        "headers": dict(response.headers),
+        "body": body,
+    }
 
 
 def extract_task_id(data: Any) -> str | None:
@@ -131,7 +139,7 @@ class MockMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: float | None,
+        duration_seconds: int,
         user_prompt: str,
         *,
         variation: int = 0,
@@ -161,7 +169,7 @@ class GenericMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: float | None,
+        duration_seconds: int,
         user_prompt: str,
         *,
         variation: int = 0,
@@ -172,14 +180,13 @@ class GenericMusicProvider:
             raise GenerationError(
                 "音乐生成失败：MUSIC_API_MODE=real 时必须配置 MUSIC_API_BASE_URL。"
             )
-        duration_minutes = _effective_duration(self._settings, duration_minutes)
         try:
             response = await self._client.post(
                 f"{self._settings.music_api_base_url}{self._settings.music_generate_path}",
                 json={
                     "prompt": structured_prompt,
-                    "duration_minutes": duration_minutes,
-                    "duration_seconds": duration_minutes * 60,
+                    "duration_minutes": duration_seconds / 60,
+                    "duration_seconds": duration_seconds,
                     "model": self._settings.music_model or None,
                     "callback_url": self._settings.music_callback_url or None,
                 },
@@ -263,15 +270,14 @@ class ElevenLabsMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: float | None,
+        duration_seconds: int,
         user_prompt: str,
         *,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
     ) -> MusicResult:
-        duration_minutes = _effective_duration(self._settings, duration_minutes)
-        music_length_ms = round(duration_minutes * 60 * 1000)
+        music_length_ms = duration_seconds * 1000
         clear_chinese = (
             self._settings.elevenlabs_clear_chinese_vocal_mode
             and looks_like_chinese_music_request(user_prompt, structured_prompt)
@@ -282,7 +288,7 @@ class ElevenLabsMusicProvider:
         )
         lyrics, _ = split_generation_prompt(user_prompt)
         planning_prompt = build_elevenlabs_planning_prompt(
-            structured_prompt, duration_minutes, clear_chinese, lyrics
+            structured_prompt, duration_seconds / 60, clear_chinese, lyrics
         )
         try:
             if use_plan:
@@ -389,7 +395,7 @@ class SunoMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: float | None,
+        duration_seconds: int,
         user_prompt: str,
         *,
         variation: int = 0,
@@ -400,7 +406,7 @@ class SunoMusicProvider:
             raise GenerationError(
                 "音乐生成失败：MUSIC_PROVIDER=suno_api 时必须配置 MUSIC_API_BASE_URL。"
             )
-        duration_minutes = _effective_duration(self._settings, duration_minutes)
+        duration_minutes = duration_seconds / 60
         failures: list[str] = []
         data: Any = None
         for model in self._models():
@@ -479,7 +485,7 @@ class MiniMaxMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: float | None,
+        duration_seconds: int,
         user_prompt: str,
         *,
         variation: int = 0,
@@ -489,13 +495,12 @@ class MiniMaxMusicProvider:
         if not self._settings.minimax_base_url:
             raise GenerationError("MiniMax 音乐生成失败：MINIMAX_BASE_URL 不能为空。")
         try:
-            lyrics_duration = _effective_duration(self._settings, duration_minutes)
             lyrics, _ = split_generation_prompt(user_prompt)
             if not lyrics:
                 lyrics = await self._lyrics_writer.write_lyrics(
                     structured_prompt,
                     user_prompt,
-                    lyrics_duration,
+                    duration_seconds / 60,
                 )
             if len(lyrics) < 10:
                 raise GenerationError("MiniMax 音乐生成失败：生成的歌词不足 10 个字符。")
@@ -511,18 +516,43 @@ class MiniMaxMusicProvider:
             }
             if job_id:
                 request_body["jobId"] = uuid5(NAMESPACE_URL, f"{job_id}:{variation}").hex
-            if duration_minutes is not None:
-                request_body["audio_duration"] = duration_minutes * 60
-            else:
-                request_body["auto_duration_hint"] = user_prompt
+            request_body["audio_duration"] = duration_seconds
+            request_body["instructions"] += (
+                f"\n[Timing: Finish singing every lyric line by "
+                f"{duration_seconds - 10:g} seconds, reserve the final 10 seconds for a short "
+                "instrumental outro, and never omit, rush, or cut off lyrics. After the final "
+                "provided lyric line, stop all vocals completely: do not invent or repeat "
+                "lyrics, sing extra words, hum, chant, or add vocal ad-libs.]"
+            )
             url = f"{self._settings.minimax_base_url}{MINIMAX_GENERATE_PATH}"
+            request_diagnostic = {
+                "method": "POST",
+                "url": url,
+                "timeoutSeconds": self._settings.minimax_timeout_seconds,
+                "body": request_body,
+            }
+            update_provider_diagnostic(
+                self._settings.output_dir,
+                job_id,
+                variation,
+                provider="minimax_music",
+                request=request_diagnostic,
+            )
             response = await self._client.post(
                 url,
                 json=request_body,
                 timeout=self._settings.minimax_timeout_seconds,
             )
+            create_response = _response_diagnostic(response)
+            update_provider_diagnostic(
+                self._settings.output_dir,
+                job_id,
+                variation,
+                createResponse=create_response,
+            )
             response.raise_for_status()
-            remote_id = response.json().get("jobId")
+            create_body = create_response["body"]
+            remote_id = create_body.get("jobId") if isinstance(create_body, dict) else None
             if not isinstance(remote_id, str) or not remote_id:
                 raise GenerationError("MiniMax 未返回 jobId。")
 
@@ -536,8 +566,17 @@ class MiniMaxMusicProvider:
                     if remaining <= 0:
                         raise GenerationError("MiniMax 音乐生成任务超时。")
                     response = await self._client.get(job_url, timeout=min(30, remaining))
+                    status_response = _response_diagnostic(response)
+                    update_provider_diagnostic(
+                        self._settings.output_dir,
+                        job_id,
+                        variation,
+                        statusResponse=status_response,
+                    )
                     response.raise_for_status()
-                    state = response.json()
+                    state = status_response["body"]
+                    if not isinstance(state, dict):
+                        raise GenerationError("MiniMax 返回的任务状态不是 JSON 对象。")
                     step, total = state.get("step"), state.get("totalSteps")
                     if step is not None and (type(step) is not int or step < 0):
                         raise GenerationError("MiniMax 返回无效 step。")
@@ -566,6 +605,18 @@ class MiniMaxMusicProvider:
                 ) as response:
                     if not response.is_success:
                         await response.aread()
+                    audio_response = {
+                        "statusCode": response.status_code,
+                        "headers": dict(response.headers),
+                    }
+                    if not response.is_success:
+                        audio_response["body"] = response.text
+                    update_provider_diagnostic(
+                        self._settings.output_dir,
+                        job_id,
+                        variation,
+                        audioResponse=audio_response,
+                    )
                     response.raise_for_status()
                     await write_stream_atomically(
                         response.aiter_bytes(), target, "MiniMax Music 3 服务返回空音频。"
@@ -588,6 +639,10 @@ class MiniMaxMusicProvider:
                     "durationSeconds": state.get("durationSeconds"),
                     "seed": self._settings.minimax_seed + variation,
                     "numInferenceSteps": self._settings.minimax_num_inference_steps,
+                    "request": request_diagnostic,
+                    "createResponse": create_response,
+                    "statusResponse": status_response,
+                    "audioResponse": audio_response,
                 },
             )
         except GenerationError:

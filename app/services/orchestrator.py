@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -15,11 +13,8 @@ from app.core.errors import CapacityExceededError
 from app.infrastructure.events import EventPublisher, GenerationEvent
 from app.infrastructure.queue import TaskDispatcher
 from app.services.audio_files import build_public_audio_url, ensure_file_under_root
-from app.services.prompt import (
-    PromptExpander,
-    estimate_music_duration_seconds,
-    split_generation_prompt,
-)
+from app.services.job_files import update_job_diagnostics
+from app.services.prompt import PromptExpander, split_generation_prompt
 from app.services.providers import MusicProvider
 from app.services.stems import StemSeparator
 from app.services.waveforms import extract_waveforms
@@ -28,33 +23,6 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[
     [str, int | None, str, str | None, str | None, int | None, int | None], Awaitable[None]
 ]
-
-
-def save_job_prompts(
-    output_dir: Path,
-    job_id: str,
-    prompt: str,
-    structured_prompt: str | None = None,
-    lyrics: str | None = None,
-) -> Path:
-    target = output_dir / "jobs" / job_id / "prompts.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(
-            {
-                "jobId": job_id,
-                "prompt": prompt,
-                "structuredPrompt": structured_prompt,
-                "lyrics": lyrics,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    temporary.replace(target)
-    return target
 
 
 class GenerationCapacity:
@@ -141,34 +109,43 @@ class GenerationOrchestrator:
                 await progress(stage, value, message, structured_prompt, lyrics, step, total_steps)
 
         async def execute() -> dict[str, Any]:
-            save_job_prompts(self.settings.output_dir, job_id, user_prompt)
+            update_job_diagnostics(
+                self.settings.output_dir,
+                job_id,
+                requestId=request_id,
+                prompt=user_prompt,
+                requestedDurationMinutes=(
+                    duration_minutes if duration_minutes is not None else "auto"
+                ),
+                provider=selected_provider,
+                requestedCount=count,
+                effectiveCount=effective_count,
+                structuredPrompt=None,
+                lyrics=None,
+            )
             await self.events.publish(GenerationEvent("generation.started", job_id, request_id))
             await report("expanding_prompt", None, "正在处理歌词与音乐风格")
             _, style = split_generation_prompt(user_prompt)
-            structured_prompt, lyrics = await self.prompt_expander.prepare(
+            prepared = await self.prompt_expander.prepare(
                 user_prompt,
                 duration_minutes,
             )
-            duration_seconds = (
-                duration_minutes * 60
-                if duration_minutes is not None
-                else estimate_music_duration_seconds(
-                    lyrics,
-                    f"{style}\n{structured_prompt}",
-                    minimum=self.settings.min_duration_minutes * 60,
-                    maximum=self.settings.max_duration_minutes * 60,
-                )
-            )
-            model_duration_minutes = duration_seconds / 60
+            structured_prompt = prepared.structured_prompt
+            lyrics = prepared.lyrics
+            duration_seconds = prepared.duration_seconds
             provider_prompt = f"[歌词与创作内容]\n{lyrics}"
             if style:
                 provider_prompt += f"\n\n[风格要求]\n{style}"
-            save_job_prompts(
+            update_job_diagnostics(
                 self.settings.output_dir,
                 job_id,
-                user_prompt,
-                structured_prompt,
-                lyrics,
+                style=style,
+                structuredPrompt=structured_prompt,
+                lyrics=lyrics,
+                providerPrompt=provider_prompt,
+                durationSource="user" if duration_minutes is not None else "llm",
+                effectiveDurationSeconds=duration_seconds,
+                effectiveDurationMinutes=duration_seconds / 60,
             )
             outputs: list[dict[str, Any]] = []
             music_provider = self.music_providers.get(selected_provider, self.music_provider)
@@ -198,7 +175,7 @@ class GenerationOrchestrator:
 
                 music_result = await music_provider.generate(
                     structured_prompt,
-                    model_duration_minutes,
+                    duration_seconds,
                     provider_prompt,
                     variation=index,
                     progress=provider_progress,

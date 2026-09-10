@@ -24,6 +24,14 @@ async def test_direct_history_restart_and_duplicate_import(tmp_path):
     assert len(history) == 1
     assert history[0]["createdAt"] == result["createdAt"]
     assert history[0]["result"]["fullTrack"] == result["fullTrack"]
+    stored = json.loads(
+        (settings.output_dir / "jobs" / result["jobId"] / "job.json").read_text()
+    )
+    assert stored["diagnostics"]["prompt"] == "rock"
+    assert stored["diagnostics"]["provider"] == "minimax_music"
+    assert stored["diagnostics"]["durationSource"] == "llm"
+    assert stored["diagnostics"]["effectiveDurationSeconds"] == 150
+    assert stored["diagnostics"]["effectiveDurationMinutes"] == 2.5
     orchestrator.stem_separator.split.assert_not_called()
     copy = settings.output_dir / "full_song_minimax_duplicate.wav"
     copy.write_bytes(b"ID3-full-audio")

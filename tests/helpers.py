@@ -7,6 +7,7 @@ from app.core.config import Settings
 from app.infrastructure.events import NullEventPublisher
 from app.infrastructure.queue import InlineTaskDispatcher
 from app.services.orchestrator import GenerationOrchestrator
+from app.services.prompt import PreparedPrompt
 from app.services.providers import MusicResult
 from app.services.stems import SplitResult, stem_output_files
 
@@ -17,11 +18,16 @@ class StubPromptExpander:
 
     async def prepare(
         self, user_prompt: str, duration_minutes: int | None = None
-    ) -> tuple[str, str]:
+    ) -> PreparedPrompt:
+        duration_seconds = duration_minutes * 60 if duration_minutes is not None else 150
         if user_prompt.startswith("[歌词与创作内容]"):
             lyrics = user_prompt.split("\n\n[风格要求]", 1)[0].split("\n", 1)[1]
-            return await self.expand(user_prompt), f"[Verse]\n{lyrics}"
-        return await self.expand(user_prompt), "[Verse]\n自动生成的测试歌词"
+            return PreparedPrompt(
+                await self.expand(user_prompt), f"[Verse]\n{lyrics}", duration_seconds
+            )
+        return PreparedPrompt(
+            await self.expand(user_prompt), "[Verse]\n自动生成的测试歌词", duration_seconds
+        )
 
     async def write_lyrics(
         self, structured_prompt: str, user_prompt: str, duration_minutes: int
@@ -41,8 +47,12 @@ class BlockingPromptExpander:
 
     async def prepare(
         self, user_prompt: str, duration_minutes: int | None = None
-    ) -> tuple[str, str]:
-        return await self.expand(user_prompt), "[Verse]\n自动生成的测试歌词"
+    ) -> PreparedPrompt:
+        return PreparedPrompt(
+            await self.expand(user_prompt),
+            "[Verse]\n自动生成的测试歌词",
+            duration_minutes * 60 if duration_minutes is not None else 150,
+        )
 
     async def write_lyrics(
         self, structured_prompt: str, user_prompt: str, duration_minutes: int
@@ -60,7 +70,7 @@ class StubMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_minutes: int | None,
+        duration_seconds: int,
         user_prompt: str,
         *,
         variation: int = 0,
@@ -70,7 +80,7 @@ class StubMusicProvider:
         self.user_prompt = user_prompt
         self.variations.append(variation)
         return MusicResult(
-            self.source, {"provider": self.name, "durationMinutes": duration_minutes}
+            self.source, {"provider": self.name, "durationSeconds": duration_seconds}
         )
 
 

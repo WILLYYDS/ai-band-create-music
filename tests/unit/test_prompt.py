@@ -11,7 +11,6 @@ from app.services.prompt import (
     build_elevenlabs_planning_prompt,
     effective_llm_output_tokens,
     enhance_elevenlabs_composition_plan,
-    estimate_music_duration_seconds,
     extract_structured_music_tags,
     extract_tagged_lyrics,
     is_expanded_music_prompt,
@@ -237,17 +236,6 @@ def test_create_prompt_splits_crlf_lyrics_from_style() -> None:
     assert style == "梦幻流行"
 
 
-def test_auto_duration_uses_explicit_style_or_lyrics_and_tempo() -> None:
-    lyrics = "[Verse]\n" + "月光落在窗台\n" * 20 + "[Chorus]\n" + "我仍等待你回来\n" * 12
-    assert estimate_music_duration_seconds(lyrics, "男声，一分钟左右") == 60
-    assert estimate_music_duration_seconds(lyrics, "90 seconds") == 90
-    assert estimate_music_duration_seconds("一句", "流行") == 60
-    assert estimate_music_duration_seconds("长歌词" * 1000, "慢板") == 360
-    assert estimate_music_duration_seconds(lyrics, "slow ballad") > estimate_music_duration_seconds(
-        lyrics, "fast punk"
-    )
-
-
 async def test_prompt_expander_only_sends_style_and_disables_doubao_thinking(
     tmp_path: Path,
 ) -> None:
@@ -295,7 +283,7 @@ async def test_lyrics_writer_returns_normalized_lyrics(tmp_path: Path) -> None:
     assert body["temperature"] == 0.8
     assert body["messages"][0]["content"] == LYRICS_SYSTEM_PROMPT
     assert "请用简体中文" in body["messages"][1]["content"]
-    assert "目标时长：约 2 分钟" in body["messages"][1]["content"]
+    assert "目标时长：严格 120 秒（约 2 分钟）" in body["messages"][1]["content"]
     assert "歌词最多 40 行" in body["messages"][1]["content"]
     assert "结尾歌词被截断" in body["messages"][1]["content"]
 
@@ -315,6 +303,7 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
                                 {
                                     "taggedLyrics": "[Verse]\n第一句\n[Chorus]\n第二句",
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                                    "durationSeconds": 150,
                                 }
                             )
                         }
@@ -330,12 +319,13 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
         llm_model="doubao-seed-evolving",
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        structured, tagged = await OpenAICompatiblePromptExpander(settings, client).prepare(
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
             "[歌词与创作内容]\n第一句\n第二句\n\n[风格要求]\n普通话摇滚"
         )
 
-    assert structured == EXPANDED_MANDARIN_ROCK_PROMPT
-    assert tagged == "[Verse]\n第一句\n[Chorus]\n第二句"
+    assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
+    assert prepared.lyrics == "[Verse]\n第一句\n[Chorus]\n第二句"
+    assert prepared.duration_seconds == 150
     assert len(requests) == 1
     body = json.loads(requests[0].content)
     assert body["temperature"] == 0
@@ -394,6 +384,7 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
                                         "[Verse]\n自动生成第一句\n[Chorus]\n自动生成第二句"
                                     ),
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                                    "durationSeconds": 155,
                                 }
                             )
                         }
@@ -409,17 +400,50 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
         llm_model="doubao-seed-evolving",
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        structured, lyrics = await OpenAICompatiblePromptExpander(settings, client).prepare(
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
             "[风格要求]\n男声、摇滚",
             None,
         )
 
-    assert structured == EXPANDED_MANDARIN_ROCK_PROMPT
-    assert lyrics.startswith("[Verse]")
+    assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
+    assert prepared.lyrics.startswith("[Verse]")
+    assert prepared.duration_seconds == 155
     assert len(requests) == 1
     body = json.loads(requests[0].content)
     assert "同时生成原创歌词和音乐风格说明" in body["messages"][0]["content"]
     assert "目标时长：自动" in body["messages"][1]["content"]
+
+
+async def test_prepare_retries_invalid_auto_duration(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "taggedLyrics": "[Verse]\n第一句\n第二句",
+                                    "styleTags": "[Genre: Rock]",
+                                    "durationSeconds": 30 if len(requests) == 1 else 180,
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare("摇滚")
+
+    assert prepared.duration_seconds == 180
+    assert len(requests) == 2
 
 
 async def test_prepare_extracts_json_surrounded_by_commentary(tmp_path: Path) -> None:
@@ -443,13 +467,14 @@ async def test_prepare_extracts_json_surrounded_by_commentary(tmp_path: Path) ->
 
     settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        structured, lyrics = await OpenAICompatiblePromptExpander(settings, client).prepare(
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
             "[风格要求]\n男声摇滚",
             1,
         )
 
-    assert structured == "[Genre: Rock]"
-    assert lyrics == "[Verse]\n自动生成第一句\n自动生成第二句"
+    assert prepared.structured_prompt == "[Genre: Rock]"
+    assert prepared.lyrics == "[Verse]\n自动生成第一句\n自动生成第二句"
+    assert prepared.duration_seconds == 60
 
 
 async def test_prepare_retries_once_after_invalid_json(tmp_path: Path) -> None:
@@ -470,12 +495,12 @@ async def test_prepare_retries_once_after_invalid_json(tmp_path: Path) -> None:
 
     settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        structured, _ = await OpenAICompatiblePromptExpander(settings, client).prepare(
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
             "[风格要求]\n男声摇滚",
             1,
         )
 
-    assert structured == "[Genre: Rock]"
+    assert prepared.structured_prompt == "[Genre: Rock]"
     assert len(requests) == 2
     retry_body = json.loads(requests[1].content)
     assert retry_body["messages"][-1]["content"].startswith("上次响应不是有效")
@@ -503,13 +528,13 @@ async def test_prepare_accepts_concise_style_and_adds_missing_verse_tag(tmp_path
 
     settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        structured, lyrics = await OpenAICompatiblePromptExpander(settings, client).prepare(
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
             "[风格要求]\n男声摇滚",
             1,
         )
 
-    assert structured == "[Genre: Rock]"
-    assert lyrics == "[Verse]\n自动生成第一句\n自动生成第二句"
+    assert prepared.structured_prompt == "[Genre: Rock]"
+    assert prepared.lyrics == "[Verse]\n自动生成第一句\n自动生成第二句"
 
 
 @pytest.mark.parametrize(
@@ -533,6 +558,7 @@ async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(
                                 {
                                     "taggedLyrics": "[Verse]\n被模型改写的歌词",
                                     "styleTags": "[Genre: Rock]",
+                                    "durationSeconds": 150,
                                 }
                             )
                         }
@@ -543,11 +569,11 @@ async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(
 
     settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        _, lyrics = await OpenAICompatiblePromptExpander(settings, client).prepare(
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
             f"[歌词与创作内容]\n{original}\n\n[风格要求]\n摇滚"
         )
 
-    assert lyrics == (original if original.startswith("[") else f"[Verse]\n{original}")
+    assert prepared.lyrics == (original if original.startswith("[") else f"[Verse]\n{original}")
 
 
 async def test_prepare_accepts_style_tags_as_json_array(tmp_path: Path) -> None:
@@ -566,6 +592,7 @@ async def test_prepare_accepts_style_tags_as_json_array(tmp_path: Path) -> None:
                                     "styleTags": [
                                         tag if tag.startswith("[") else f"[{tag}" for tag in tags
                                     ],
+                                    "durationSeconds": 150,
                                 }
                             )
                         }
@@ -576,11 +603,11 @@ async def test_prepare_accepts_style_tags_as_json_array(tmp_path: Path) -> None:
 
     settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        structured, _ = await OpenAICompatiblePromptExpander(settings, client).prepare(
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
             "[歌词与创作内容]\n第一句\n第二句\n\n[风格要求]\n普通话摇滚"
         )
 
-    assert structured == EXPANDED_MANDARIN_ROCK_PROMPT
+    assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
 
 
 async def test_lyrics_writer_handles_partitioned_content(tmp_path: Path) -> None:

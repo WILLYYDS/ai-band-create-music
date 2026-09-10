@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
@@ -50,7 +51,8 @@ LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
         "不得增加、删除、改写、重排或重复任何歌词。",
         "将风格要求扩写为 8-14 个详细英文音乐制作标签，格式为 [Category: value]。",
         "风格标签需覆盖曲风、速度、情绪、配器、人声、编曲、制作与混音。",
-        "只返回 JSON 对象，taggedLyrics 和 styleTags 的值都必须是字符串；不要解释或输出代码块。",
+        "只返回 JSON 对象，包含字符串 taggedLyrics、字符串 styleTags 和整数 durationSeconds；"
+        "不要解释或输出代码块。",
     ]
 )
 
@@ -63,7 +65,8 @@ GENERATE_LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
         "速度、情绪、配器、人声、编曲、制作与混音、排除项。",
         "保留用户指定的人声、时长和风格；不得引用具体艺人或受版权保护作品。",
         "排除项禁止出现 no lyrics、no vocals 或 no melody。",
-        "只返回 JSON 对象，taggedLyrics 和 styleTags 的值都必须是字符串；不要解释或输出代码块。",
+        "只返回 JSON 对象，包含字符串 taggedLyrics、字符串 styleTags 和整数 durationSeconds；"
+        "不要解释或输出代码块。",
     ]
 )
 
@@ -97,16 +100,6 @@ LYRICS_SECTION_PATTERN = re.compile(
     r"Bridge(?: \d+)?|Instrumental(?: Break)?|Solo|Outro)\]",
     re.IGNORECASE,
 )
-EXPLICIT_MINUTES_PATTERN = re.compile(
-    r"(?<!\d)(\d+(?:\.\d+)?|[一二三四五六])\s*(?:分钟|分鐘|分|minutes?|mins?)(?![A-Za-z])",
-    re.IGNORECASE,
-)
-EXPLICIT_SECONDS_PATTERN = re.compile(
-    r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:秒钟|秒鐘|秒|seconds?|secs?)(?![A-Za-z])",
-    re.IGNORECASE,
-)
-BPM_PATTERN = re.compile(r"(?<!\d)([4-9]\d|1\d{2}|2[0-4]\d)\s*bpm\b", re.IGNORECASE)
-CHINESE_NUMBERS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
 FORBIDDEN_LYRICS_CONSTRAINT_PATTERN = re.compile(
     r"(?:[,;]\s*)?\bno (?:lyrics(?:\s+or\s+melody(?:\s+generation)?)?|"
     r"vocals?|melody(?:\s+generation)?)\b",
@@ -114,14 +107,36 @@ FORBIDDEN_LYRICS_CONSTRAINT_PATTERN = re.compile(
 )
 
 
-def lyrics_duration_instruction(duration_minutes: float | None) -> str:
+@dataclass(frozen=True, slots=True)
+class PreparedPrompt:
+    structured_prompt: str
+    lyrics: str
+    duration_seconds: int
+
+
+def lyrics_duration_instruction(
+    duration_minutes: float | None,
+    *,
+    minimum_seconds: int = 60,
+    maximum_seconds: int = 360,
+    include_json_duration: bool = True,
+) -> str:
     if duration_minutes is None:
-        return "目标时长：自动。根据风格写出自然完整的歌词，不要为凑固定时长重复或灌水。"
+        return (
+            f"目标时长：自动。请根据歌词字数、段落、BPM 和编曲自行确定 {minimum_seconds}-"
+            f"{maximum_seconds} 秒内的完整歌曲时长，并在 JSON 的 durationSeconds 返回整数秒数。"
+            "歌词必须能在该时长结束前完整唱完；不要重复、灌水或在歌词唱完后继续演唱。"
+        )
     max_lines = round(duration_minutes * 20)
+    duration_seconds = round(duration_minutes * 60)
+    json_instruction = (
+        f"JSON 的 durationSeconds 必须为 {duration_seconds}。" if include_json_duration else ""
+    )
     return (
-        f"目标时长：约 {duration_minutes:g} 分钟。必须让全部歌词在目标时长内完整唱完，"
+        f"目标时长：严格 {duration_seconds} 秒（约 {duration_minutes:g} 分钟）；"
+        f"{json_instruction}必须让全部歌词在目标时长内完整唱完，"
         f"并为前奏、间奏和尾奏留出时间；歌词最多 {max_lines} 行（结构标签不计），"
-        "每行简短，宁可少写，也不要让结尾歌词被截断。"
+        "每行简短，宁可少写，也不要让结尾歌词被截断；歌词唱完后绝对不能继续演唱。"
     )
 
 
@@ -130,7 +145,7 @@ class PromptExpander(Protocol):
 
     async def prepare(
         self, user_prompt: str, duration_minutes: int | None = None
-    ) -> tuple[str, str]: ...
+    ) -> PreparedPrompt: ...
 
     async def write_lyrics(
         self, structured_prompt: str, user_prompt: str, duration_minutes: int
@@ -157,63 +172,6 @@ def normalize_llm_output(raw_content: object) -> str:
     content = re.sub(r"^```[a-z]*\s*", "", content, flags=re.IGNORECASE)
     content = re.sub(r"```$", "", content)
     return content.strip().strip("\"'").strip()
-
-
-def estimate_music_duration_seconds(
-    lyrics: str,
-    style: str,
-    *,
-    minimum: int = 60,
-    maximum: int = 360,
-) -> int:
-    """Choose a deterministic song length from explicit style hints or singable lyrics."""
-    context = style.replace("：", ":")
-    minute_match = EXPLICIT_MINUTES_PATTERN.search(context)
-    second_match = EXPLICIT_SECONDS_PATTERN.search(context)
-    if minute_match:
-        raw = minute_match.group(1)
-        requested = float(CHINESE_NUMBERS.get(raw, raw)) * 60
-    elif second_match:
-        requested = float(second_match.group(1))
-    else:
-        bpm_match = BPM_PATTERN.search(context)
-        bpm = int(bpm_match.group(1)) if bpm_match else 96
-        lowered = context.lower()
-        if not bpm_match and any(
-            word in lowered for word in ("slow", "ballad", "ambient", "舒缓", "慢", "空灵")
-        ):
-            bpm = 72
-        elif not bpm_match and any(
-            word in lowered for word in ("fast", "uptempo", "punk", "快速", "高速", "激烈")
-        ):
-            bpm = 132
-
-        lyric_lines = [
-            line.strip()
-            for line in lyrics.splitlines()
-            if line.strip() and not re.fullmatch(r"\s*\[[^\]]+\]\s*", line)
-        ]
-        plain = "\n".join(lyric_lines)
-        chinese_characters = len(re.findall(r"[\u3400-\u9fff]", plain))
-        latin_words = len(re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)?", plain))
-        singable_units = chinese_characters + latin_words * 1.5
-        units_per_second = max(1.25, min(2.75, bpm / 50))
-        requested = singable_units / units_per_second + len(lyric_lines) * 0.8
-
-        sections = [match.group(0).lower() for match in LYRICS_SECTION_PATTERN.finditer(lyrics)]
-        requested += sum(
-            10
-            if "intro" in section or "outro" in section
-            else 14
-            if "instrumental" in section or "solo" in section
-            else 2
-            for section in sections
-        )
-        if not sections:
-            requested += 16
-
-    clamped = max(minimum, min(maximum, requested))
-    return int(round(clamped / 5) * 5)
 
 
 def extract_json_object(raw_content: object) -> dict[str, Any]:
@@ -578,16 +536,23 @@ class OpenAICompatiblePromptExpander:
 
     async def prepare(
         self, user_prompt: str, duration_minutes: int | None = None
-    ) -> tuple[str, str]:
+    ) -> PreparedPrompt:
         if self._settings.llm_api_key is None:
             raise GenerationError("歌词与风格处理失败：缺少 LLM_API_KEY 环境变量。")
         lyrics, style = split_generation_prompt(user_prompt)
         generate_lyrics = not lyrics
+        duration_instruction = lyrics_duration_instruction(
+            duration_minutes,
+            minimum_seconds=self._settings.min_duration_minutes * 60,
+            maximum_seconds=self._settings.max_duration_minutes * 60,
+        )
         if generate_lyrics:
-            duration_instruction = lyrics_duration_instruction(duration_minutes)
             request_content = f"创作要求：\n{style or user_prompt}\n\n{duration_instruction}"
         else:
-            request_content = f"歌词：\n{lyrics}\n\n风格要求：\n{style or '请补充协调的音乐风格'}"
+            request_content = (
+                f"歌词：\n{lyrics}\n\n风格要求：\n{style or '请补充协调的音乐风格'}"
+                f"\n\n{duration_instruction}"
+            )
         request_body: dict[str, object] = {
             "model": self._settings.llm_model,
             "temperature": 0,
@@ -690,7 +655,17 @@ class OpenAICompatiblePromptExpander:
                         )
                     if not structured:
                         raise ValueError("模型未返回风格描述")
-                    return structured, tagged
+                    if duration_minutes is None:
+                        duration_seconds = prepared.get("durationSeconds")
+                        if type(duration_seconds) is not int or not (
+                            self._settings.min_duration_minutes * 60
+                            <= duration_seconds
+                            <= self._settings.max_duration_minutes * 60
+                        ):
+                            raise ValueError("模型未返回范围内的整数 durationSeconds")
+                    else:
+                        duration_seconds = duration_minutes * 60
+                    return PreparedPrompt(structured, tagged, duration_seconds)
                 except (ValueError, KeyError, IndexError, TypeError):
                     if attempt:
                         raise
@@ -724,7 +699,9 @@ class OpenAICompatiblePromptExpander:
                             structured_prompt[:1200],
                             "",
                             language,
-                            lyrics_duration_instruction(duration_minutes),
+                            lyrics_duration_instruction(
+                                duration_minutes, include_json_duration=False
+                            ),
                             "总长不超过 3500 字符。",
                         ]
                     ),
