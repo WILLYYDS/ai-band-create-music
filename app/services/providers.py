@@ -519,11 +519,13 @@ class MiniMaxMusicProvider:
                 request_body["jobId"] = uuid5(NAMESPACE_URL, f"{job_id}:{variation}").hex
             request_body["audio_duration"] = duration_seconds
             request_body["instructions"] += (
-                f"\n[Timing: Finish singing every lyric line by "
-                f"{duration_seconds - 10:g} seconds, reserve the final 10 seconds for a short "
-                "instrumental outro, and never omit, rush, or cut off lyrics. After the final "
-                "provided lyric line, stop all vocals completely: do not invent or repeat "
-                "lyrics, sing extra words, hum, chant, or add vocal ad-libs.]"
+                "\n[Lyric Fidelity: Sing every supplied non-tag lyric line exactly once, verbatim, "
+                "and in order. Never omit, repeat, paraphrase, invent, or replace any lyric words.]"
+                f"\n[Timing: The {duration_seconds:g}-second audio duration is a maximum, not a "
+                "target to fill. Pace the arrangement so the final lyric ends 2-5 seconds before "
+                "the track ends. After the final lyric, stop all vocals completely and end the "
+                "song within 5 seconds. Never fill unused time with repeated or invented vocals, "
+                "humming, chants, ad-libs, or an extended instrumental outro.]"
             )
             url = f"{self._settings.minimax_base_url}{MINIMAX_GENERATE_PATH}"
             request_diagnostic = {

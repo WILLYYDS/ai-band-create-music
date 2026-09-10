@@ -52,8 +52,8 @@ LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
         "不得增加、删除、改写、重排或重复任何歌词。",
         "将风格要求扩写为 8-14 个详细英文音乐制作标签，格式为 [Category: value]。",
         "风格标签需覆盖曲风、速度、情绪、配器、人声、编曲、制作与混音。",
-        "只返回 JSON 对象，包含字符串 taggedLyrics、字符串 styleTags 和整数 durationSeconds；"
-        "不要解释或输出代码块。",
+        "只返回 JSON 对象，包含字符串 taggedLyrics、字符串 styleTags、整数 durationSeconds，"
+        "以及 durationPlan 对象；不要解释或输出代码块。",
     ]
 )
 
@@ -62,12 +62,15 @@ GENERATE_LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
         "你是专业音乐制作人与填词人，根据用户的创作要求同时生成原创歌词和音乐风格说明。",
         "taggedLyrics 必须是可直接演唱的原创中文歌词，使用 [Intro]、[Verse]、[Chorus]、"
         "[Bridge]、[Outro] 等结构标签，每个标签独占一行。",
+        "taggedLyrics 只能包含支持的英文结构标签和真正需要唱出的歌词；禁止 [Guitar Solo]、"
+        "[Final Chorus] 等自造标签，禁止用括号写演奏、制作或时长说明。独奏只能写 [Solo]，"
+        "最后副歌仍写 [Chorus]。",
         "styleTags 必须是恰好 8 个简洁的英文 [Category: value] 音乐制作标签，覆盖流派、"
         "速度、情绪、配器、人声、编曲、制作与混音、排除项。",
         "保留用户指定的人声、时长和风格；不得引用具体艺人或受版权保护作品。",
         "排除项禁止出现 no lyrics、no vocals 或 no melody。",
-        "只返回 JSON 对象，包含字符串 taggedLyrics、字符串 styleTags 和整数 durationSeconds；"
-        "不要解释或输出代码块。",
+        "只返回 JSON 对象，包含字符串 taggedLyrics、字符串 styleTags、整数 durationSeconds，"
+        "以及 durationPlan 对象；不要解释或输出代码块。",
     ]
 )
 
@@ -128,8 +131,11 @@ def lyrics_duration_instruction(
             f"{maximum_seconds} 秒内最短且足够的生成上限，并在 JSON 的 durationSeconds "
             "返回整数秒数。"
             "audio_duration 只是模型可提前结束的上限，不是必须填满的目标；请逐段估算演唱、独奏、"
-            "前奏和尾奏时间，只增加约 10 秒安全余量，避免明显高估。歌词必须能在该时长结束前"
-            "完整唱完；不要重复、灌水或在歌词唱完后继续演唱。"
+            "前奏和尾奏时间，不要增加安全余量。按 BPM 计算每小节秒数，每句歌词通常占 1-2 小节；"
+            "前奏、过渡和尾奏合计应尽量控制在 15 秒内，尾奏不得超过 5 秒，明确要求的独奏时长"
+            "单独计入。durationPlan 必须包含整数 vocalSeconds、introAndTransitionsSeconds、"
+            "soloAndInstrumentalSeconds、outroSeconds，四项之和必须等于 durationSeconds。"
+            "歌词必须能在该时长结束前完整唱完；不要重复、灌水或在歌词唱完后继续演唱。"
         )
     max_lines = round(duration_minutes * 20)
     duration_seconds = round(duration_minutes * 60)
@@ -697,16 +703,39 @@ class OpenAICompatiblePromptExpander:
                             if generate_lyrics
                             else "模型修改了歌词或未添加段落标签"
                         )
+                    if generate_lyrics:
+                        lines = [line.strip() for line in tagged.splitlines() if line.strip()]
+                        if any(
+                            (line.startswith("[") and not LYRICS_SECTION_PATTERN.fullmatch(line))
+                            or re.fullmatch(r"[（(].*[）)]", line)
+                            for line in lines
+                        ):
+                            raise ValueError("模型在歌词中加入了不支持的标签或演奏说明")
                     if not structured or not is_expanded_music_prompt(structured):
                         raise ValueError("模型未返回至少 8 个详细风格标签")
                     if duration_minutes is None:
                         duration_seconds = prepared.get("durationSeconds")
+                        duration_plan = prepared.get("durationPlan")
+                        plan_fields = (
+                            "vocalSeconds",
+                            "introAndTransitionsSeconds",
+                            "soloAndInstrumentalSeconds",
+                            "outroSeconds",
+                        )
                         if type(duration_seconds) is not int or not (
                             self._settings.min_duration_minutes * 60
                             <= duration_seconds
                             <= self._settings.max_duration_minutes * 60
                         ):
                             raise ValueError("模型未返回范围内的整数 durationSeconds")
+                        if (
+                            not isinstance(duration_plan, dict)
+                            or any(type(duration_plan.get(key)) is not int for key in plan_fields)
+                            or any(duration_plan[key] < 0 for key in plan_fields)
+                            or duration_plan["outroSeconds"] > 5
+                            or sum(duration_plan[key] for key in plan_fields) != duration_seconds
+                        ):
+                            raise ValueError("模型未返回与总时长一致的 durationPlan")
                     else:
                         duration_seconds = duration_minutes * 60
                     return PreparedPrompt(structured, tagged, duration_seconds)

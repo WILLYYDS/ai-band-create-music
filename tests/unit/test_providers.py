@@ -191,7 +191,7 @@ async def test_minimax_provider_streams_self_hosted_wav(tmp_path: Path) -> None:
     assert requests[0].url.path == "/v1/audio/jobs"
     assert "authorization" not in requests[0].headers
     assert body["model"] == "MiniMaxAI/MiniMax-Music3"
-    assert "Finish singing every lyric line by 140 seconds" in body["instructions"]
+    assert "150-second audio duration is a maximum" in body["instructions"]
     assert body["input"] == "[Verse]\ntest lyrics"
     assert body["seed"] == 42
     assert body["num_inference_steps"] == 30
@@ -222,10 +222,12 @@ async def test_minimax_provider_sends_selected_duration(tmp_path: Path) -> None:
 
     body = json.loads(requests[0].content)
     assert body["audio_duration"] == 60
-    assert "Finish singing every lyric line by 50 seconds" in body["instructions"]
-    assert "reserve the final 10 seconds" in body["instructions"]
-    assert "After the final provided lyric line, stop all vocals completely" in body["instructions"]
-    assert "do not invent or repeat lyrics" in body["instructions"]
+    assert "Sing every supplied non-tag lyric line exactly once" in body["instructions"]
+    assert "60-second audio duration is a maximum" in body["instructions"]
+    assert "final lyric ends 2-5 seconds before the track ends" in body["instructions"]
+    assert "end the song within 5 seconds" in body["instructions"]
+    assert "extended instrumental outro" in body["instructions"]
+    assert "reserve the final 10 seconds" not in body["instructions"]
     diagnostics = json.loads(
         (settings.output_dir / "jobs/local-job/prompts.json").read_text(encoding="utf-8")
     )

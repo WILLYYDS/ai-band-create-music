@@ -304,6 +304,12 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
                                     "taggedLyrics": "[Verse]\n第一句\n[Chorus]\n第二句",
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
                                     "durationSeconds": 150,
+                                    "durationPlan": {
+                                        "vocalSeconds": 130,
+                                        "introAndTransitionsSeconds": 10,
+                                        "soloAndInstrumentalSeconds": 5,
+                                        "outroSeconds": 5,
+                                    },
                                 }
                             )
                         }
@@ -385,6 +391,12 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
                                     ),
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
                                     "durationSeconds": 155,
+                                    "durationPlan": {
+                                        "vocalSeconds": 135,
+                                        "introAndTransitionsSeconds": 10,
+                                        "soloAndInstrumentalSeconds": 5,
+                                        "outroSeconds": 5,
+                                    },
                                 }
                             )
                         }
@@ -421,7 +433,7 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
     assert diagnostics["llmAttempts"][0]["response"]["statusCode"] == 200
 
 
-async def test_prepare_retries_invalid_auto_duration(tmp_path: Path) -> None:
+async def test_prepare_retries_invalid_auto_duration_plan(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -436,7 +448,13 @@ async def test_prepare_retries_invalid_auto_duration(tmp_path: Path) -> None:
                                 {
                                     "taggedLyrics": "[Verse]\n第一句\n第二句",
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
-                                    "durationSeconds": 30 if len(requests) == 1 else 180,
+                                    "durationSeconds": 180,
+                                    "durationPlan": {
+                                        "vocalSeconds": 160,
+                                        "introAndTransitionsSeconds": 10,
+                                        "soloAndInstrumentalSeconds": 5,
+                                        "outroSeconds": 10 if len(requests) == 1 else 5,
+                                    },
                                 }
                             )
                         }
@@ -450,6 +468,51 @@ async def test_prepare_retries_invalid_auto_duration(tmp_path: Path) -> None:
         prepared = await OpenAICompatiblePromptExpander(settings, client).prepare("摇滚")
 
     assert prepared.duration_seconds == 180
+    assert len(requests) == 2
+
+
+async def test_prepare_retries_generated_lyrics_with_custom_stage_directions(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        lyrics = (
+            "[Guitar Solo]\n（25 秒吉他独奏）\n第一句"
+            if len(requests) == 1
+            else "[Solo]\n[Verse]\n第一句"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "taggedLyrics": lyrics,
+                                    "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                                    "durationSeconds": 90,
+                                    "durationPlan": {
+                                        "vocalSeconds": 70,
+                                        "introAndTransitionsSeconds": 10,
+                                        "soloAndInstrumentalSeconds": 5,
+                                        "outroSeconds": 5,
+                                    },
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare("男声摇滚")
+
+    assert prepared.lyrics == "[Solo]\n[Verse]\n第一句"
     assert len(requests) == 2
 
 
@@ -574,6 +637,12 @@ async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(
                                     "taggedLyrics": "[Verse]\n被模型改写的歌词",
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
                                     "durationSeconds": 150,
+                                    "durationPlan": {
+                                        "vocalSeconds": 130,
+                                        "introAndTransitionsSeconds": 10,
+                                        "soloAndInstrumentalSeconds": 5,
+                                        "outroSeconds": 5,
+                                    },
                                 }
                             )
                         }
@@ -608,6 +677,12 @@ async def test_prepare_accepts_style_tags_as_json_array(tmp_path: Path) -> None:
                                         tag if tag.startswith("[") else f"[{tag}" for tag in tags
                                     ],
                                     "durationSeconds": 150,
+                                    "durationPlan": {
+                                        "vocalSeconds": 130,
+                                        "introAndTransitionsSeconds": 10,
+                                        "soloAndInstrumentalSeconds": 5,
+                                        "outroSeconds": 5,
+                                    },
                                 }
                             )
                         }
