@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import wave
 from pathlib import Path
 
 import httpx
@@ -29,6 +31,14 @@ class StubLyricsWriter:
         self, structured_prompt: str, user_prompt: str, duration_minutes: int
     ) -> str:
         return "[Verse]\ntest lyrics"
+
+
+def wav_bytes(seconds: float = 1) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as audio:
+        audio.setparams((2, 2, 8000, 0, "NONE", "not compressed"))
+        audio.writeframes(b"\0" * round(seconds * 8000 * 4))
+    return output.getvalue()
 
 
 def test_provider_response_extractors_cover_legacy_shapes() -> None:
@@ -191,7 +201,9 @@ async def test_minimax_provider_streams_self_hosted_wav(tmp_path: Path) -> None:
     assert "auto_duration_hint" not in body
     assert "max_new_tokens" not in body
     assert result.audio_path.suffix == ".wav"
-    assert result.audio_path.read_bytes() == b"RIFF\x00\x00\x00\x00WAVEminimax"
+    assert result.audio_path.read_bytes()[:4] == b"RIFF"
+    assert result.debug["durationSeconds"] == 1
+    assert result.debug["requestedDurationSeconds"] == 150
     assert result.debug["mode"] == "self_hosted_wav"
 
 
@@ -218,6 +230,8 @@ async def test_minimax_provider_sends_selected_duration(tmp_path: Path) -> None:
         (settings.output_dir / "jobs/local-job/prompts.json").read_text(encoding="utf-8")
     )
     provider_request = diagnostics["providerRequests"][0]
+    assert provider_request["requestedDurationSeconds"] == 60
+    assert provider_request["actualDurationSeconds"] == 1
     assert provider_request["request"]["body"] == body
     assert provider_request["request"]["url"] == "https://minimax.test/v1/audio/jobs"
     assert provider_request["createResponse"]["body"] == {"jobId": "remote-job"}
@@ -256,7 +270,9 @@ async def test_minimax_provider_preserves_create_page_lyrics(tmp_path: Path) -> 
             "[歌词与创作内容]\n夜色落进空荡站台\n最后一班车没有回来\n\n[风格要求]\n梦幻流行、空灵女声",
         )
 
-    assert json.loads(requests[0].content)["input"] == ("夜色落进空荡站台\n最后一班车没有回来")
+    body = json.loads(requests[0].content)
+    assert body["input"] == "夜色落进空荡站台\n最后一班车没有回来"
+    assert "Original style details:\n梦幻流行、空灵女声" in body["instructions"]
 
 
 async def test_minimax_provider_reports_server_error(tmp_path: Path) -> None:
@@ -297,7 +313,7 @@ def minimax_response(request):
     if request.method == "POST":
         return httpx.Response(202, json={"jobId": "remote-job"})
     if request.url.path.endswith("/audio"):
-        return httpx.Response(200, content=b"RIFF\x00\x00\x00\x00WAVEminimax")
+        return httpx.Response(200, content=wav_bytes())
     return httpx.Response(
         200, json={"status": "succeeded", "stage": "completed", "step": None, "totalSteps": None}
     )

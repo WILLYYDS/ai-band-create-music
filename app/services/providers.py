@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import wave
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -495,7 +496,7 @@ class MiniMaxMusicProvider:
         if not self._settings.minimax_base_url:
             raise GenerationError("MiniMax 音乐生成失败：MINIMAX_BASE_URL 不能为空。")
         try:
-            lyrics, _ = split_generation_prompt(user_prompt)
+            lyrics, original_style = split_generation_prompt(user_prompt)
             if not lyrics:
                 lyrics = await self._lyrics_writer.write_lyrics(
                     structured_prompt,
@@ -505,10 +506,13 @@ class MiniMaxMusicProvider:
             if len(lyrics) < 10:
                 raise GenerationError("MiniMax 音乐生成失败：生成的歌词不足 10 个字符。")
             target = self._settings.output_dir / f"full_song_minimax_{time.time_ns()}.wav"
+            instructions = structured_prompt
+            if original_style and original_style.casefold() not in structured_prompt.casefold():
+                instructions += f"\n\nOriginal style details:\n{original_style}"
             request_body = {
                 "model": self._settings.minimax_model,
                 "input": lyrics,
-                "instructions": structured_prompt,
+                "instructions": instructions,
                 "seed": self._settings.minimax_seed + variation,
                 "num_inference_steps": self._settings.minimax_num_inference_steps,
                 "response_format": "wav",
@@ -621,6 +625,17 @@ class MiniMaxMusicProvider:
                     await write_stream_atomically(
                         response.aiter_bytes(), target, "MiniMax Music 3 服务返回空音频。"
                     )
+                with wave.open(str(target), "rb") as audio:
+                    actual_duration_seconds = round(
+                        audio.getnframes() / audio.getframerate(), 3
+                    )
+                update_provider_diagnostic(
+                    self._settings.output_dir,
+                    job_id,
+                    variation,
+                    requestedDurationSeconds=duration_seconds,
+                    actualDurationSeconds=actual_duration_seconds,
+                )
             finally:
                 # The durable local copy belongs to history; release the remote temporary WAV.
                 try:
@@ -636,7 +651,8 @@ class MiniMaxMusicProvider:
                     "jobId": remote_id,
                     "step": step,
                     "totalSteps": total,
-                    "durationSeconds": state.get("durationSeconds"),
+                    "requestedDurationSeconds": duration_seconds,
+                    "durationSeconds": actual_duration_seconds,
                     "seed": self._settings.minimax_seed + variation,
                     "numInferenceSteps": self._settings.minimax_num_inference_steps,
                     "request": request_diagnostic,
@@ -657,7 +673,7 @@ class MiniMaxMusicProvider:
             raise GenerationError(
                 f"MiniMax Music 3 服务调用失败：{_http_failure_message(exc)}"
             ) from exc
-        except (httpx.HTTPError, ValueError) as exc:
+        except (httpx.HTTPError, ValueError, wave.Error) as exc:
             raise GenerationError(
                 f"MiniMax Music 3 服务调用失败：{_http_failure_message(exc)}"
             ) from exc

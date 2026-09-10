@@ -348,7 +348,7 @@ async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> 
                             "content": json.dumps(
                                 {
                                     "taggedLyrics": ("[Verse]\n自动生成第一句\n自动生成第二句"),
-                                    "styleTags": "[Genre: Rock]",
+                                    "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
                                 }
                             )
                         }
@@ -403,6 +403,7 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
         prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
             "[风格要求]\n男声、摇滚",
             None,
+            job_id="prompt-job",
         )
 
     assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
@@ -412,6 +413,12 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
     body = json.loads(requests[0].content)
     assert "同时生成原创歌词和音乐风格说明" in body["messages"][0]["content"]
     assert "目标时长：自动" in body["messages"][1]["content"]
+    assert "audio_duration 只是模型可提前结束的上限" in body["messages"][1]["content"]
+    diagnostics = json.loads(
+        (settings.output_dir / "jobs/prompt-job/prompts.json").read_text(encoding="utf-8")
+    )
+    assert diagnostics["llmAttempts"][0]["request"]["body"] == body
+    assert diagnostics["llmAttempts"][0]["response"]["statusCode"] == 200
 
 
 async def test_prepare_retries_invalid_auto_duration(tmp_path: Path) -> None:
@@ -428,7 +435,7 @@ async def test_prepare_retries_invalid_auto_duration(tmp_path: Path) -> None:
                             "content": json.dumps(
                                 {
                                     "taggedLyrics": "[Verse]\n第一句\n第二句",
-                                    "styleTags": "[Genre: Rock]",
+                                    "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
                                     "durationSeconds": 30 if len(requests) == 1 else 180,
                                 }
                             )
@@ -450,7 +457,7 @@ async def test_prepare_extracts_json_surrounded_by_commentary(tmp_path: Path) ->
     payload = json.dumps(
         {
             "taggedLyrics": "[Verse]\n自动生成第一句\n自动生成第二句",
-            "styleTags": "[Genre: Rock]",
+            "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
         },
         ensure_ascii=False,
     )
@@ -472,7 +479,7 @@ async def test_prepare_extracts_json_surrounded_by_commentary(tmp_path: Path) ->
             1,
         )
 
-    assert prepared.structured_prompt == "[Genre: Rock]"
+    assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
     assert prepared.lyrics == "[Verse]\n自动生成第一句\n自动生成第二句"
     assert prepared.duration_seconds == 60
 
@@ -487,7 +494,7 @@ async def test_prepare_retries_once_after_invalid_json(tmp_path: Path) -> None:
             content = json.dumps(
                 {
                     "taggedLyrics": "[Verse]\n自动生成第一句\n自动生成第二句",
-                    "styleTags": "[Genre: Rock]",
+                    "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
                 },
                 ensure_ascii=False,
             )
@@ -500,14 +507,17 @@ async def test_prepare_retries_once_after_invalid_json(tmp_path: Path) -> None:
             1,
         )
 
-    assert prepared.structured_prompt == "[Genre: Rock]"
+    assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
     assert len(requests) == 2
     retry_body = json.loads(requests[1].content)
-    assert retry_body["messages"][-1]["content"].startswith("上次响应不是有效")
+    assert retry_body["messages"][-1]["content"].startswith("上次响应未满足")
 
 
-async def test_prepare_accepts_concise_style_and_adds_missing_verse_tag(tmp_path: Path) -> None:
+async def test_prepare_retries_concise_style_and_adds_missing_verse_tag(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
         return httpx.Response(
             200,
             json={
@@ -517,7 +527,11 @@ async def test_prepare_accepts_concise_style_and_adds_missing_verse_tag(tmp_path
                             "content": json.dumps(
                                 {
                                     "lyrics": "自动生成第一句\n自动生成第二句",
-                                    "style": "[Genre: Rock]",
+                                    "style": (
+                                        "[Genre: Rock]"
+                                        if len(requests) == 1
+                                        else EXPANDED_MANDARIN_ROCK_PROMPT
+                                    ),
                                 }
                             )
                         }
@@ -533,8 +547,9 @@ async def test_prepare_accepts_concise_style_and_adds_missing_verse_tag(tmp_path
             1,
         )
 
-    assert prepared.structured_prompt == "[Genre: Rock]"
+    assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
     assert prepared.lyrics == "[Verse]\n自动生成第一句\n自动生成第二句"
+    assert len(requests) == 2
 
 
 @pytest.mark.parametrize(
@@ -557,7 +572,7 @@ async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(
                             "content": json.dumps(
                                 {
                                     "taggedLyrics": "[Verse]\n被模型改写的歌词",
-                                    "styleTags": "[Genre: Rock]",
+                                    "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
                                     "durationSeconds": 150,
                                 }
                             )

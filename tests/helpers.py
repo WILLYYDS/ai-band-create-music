@@ -17,7 +17,11 @@ class StubPromptExpander:
         return f"[Genre: Test], [Source: {user_prompt}]"
 
     async def prepare(
-        self, user_prompt: str, duration_minutes: int | None = None
+        self,
+        user_prompt: str,
+        duration_minutes: int | None = None,
+        *,
+        job_id: str | None = None,
     ) -> PreparedPrompt:
         duration_seconds = duration_minutes * 60 if duration_minutes is not None else 150
         if user_prompt.startswith("[歌词与创作内容]"):
@@ -46,7 +50,11 @@ class BlockingPromptExpander:
         return "[Genre: Test]"
 
     async def prepare(
-        self, user_prompt: str, duration_minutes: int | None = None
+        self,
+        user_prompt: str,
+        duration_minutes: int | None = None,
+        *,
+        job_id: str | None = None,
     ) -> PreparedPrompt:
         return PreparedPrompt(
             await self.expand(user_prompt),

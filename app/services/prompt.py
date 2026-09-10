@@ -10,6 +10,7 @@ import httpx
 
 from app.core.config import Settings
 from app.core.errors import GenerationError
+from app.services.job_files import update_job_diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -124,8 +125,11 @@ def lyrics_duration_instruction(
     if duration_minutes is None:
         return (
             f"目标时长：自动。请根据歌词字数、段落、BPM 和编曲自行确定 {minimum_seconds}-"
-            f"{maximum_seconds} 秒内的完整歌曲时长，并在 JSON 的 durationSeconds 返回整数秒数。"
-            "歌词必须能在该时长结束前完整唱完；不要重复、灌水或在歌词唱完后继续演唱。"
+            f"{maximum_seconds} 秒内最短且足够的生成上限，并在 JSON 的 durationSeconds "
+            "返回整数秒数。"
+            "audio_duration 只是模型可提前结束的上限，不是必须填满的目标；请逐段估算演唱、独奏、"
+            "前奏和尾奏时间，只增加约 10 秒安全余量，避免明显高估。歌词必须能在该时长结束前"
+            "完整唱完；不要重复、灌水或在歌词唱完后继续演唱。"
         )
     max_lines = round(duration_minutes * 20)
     duration_seconds = round(duration_minutes * 60)
@@ -144,7 +148,11 @@ class PromptExpander(Protocol):
     async def expand(self, user_prompt: str) -> str: ...
 
     async def prepare(
-        self, user_prompt: str, duration_minutes: int | None = None
+        self,
+        user_prompt: str,
+        duration_minutes: int | None = None,
+        *,
+        job_id: str | None = None,
     ) -> PreparedPrompt: ...
 
     async def write_lyrics(
@@ -535,7 +543,11 @@ class OpenAICompatiblePromptExpander:
             raise GenerationError(f"LLM 扩写失败：{_http_failure_message(exc)}") from exc
 
     async def prepare(
-        self, user_prompt: str, duration_minutes: int | None = None
+        self,
+        user_prompt: str,
+        duration_minutes: int | None = None,
+        *,
+        job_id: str | None = None,
     ) -> PreparedPrompt:
         if self._settings.llm_api_key is None:
             raise GenerationError("歌词与风格处理失败：缺少 LLM_API_KEY 环境变量。")
@@ -581,6 +593,7 @@ class OpenAICompatiblePromptExpander:
         try:
             original_messages = list(request_body["messages"])
             rejected_content = ""
+            diagnostics: list[dict[str, object]] = []
             for attempt in range(2):
                 if attempt:
                     request_body["messages"] = [
@@ -588,10 +601,28 @@ class OpenAICompatiblePromptExpander:
                         {"role": "assistant", "content": rejected_content[:2000]},
                         {
                             "role": "user",
-                            "content": "上次响应不是有效的目标 JSON。请修正后只输出 JSON 对象。",
+                            "content": (
+                                "上次响应未满足歌词、时长或至少 8 个详细风格标签的要求。"
+                                "请修正后只输出 JSON 对象。"
+                            ),
                         },
                     ]
                 try:
+                    diagnostics.append(
+                        {
+                            "attempt": attempt + 1,
+                            "request": {
+                                "method": "POST",
+                                "url": self._settings.llm_url,
+                                "timeoutSeconds": self._settings.llm_timeout_seconds,
+                                "body": json.loads(json.dumps(request_body)),
+                            },
+                        }
+                    )
+                    if job_id:
+                        update_job_diagnostics(
+                            self._settings.output_dir, job_id, llmAttempts=diagnostics
+                        )
                     response = await self._client.post(
                         self._settings.llm_url,
                         json=request_body,
@@ -606,6 +637,19 @@ class OpenAICompatiblePromptExpander:
                             connect=min(10, self._settings.llm_timeout_seconds),
                         ),
                     )
+                    try:
+                        response_body: object = response.json()
+                    except ValueError:
+                        response_body = response.text
+                    diagnostics[-1]["response"] = {
+                        "statusCode": response.status_code,
+                        "headers": dict(response.headers),
+                        "body": response_body,
+                    }
+                    if job_id:
+                        update_job_diagnostics(
+                            self._settings.output_dir, job_id, llmAttempts=diagnostics
+                        )
                     response.raise_for_status()
                     data = response.json()
                     content = data["choices"][0]["message"]["content"]
@@ -653,8 +697,8 @@ class OpenAICompatiblePromptExpander:
                             if generate_lyrics
                             else "模型修改了歌词或未添加段落标签"
                         )
-                    if not structured:
-                        raise ValueError("模型未返回风格描述")
+                    if not structured or not is_expanded_music_prompt(structured):
+                        raise ValueError("模型未返回至少 8 个详细风格标签")
                     if duration_minutes is None:
                         duration_seconds = prepared.get("durationSeconds")
                         if type(duration_seconds) is not int or not (

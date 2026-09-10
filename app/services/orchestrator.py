@@ -129,6 +129,7 @@ class GenerationOrchestrator:
             prepared = await self.prompt_expander.prepare(
                 user_prompt,
                 duration_minutes,
+                job_id=job_id,
             )
             structured_prompt = prepared.structured_prompt
             lyrics = prepared.lyrics

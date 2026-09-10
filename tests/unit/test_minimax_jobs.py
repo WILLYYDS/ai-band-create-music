@@ -1,5 +1,7 @@
 import asyncio
+import io
 import json
+import wave
 
 import httpx
 import pytest
@@ -7,6 +9,14 @@ import pytest
 from app.core.errors import GenerationError
 from app.services.providers import MiniMaxMusicProvider
 from tests.helpers import make_settings
+
+
+def wav_bytes() -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as audio:
+        audio.setparams((2, 2, 8000, 0, "NONE", "not compressed"))
+        audio.writeframes(b"\0" * 8000 * 4)
+    return output.getvalue()
 
 
 @pytest.mark.parametrize("outcome", ["succeeded", "failed", "cancel"])
@@ -22,7 +32,7 @@ async def test_minimax_actual_progress_terminal_and_cancellation(tmp_path, outco
         if request.method == "DELETE":
             return httpx.Response(200, json={})
         if request.url.path.endswith("/audio"):
-            return httpx.Response(200, content=b"RIFF-test-audio")
+            return httpx.Response(200, content=wav_bytes())
         polls += 1
         return httpx.Response(
             200,
@@ -53,7 +63,8 @@ async def test_minimax_actual_progress_terminal_and_cancellation(tmp_path, outco
         )
         if outcome == "succeeded":
             result = await call
-            assert result.audio_path.read_bytes() == b"RIFF-test-audio"
+            assert result.audio_path.read_bytes()[:4] == b"RIFF"
+            assert result.debug["durationSeconds"] == 1
             assert requests[-1].method == "DELETE"
         else:
             with pytest.raises(asyncio.CancelledError if outcome == "cancel" else GenerationError):
