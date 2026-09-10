@@ -496,7 +496,7 @@ class MiniMaxMusicProvider:
         if not self._settings.minimax_base_url:
             raise GenerationError("MiniMax 音乐生成失败：MINIMAX_BASE_URL 不能为空。")
         try:
-            lyrics, original_style = split_generation_prompt(user_prompt)
+            lyrics, _ = split_generation_prompt(user_prompt)
             if not lyrics:
                 lyrics = await self._lyrics_writer.write_lyrics(
                     structured_prompt,
@@ -506,13 +506,10 @@ class MiniMaxMusicProvider:
             if len(lyrics) < 10:
                 raise GenerationError("MiniMax 音乐生成失败：生成的歌词不足 10 个字符。")
             target = self._settings.output_dir / f"full_song_minimax_{time.time_ns()}.wav"
-            instructions = structured_prompt
-            if original_style and original_style.casefold() not in structured_prompt.casefold():
-                instructions += f"\n\nOriginal style details:\n{original_style}"
             request_body = {
                 "model": self._settings.minimax_model,
                 "input": lyrics,
-                "instructions": instructions,
+                "instructions": structured_prompt,
                 "seed": self._settings.minimax_seed + variation,
                 "num_inference_steps": self._settings.minimax_num_inference_steps,
                 "response_format": "wav",

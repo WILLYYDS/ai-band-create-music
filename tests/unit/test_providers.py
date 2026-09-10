@@ -272,7 +272,7 @@ async def test_minimax_provider_preserves_create_page_lyrics(tmp_path: Path) -> 
 
     body = json.loads(requests[0].content)
     assert body["input"] == "夜色落进空荡站台\n最后一班车没有回来"
-    assert "Original style details:\n梦幻流行、空灵女声" in body["instructions"]
+    assert "梦幻流行、空灵女声" not in body["instructions"]
 
 
 async def test_minimax_provider_reports_server_error(tmp_path: Path) -> None:
