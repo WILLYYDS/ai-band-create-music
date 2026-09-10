@@ -132,7 +132,7 @@ def lyrics_duration_instruction(
             "返回整数秒数。"
             "audio_duration 只是模型可提前结束的上限，不是必须填满的目标；请逐段估算演唱、独奏、"
             "前奏和尾奏时间，不要增加安全余量。按 BPM 计算每小节秒数，每句歌词通常占 1-2 小节；"
-            "前奏、过渡和尾奏合计应尽量控制在 15 秒内，尾奏不得超过 5 秒，明确要求的独奏时长"
+            "前奏、过渡和尾奏合计应尽量控制在 20 秒内，尾奏不得超过 5 秒，明确要求的独奏时长"
             "单独计入。durationPlan 必须包含整数 vocalSeconds、introAndTransitionsSeconds、"
             "soloAndInstrumentalSeconds、outroSeconds，四项之和必须等于 durationSeconds。"
             "歌词必须能在该时长结束前完整唱完；不要重复、灌水或在歌词唱完后继续演唱。"
@@ -153,7 +153,7 @@ def lyrics_duration_instruction(
         f"并为前奏、间奏和尾奏留出时间；歌词最多 {max_lines} 行（结构标签不计），"
         "每句应能在 2-6 秒内唱完，每行不超过 32 个字符，宁可少写，也不要让结尾歌词被截断；"
         "前奏、过渡和尾奏合计"
-        "不得超过 15 秒，尾奏不得超过 5 秒；歌词唱完后绝对不能继续演唱。"
+        "不得超过 20 秒，尾奏不得超过 5 秒；歌词唱完后绝对不能继续演唱。"
     )
 
 
@@ -747,7 +747,7 @@ class OpenAICompatiblePromptExpander:
                             or duration_plan["outroSeconds"] > 5
                             or duration_plan["introAndTransitionsSeconds"]
                             + duration_plan["outroSeconds"]
-                            > 15
+                            > 20
                             or sum(duration_plan[key] for key in plan_fields) != duration_seconds
                         ):
                             raise ValueError("模型未返回与总时长一致的 durationPlan")

@@ -286,6 +286,7 @@ async def test_lyrics_writer_returns_normalized_lyrics(tmp_path: Path) -> None:
     assert "请用简体中文" in body["messages"][1]["content"]
     assert "目标时长：严格 120 秒（约 2 分钟）" in body["messages"][1]["content"]
     assert "歌词最多 40 行" in body["messages"][1]["content"]
+    assert "前奏、过渡和尾奏合计不得超过 20 秒" in body["messages"][1]["content"]
     assert "结尾歌词被截断" in body["messages"][1]["content"]
 
 
@@ -441,7 +442,7 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
     assert diagnostics["llmAttempts"][0]["response"]["statusCode"] == 200
 
 
-async def test_prepare_retries_invalid_auto_duration_plan(tmp_path: Path) -> None:
+async def test_prepare_retries_excess_auto_intro_and_outro_budget(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -458,10 +459,12 @@ async def test_prepare_retries_invalid_auto_duration_plan(tmp_path: Path) -> Non
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
                                     "durationSeconds": 180,
                                     "durationPlan": {
-                                        "vocalSeconds": 160,
-                                        "introAndTransitionsSeconds": 10,
+                                        "vocalSeconds": 154 if len(requests) == 1 else 155,
+                                        "introAndTransitionsSeconds": 16
+                                        if len(requests) == 1
+                                        else 15,
                                         "soloAndInstrumentalSeconds": 5,
-                                        "outroSeconds": 10 if len(requests) == 1 else 5,
+                                        "outroSeconds": 5,
                                     },
                                 }
                             )
