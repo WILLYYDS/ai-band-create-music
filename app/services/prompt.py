@@ -118,6 +118,45 @@ class PreparedPrompt:
     duration_seconds: int
 
 
+def normalize_duration_plan(
+    raw_plan: object,
+    lyric_count: int,
+    target_seconds: int | None = None,
+) -> tuple[dict[str, int], int, list[str]]:
+    source = raw_plan if isinstance(raw_plan, dict) else {}
+
+    def seconds(key: str, default: int) -> int:
+        value = source.get(key)
+        return value if type(value) is int and value >= 0 else default
+
+    minimum_vocal = lyric_count * 2
+    maximum_vocal = lyric_count * 6
+    vocal = min(max(seconds("vocalSeconds", lyric_count * 4), minimum_vocal), maximum_vocal)
+    outro = min(seconds("outroSeconds", 5), 5)
+    intro = min(seconds("introAndTransitionsSeconds", 10), 25 - outro)
+    solo = seconds("soloAndInstrumentalSeconds", 0)
+
+    if target_seconds is not None:
+        nonvocal_budget = max(0, target_seconds - minimum_vocal)
+        outro = min(outro, nonvocal_budget)
+        solo = min(solo, nonvocal_budget - outro)
+        intro = min(intro, nonvocal_budget - outro - solo)
+        vocal = target_seconds - intro - solo - outro
+
+    normalized = {
+        "vocalSeconds": vocal,
+        "introAndTransitionsSeconds": intro,
+        "soloAndInstrumentalSeconds": solo,
+        "outroSeconds": outro,
+    }
+    adjustments = [
+        f"{key}: {source.get(key)!r} -> {value}"
+        for key, value in normalized.items()
+        if source.get(key) != value
+    ]
+    return normalized, sum(normalized.values()), adjustments
+
+
 def lyrics_duration_instruction(
     duration_minutes: float | None,
     *,
@@ -133,7 +172,7 @@ def lyrics_duration_instruction(
             "audio_duration 只是模型可提前结束的上限，不是必须填满的目标；请逐段估算演唱、独奏、"
             "前奏和尾奏时间，不要增加安全余量。按 BPM 计算每小节秒数，每句歌词通常占 1-2 小节、"
             "应能在 2-6 秒内唱完；"
-            "前奏、过渡和尾奏合计应尽量控制在 20 秒内，尾奏不得超过 5 秒，明确要求的独奏时长"
+            "前奏、过渡和尾奏合计应尽量控制在 25 秒内，尾奏不得超过 5 秒，明确要求的独奏时长"
             "单独计入。durationPlan 必须包含整数 vocalSeconds、introAndTransitionsSeconds、"
             "soloAndInstrumentalSeconds、outroSeconds，四项之和必须等于 durationSeconds。"
             "歌词必须能在该时长结束前完整唱完；不要重复、灌水或在歌词唱完后继续演唱。"
@@ -154,7 +193,7 @@ def lyrics_duration_instruction(
         f"并为前奏、间奏和尾奏留出时间；歌词最多 {max_lines} 行（结构标签不计），"
         "每句应能在 2-6 秒内唱完，每行不超过 32 个字符，宁可少写，也不要让结尾歌词被截断；"
         "前奏、过渡和尾奏合计"
-        "不得超过 20 秒，尾奏不得超过 5 秒；歌词唱完后绝对不能继续演唱。"
+        "尽量不超过 25 秒，尾奏不得超过 5 秒；歌词唱完后绝对不能继续演唱。"
     )
 
 
@@ -607,6 +646,7 @@ class OpenAICompatiblePromptExpander:
         try:
             original_messages = list(request_body["messages"])
             rejected_content = ""
+            rejection_reason = ""
             diagnostics: list[dict[str, object]] = []
             for attempt in range(2):
                 if attempt:
@@ -616,7 +656,7 @@ class OpenAICompatiblePromptExpander:
                         {
                             "role": "user",
                             "content": (
-                                "上次响应未满足歌词、时长或至少 8 个详细风格标签的要求。"
+                                f"上次响应未满足要求：{rejection_reason}。"
                                 "请修正后只输出 JSON 对象。"
                             ),
                         },
@@ -711,8 +751,13 @@ class OpenAICompatiblePromptExpander:
                             if generate_lyrics
                             else "模型修改了歌词或未添加段落标签"
                         )
+                    lines = [line.strip() for line in tagged.splitlines() if line.strip()]
+                    lyric_lines = [
+                        line for line in lines if not LYRICS_SECTION_PATTERN.fullmatch(line)
+                    ]
+                    if not lyric_lines:
+                        raise ValueError("模型未返回可演唱的歌词行")
                     if generate_lyrics:
-                        lines = [line.strip() for line in tagged.splitlines() if line.strip()]
                         if any(
                             (line.startswith("[") and not LYRICS_SECTION_PATTERN.fullmatch(line))
                             or re.fullmatch(r"[（(].*[）)]", line)
@@ -721,51 +766,92 @@ class OpenAICompatiblePromptExpander:
                             raise ValueError("模型在歌词中加入了不支持的标签或演奏说明")
                     if not structured or not is_expanded_music_prompt(structured):
                         raise ValueError("模型未返回至少 8 个详细风格标签")
+                    duration_seconds = (
+                        duration_minutes * 60 if duration_minutes is not None else None
+                    )
+                    duration_plan, computed_seconds, adjustments = normalize_duration_plan(
+                        prepared.get("durationPlan"),
+                        len(lyric_lines),
+                        duration_seconds,
+                    )
+                    duration_retry_reason = ""
                     if duration_minutes is None:
-                        duration_seconds = prepared.get("durationSeconds")
-                        if type(duration_seconds) is not int or not (
-                            self._settings.min_duration_minutes * 60
-                            <= duration_seconds
-                            <= self._settings.max_duration_minutes * 60
-                        ):
-                            raise ValueError("模型未返回范围内的整数 durationSeconds")
-                    else:
-                        duration_seconds = duration_minutes * 60
-                        if generate_lyrics and prepared.get("durationSeconds") != duration_seconds:
-                            raise ValueError("模型返回的 durationSeconds 与指定时长不一致")
-                    if duration_minutes is None or generate_lyrics:
-                        duration_plan = prepared.get("durationPlan")
-                        plan_fields = (
-                            "vocalSeconds",
-                            "introAndTransitionsSeconds",
-                            "soloAndInstrumentalSeconds",
-                            "outroSeconds",
-                        )
+                        minimum_seconds = self._settings.min_duration_minutes * 60
+                        maximum_seconds = self._settings.max_duration_minutes * 60
+                        if computed_seconds > maximum_seconds:
+                            duration_plan, computed_seconds, extra_adjustments = (
+                                normalize_duration_plan(
+                                    duration_plan,
+                                    len(lyric_lines),
+                                    maximum_seconds,
+                                )
+                            )
+                            adjustments.extend(extra_adjustments)
                         if (
-                            not isinstance(duration_plan, dict)
-                            or any(type(duration_plan.get(key)) is not int for key in plan_fields)
-                            or any(duration_plan[key] < 0 for key in plan_fields)
-                            or duration_plan["outroSeconds"] > 5
-                            or duration_plan["introAndTransitionsSeconds"]
-                            + duration_plan["outroSeconds"]
-                            > 20
-                            or sum(duration_plan[key] for key in plan_fields) != duration_seconds
+                            generate_lyrics
+                            and computed_seconds < minimum_seconds
+                            and attempt == 0
                         ):
-                            raise ValueError("模型未返回与总时长一致的 durationPlan")
+                            minimum_lines = (
+                                max(
+                                    0,
+                                    minimum_seconds
+                                    - duration_plan["introAndTransitionsSeconds"]
+                                    - duration_plan["soloAndInstrumentalSeconds"]
+                                    - duration_plan["outroSeconds"],
+                                )
+                                + 5
+                            ) // 6
+                            duration_retry_reason = (
+                                f"Auto 归一化后只有 {computed_seconds} 秒，至少需要 "
+                                f"{minimum_lines} 句歌词才能形成 {minimum_seconds} 秒歌曲"
+                            )
+                        duration_seconds = max(minimum_seconds, computed_seconds)
+                        if duration_seconds != computed_seconds:
+                            adjustments.append(
+                                f"effectiveDurationSeconds: {computed_seconds} -> "
+                                f"{duration_seconds}"
+                            )
+                    normalization = {
+                        "rawDurationSeconds": prepared.get("durationSeconds"),
+                        "rawDurationPlan": prepared.get("durationPlan"),
+                        "normalizedDurationPlan": duration_plan,
+                        "computedDurationSeconds": computed_seconds,
+                        "effectiveDurationSeconds": duration_seconds,
+                        "adjustments": adjustments,
+                    }
+                    diagnostics[-1]["durationNormalization"] = normalization
+                    if job_id:
+                        update_job_diagnostics(
+                            self._settings.output_dir, job_id, llmAttempts=diagnostics
+                        )
+                    if duration_retry_reason:
+                        raise ValueError(duration_retry_reason)
                     if generate_lyrics:
-                        lyric_lines = [
-                            line for line in lines if not LYRICS_SECTION_PATTERN.fullmatch(line)
-                        ]
                         if any(len(line) > 32 for line in lyric_lines):
                             raise ValueError("模型生成了超过 32 个字符的歌词行")
-                        if not (
-                            (duration_plan["vocalSeconds"] + 5) // 6
-                            <= len(lyric_lines)
-                            <= duration_plan["vocalSeconds"] // 2
-                        ):
-                            raise ValueError("模型生成的歌词句数与演唱时长预算不一致")
+                        if duration_minutes is not None:
+                            minimum_lines = (duration_plan["vocalSeconds"] + 5) // 6
+                            maximum_lines = duration_plan["vocalSeconds"] // 2
+                            if not minimum_lines <= len(lyric_lines) <= maximum_lines:
+                                wider_minimum = (duration_plan["vocalSeconds"] + 7) // 8
+                                wider_maximum = duration_plan["vocalSeconds"] * 2 // 3
+                                if attempt == 0 or not (
+                                    wider_minimum <= len(lyric_lines) <= wider_maximum
+                                ):
+                                    raise ValueError(
+                                        f"固定时长中的 {duration_plan['vocalSeconds']} 秒演唱预算"
+                                        f"需要 {minimum_lines}-{maximum_lines} 句歌词，"
+                                        f"实际返回 {len(lyric_lines)} 句"
+                                    )
                     return PreparedPrompt(structured, tagged, duration_seconds)
-                except (ValueError, KeyError, IndexError, TypeError):
+                except (ValueError, KeyError, IndexError, TypeError) as exc:
+                    rejection_reason = str(exc)
+                    diagnostics[-1]["validationError"] = rejection_reason
+                    if job_id:
+                        update_job_diagnostics(
+                            self._settings.output_dir, job_id, llmAttempts=diagnostics
+                        )
                     if attempt:
                         raise
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
