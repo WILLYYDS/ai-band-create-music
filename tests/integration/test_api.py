@@ -90,7 +90,8 @@ async def test_generate_preserves_not_ready_response(tmp_path: Path) -> None:
 
 async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> None:
     settings = make_settings(tmp_path, enable_audio_splitting=True)
-    app = create_app(settings, make_orchestrator(settings))
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
     async with await _client(app) as client:
         response = await client.post(
             "/api/generate",
@@ -110,6 +111,7 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
     assert audio.headers["content-type"].startswith("audio/mpeg")
     assert audio.headers["cache-control"] == "no-store"
     assert audio.content == b"ID3-full-audio"
+    assert orchestrator.music_provider.duration_modes == [False]
 
 
 @pytest.mark.parametrize(
@@ -120,7 +122,8 @@ async def test_generate_uses_llm_duration_for_auto(
     tmp_path: Path, duration_field: dict[str, object]
 ) -> None:
     settings = make_settings(tmp_path, enable_audio_splitting=False)
-    app = create_app(settings, make_orchestrator(settings))
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
     async with await _client(app) as client:
         response = await client.post(
             "/api/generate",
@@ -132,6 +135,7 @@ async def test_generate_uses_llm_duration_for_auto(
     assert body["durationMinutes"] == "auto"
     assert body["requestedDurationSeconds"] == 150
     assert body["debug"]["music"]["durationSeconds"] == 150
+    assert orchestrator.music_provider.duration_modes == [True]
 
 
 async def test_generate_selects_provider_per_request(tmp_path: Path) -> None:

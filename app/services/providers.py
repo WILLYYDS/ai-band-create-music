@@ -42,6 +42,7 @@ class MusicProvider(Protocol):
         duration_seconds: int,
         user_prompt: str,
         *,
+        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -143,6 +144,7 @@ class MockMusicProvider:
         duration_seconds: int,
         user_prompt: str,
         *,
+        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -173,6 +175,7 @@ class GenericMusicProvider:
         duration_seconds: int,
         user_prompt: str,
         *,
+        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -274,6 +277,7 @@ class ElevenLabsMusicProvider:
         duration_seconds: int,
         user_prompt: str,
         *,
+        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -399,6 +403,7 @@ class SunoMusicProvider:
         duration_seconds: int,
         user_prompt: str,
         *,
+        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -489,6 +494,7 @@ class MiniMaxMusicProvider:
         duration_seconds: int,
         user_prompt: str,
         *,
+        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -518,13 +524,22 @@ class MiniMaxMusicProvider:
             if job_id:
                 request_body["jobId"] = uuid5(NAMESPACE_URL, f"{job_id}:{variation}").hex
             request_body["audio_duration"] = duration_seconds
+            timing_instruction = (
+                f"[Timing: The {duration_seconds:g}-second audio duration is a maximum, not a "
+                "target to fill. Pace the arrangement so the final lyric ends 2-5 seconds before "
+                "the track ends. After the final lyric, stop all vocals completely and end the "
+                "song within 5 seconds.]"
+                if duration_is_maximum
+                else f"[Timing: The track must be exactly {duration_seconds:g} seconds long. "
+                "Pace the arrangement so the final lyric ends 2-5 seconds before that exact end. "
+                "After the final lyric, stop all vocals completely and use no more than 5 seconds "
+                "for the outro.]"
+            )
             request_body["instructions"] += (
                 "\n[Lyric Fidelity: Sing every supplied non-tag lyric line exactly once, verbatim, "
                 "and in order. Never omit, repeat, paraphrase, invent, or replace any lyric words.]"
-                f"\n[Timing: The {duration_seconds:g}-second audio duration is a maximum, not a "
-                "target to fill. Pace the arrangement so the final lyric ends 2-5 seconds before "
-                "the track ends. After the final lyric, stop all vocals completely and end the "
-                "song within 5 seconds. Never fill unused time with repeated or invented vocals, "
+                f"\n{timing_instruction}"
+                "\n[Vocal Ending: Never fill unused time with repeated or invented vocals, "
                 "humming, chants, ad-libs, or an extended instrumental outro.]"
             )
             url = f"{self._settings.minimax_base_url}{MINIMAX_GENERATE_PATH}"

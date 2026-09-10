@@ -74,6 +74,7 @@ class StubMusicProvider:
         self.name = name
         self.user_prompt = ""
         self.variations: list[int] = []
+        self.duration_modes: list[bool] = []
 
     async def generate(
         self,
@@ -81,12 +82,14 @@ class StubMusicProvider:
         duration_seconds: int,
         user_prompt: str,
         *,
+        duration_is_maximum: bool = False,
         variation: int = 0,
         progress=None,
         job_id=None,
     ) -> MusicResult:
         self.user_prompt = user_prompt
         self.variations.append(variation)
+        self.duration_modes.append(duration_is_maximum)
         return MusicResult(
             self.source, {"provider": self.name, "durationSeconds": duration_seconds}
         )

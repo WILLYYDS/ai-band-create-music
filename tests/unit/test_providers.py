@@ -184,7 +184,7 @@ async def test_minimax_provider_streams_self_hosted_wav(tmp_path: Path) -> None:
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
-            "[Genre: Rock]", 150, "rock"
+            "[Genre: Rock]", 150, "rock", duration_is_maximum=True
         )
 
     body = json.loads(requests[0].content)
@@ -223,10 +223,11 @@ async def test_minimax_provider_sends_selected_duration(tmp_path: Path) -> None:
     body = json.loads(requests[0].content)
     assert body["audio_duration"] == 60
     assert "Sing every supplied non-tag lyric line exactly once" in body["instructions"]
-    assert "60-second audio duration is a maximum" in body["instructions"]
-    assert "final lyric ends 2-5 seconds before the track ends" in body["instructions"]
-    assert "end the song within 5 seconds" in body["instructions"]
+    assert "track must be exactly 60 seconds long" in body["instructions"]
+    assert "final lyric ends 2-5 seconds before that exact end" in body["instructions"]
+    assert "use no more than 5 seconds for the outro" in body["instructions"]
     assert "extended instrumental outro" in body["instructions"]
+    assert "audio duration is a maximum" not in body["instructions"]
     assert "reserve the final 10 seconds" not in body["instructions"]
     diagnostics = json.loads(
         (settings.output_dir / "jobs/local-job/prompts.json").read_text(encoding="utf-8")

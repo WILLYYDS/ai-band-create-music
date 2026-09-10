@@ -178,6 +178,7 @@ class GenerationOrchestrator:
                     structured_prompt,
                     duration_seconds,
                     provider_prompt,
+                    duration_is_maximum=duration_minutes is None,
                     variation=index,
                     progress=provider_progress,
                     job_id=job_id,
