@@ -134,9 +134,25 @@ class GenerationOrchestrator:
             structured_prompt = prepared.structured_prompt
             lyrics = prepared.lyrics
             duration_seconds = prepared.duration_seconds
+            if duration_seconds is None and selected_provider != "minimax_music":
+                duration_seconds = self.settings.default_duration_minutes * 60
             provider_prompt = f"[歌词与创作内容]\n{lyrics}"
             if style:
                 provider_prompt += f"\n\n[风格要求]\n{style}"
+            duration_diagnostics: dict[str, object] = {
+                "durationSource": (
+                    "user"
+                    if duration_minutes is not None
+                    else "provider"
+                    if selected_provider == "minimax_music"
+                    else "default"
+                )
+            }
+            if duration_seconds is not None:
+                duration_diagnostics.update(
+                    effectiveDurationSeconds=duration_seconds,
+                    effectiveDurationMinutes=duration_seconds / 60,
+                )
             update_job_diagnostics(
                 self.settings.output_dir,
                 job_id,
@@ -144,9 +160,7 @@ class GenerationOrchestrator:
                 structuredPrompt=structured_prompt,
                 lyrics=lyrics,
                 providerPrompt=provider_prompt,
-                durationSource="user" if duration_minutes is not None else "llm",
-                effectiveDurationSeconds=duration_seconds,
-                effectiveDurationMinutes=duration_seconds / 60,
+                **duration_diagnostics,
             )
             outputs: list[dict[str, Any]] = []
             music_provider = self.music_providers.get(selected_provider, self.music_provider)
@@ -178,7 +192,6 @@ class GenerationOrchestrator:
                     structured_prompt,
                     duration_seconds,
                     provider_prompt,
-                    duration_is_maximum=duration_minutes is None,
                     variation=index,
                     progress=provider_progress,
                     job_id=job_id,
@@ -200,16 +213,14 @@ class GenerationOrchestrator:
                         "stemUrls": [],
                         "waveforms": await extract_waveforms({"full": full_path}),
                         "splitEnabled": False,
-                        "durationSeconds": music_result.debug.get(
-                            "durationSeconds", duration_seconds
-                        ),
+                        "durationSeconds": music_result.debug.get("durationSeconds"),
                         "debug": {"music": music_result.debug},
                     }
                 )
 
             await report("finalizing", None, "正在校验并整理输出文件")
             primary = outputs[0]
-            response = {
+            response: dict[str, Any] = {
                 "success": True,
                 "jobId": job_id,
                 "prompt": user_prompt,
@@ -219,11 +230,12 @@ class GenerationOrchestrator:
                 "count": effective_count,
                 "requestedCount": count,
                 "provider": selected_provider,
-                "requestedDurationSeconds": duration_seconds,
                 "alternatives": outputs[1:],
                 "warning": warning,
                 **primary,
             }
+            if duration_seconds is not None:
+                response["requestedDurationSeconds"] = duration_seconds
             await self.events.publish(GenerationEvent("generation.succeeded", job_id, request_id))
             logger.info("generation succeeded job_id=%s request_id=%s", job_id, request_id)
             return response

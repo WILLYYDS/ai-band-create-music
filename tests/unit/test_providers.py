@@ -169,7 +169,7 @@ async def test_generic_provider_accepts_direct_audio_url(tmp_path: Path) -> None
     assert result.debug["mode"] == "direct_audio_url"
 
 
-async def test_minimax_provider_streams_self_hosted_wav(tmp_path: Path) -> None:
+async def test_minimax_provider_omits_duration_for_auto(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -184,26 +184,26 @@ async def test_minimax_provider_streams_self_hosted_wav(tmp_path: Path) -> None:
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
-            "[Genre: Rock]", 150, "rock", duration_is_maximum=True
+            "[Genre: Rock]", None, "rock"
         )
 
     body = json.loads(requests[0].content)
     assert requests[0].url.path == "/v1/audio/jobs"
     assert "authorization" not in requests[0].headers
     assert body["model"] == "MiniMaxAI/MiniMax-Music3"
-    assert "150-second audio duration is a maximum" in body["instructions"]
+    assert "Choose the natural complete song duration" in body["instructions"]
     assert body["input"] == "[Verse]\ntest lyrics"
     assert body["seed"] == 42
     assert body["num_inference_steps"] == 30
     assert body["response_format"] == "wav"
     assert body["stream"] is False
-    assert body["audio_duration"] == 150
+    assert "audio_duration" not in body
     assert "auto_duration_hint" not in body
     assert "max_new_tokens" not in body
     assert result.audio_path.suffix == ".wav"
     assert result.audio_path.read_bytes()[:4] == b"RIFF"
     assert result.debug["durationSeconds"] == 1
-    assert result.debug["requestedDurationSeconds"] == 150
+    assert "requestedDurationSeconds" not in result.debug
     assert result.debug["mode"] == "self_hosted_wav"
 
 

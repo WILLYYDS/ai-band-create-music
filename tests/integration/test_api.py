@@ -100,6 +100,7 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
         assert response.status_code == 200
         body = response.json()
         assert body["durationMinutes"] == 3
+        assert body["requestedDurationSeconds"] == 180
         assert body["debug"]["music"]["durationSeconds"] == 180
         assert body["splitEnabled"] is False
         assert body["stems"] == {}
@@ -111,14 +112,14 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
     assert audio.headers["content-type"].startswith("audio/mpeg")
     assert audio.headers["cache-control"] == "no-store"
     assert audio.content == b"ID3-full-audio"
-    assert orchestrator.music_provider.duration_modes == [False]
+    assert orchestrator.music_provider.requested_durations == [180]
 
 
 @pytest.mark.parametrize(
     "duration_field",
     [{"durationMinutes": "auto"}, {"durationMinutes": None}, {}],
 )
-async def test_generate_uses_llm_duration_for_auto(
+async def test_generate_lets_provider_choose_duration_for_auto(
     tmp_path: Path, duration_field: dict[str, object]
 ) -> None:
     settings = make_settings(tmp_path, enable_audio_splitting=False)
@@ -133,9 +134,9 @@ async def test_generate_uses_llm_duration_for_auto(
     assert response.status_code == 200
     body = response.json()
     assert body["durationMinutes"] == "auto"
-    assert body["requestedDurationSeconds"] == 150
+    assert "requestedDurationSeconds" not in body
     assert body["debug"]["music"]["durationSeconds"] == 150
-    assert orchestrator.music_provider.duration_modes == [True]
+    assert orchestrator.music_provider.requested_durations == [None]
 
 
 async def test_generate_selects_provider_per_request(tmp_path: Path) -> None:
@@ -263,9 +264,9 @@ async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
     assert final_diagnostics["lyrics"] == "[Verse]\n自动生成的测试歌词"
     assert final_diagnostics["style"] == "真实进度"
     assert final_diagnostics["providerPrompt"].startswith("[歌词与创作内容]")
-    assert final_diagnostics["durationSource"] == "llm"
-    assert final_diagnostics["effectiveDurationSeconds"] == 150
-    assert final_diagnostics["effectiveDurationMinutes"] == 2.5
+    assert final_diagnostics["durationSource"] == "provider"
+    assert "effectiveDurationSeconds" not in final_diagnostics
+    assert "effectiveDurationMinutes" not in final_diagnostics
     assert body["result"]["splitEnabled"] is False
     assert body["result"]["stems"] == {}
 

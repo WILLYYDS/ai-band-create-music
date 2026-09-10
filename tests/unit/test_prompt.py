@@ -16,7 +16,6 @@ from app.services.prompt import (
     is_expanded_music_prompt,
     looks_like_chinese_music_request,
     music_prompt_tag_count,
-    normalize_duration_plan,
     normalize_llm_output,
     split_generation_prompt,
     truncate_lyrics,
@@ -61,22 +60,11 @@ def generated_lyrics(line_count: int) -> str:
     return "[Verse]\n" + "\n".join(f"第 {index} 句歌词" for index in range(line_count))
 
 
-ONE_MINUTE_LYRICS = generated_lyrics(8)
+ONE_MINUTE_LYRICS = generated_lyrics(10)
 
 
 def test_normalize_llm_output_removes_fences_and_quotes() -> None:
     assert normalize_llm_output('```text\n"[Genre: Folk]"\n```') == "[Genre: Folk]"
-
-
-def test_normalize_duration_plan_tolerates_missing_llm_fields() -> None:
-    plan, total, _ = normalize_duration_plan(None, 8)
-    assert plan == {
-        "vocalSeconds": 32,
-        "introAndTransitionsSeconds": 10,
-        "soloAndInstrumentalSeconds": 0,
-        "outroSeconds": 5,
-    }
-    assert total == 47
 
 
 def test_chinese_request_detection() -> None:
@@ -303,7 +291,7 @@ async def test_lyrics_writer_returns_normalized_lyrics(tmp_path: Path) -> None:
     assert body["messages"][0]["content"] == LYRICS_SYSTEM_PROMPT
     assert "请用简体中文" in body["messages"][1]["content"]
     assert "目标时长：严格 120 秒（约 2 分钟）" in body["messages"][1]["content"]
-    assert "歌词最多 40 行" in body["messages"][1]["content"]
+    assert "生成 20-40 行歌词" in body["messages"][1]["content"]
     assert "前奏、过渡和尾奏合计尽量不超过 25 秒" in body["messages"][1]["content"]
     assert "结尾歌词被截断" in body["messages"][1]["content"]
 
@@ -323,13 +311,6 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
                                 {
                                     "taggedLyrics": "[Verse]\n第一句\n[Chorus]\n第二句",
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
-                                    "durationSeconds": 150,
-                                    "durationPlan": {
-                                        "vocalSeconds": 130,
-                                        "introAndTransitionsSeconds": 10,
-                                        "soloAndInstrumentalSeconds": 5,
-                                        "outroSeconds": 5,
-                                    },
                                 }
                             )
                         }
@@ -351,7 +332,7 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
 
     assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
     assert prepared.lyrics == "[Verse]\n第一句\n[Chorus]\n第二句"
-    assert prepared.duration_seconds == 60
+    assert prepared.duration_seconds is None
     assert len(requests) == 1
     body = json.loads(requests[0].content)
     assert body["temperature"] == 0
@@ -375,13 +356,6 @@ async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> 
                                 {
                                     "taggedLyrics": ONE_MINUTE_LYRICS,
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
-                                    "durationSeconds": 60,
-                                    "durationPlan": {
-                                        "vocalSeconds": 45,
-                                        "introAndTransitionsSeconds": 10,
-                                        "soloAndInstrumentalSeconds": 0,
-                                        "outroSeconds": 5,
-                                    },
                                 }
                             )
                         }
@@ -396,7 +370,7 @@ async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> 
 
     body = json.loads(requests[0].content)
     assert body["response_format"] == {"type": "json_object"}
-    assert "歌词最多 20 行" in body["messages"][1]["content"]
+    assert "生成 10-20 行歌词" in body["messages"][1]["content"]
     assert "结尾歌词被截断" in body["messages"][1]["content"]
 
 
@@ -405,7 +379,6 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        lyrics = generated_lyrics(2 if len(requests) == 1 else 23)
         return httpx.Response(
             200,
             json={
@@ -414,15 +387,8 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "taggedLyrics": lyrics,
+                                    "taggedLyrics": generated_lyrics(12),
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
-                                    "durationSeconds": 155,
-                                    "durationPlan": {
-                                        "vocalSeconds": 135,
-                                        "introAndTransitionsSeconds": 10,
-                                        "soloAndInstrumentalSeconds": 5,
-                                        "outroSeconds": 5,
-                                    },
                                 }
                             )
                         }
@@ -445,71 +411,18 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
         )
 
     assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
-    assert prepared.lyrics == generated_lyrics(23)
-    assert prepared.duration_seconds == 155
-    assert len(requests) == 2
+    assert prepared.lyrics == generated_lyrics(12)
+    assert prepared.duration_seconds is None
+    assert len(requests) == 1
     body = json.loads(requests[0].content)
     assert "同时生成原创歌词和音乐风格说明" in body["messages"][0]["content"]
     assert "目标时长：自动" in body["messages"][1]["content"]
-    assert "audio_duration 只是模型可提前结束的上限" in body["messages"][1]["content"]
+    assert "不要估算或返回任何时长字段" in body["messages"][1]["content"]
     diagnostics = json.loads(
         (settings.output_dir / "jobs/prompt-job/prompts.json").read_text(encoding="utf-8")
     )
     assert diagnostics["llmAttempts"][0]["request"]["body"] == body
     assert diagnostics["llmAttempts"][0]["response"]["statusCode"] == 200
-    assert "Auto 归一化后只有 32 秒" in diagnostics["llmAttempts"][0]["validationError"]
-    assert diagnostics["llmAttempts"][0]["durationNormalization"][
-        "normalizedDurationPlan"
-    ]["vocalSeconds"] == 12
-    retry_body = json.loads(requests[1].content)
-    assert "至少需要 7 句歌词" in retry_body["messages"][-1]["content"]
-
-
-async def test_prepare_normalizes_excess_auto_intro_and_outro_budget(tmp_path: Path) -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "taggedLyrics": generated_lyrics(26),
-                                    "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
-                                    "durationSeconds": 180,
-                                    "durationPlan": {
-                                        "vocalSeconds": 140,
-                                        "introAndTransitionsSeconds": 30,
-                                        "soloAndInstrumentalSeconds": 5,
-                                        "outroSeconds": 5,
-                                    },
-                                }
-                            )
-                        }
-                    }
-                ]
-            },
-        )
-
-    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
-            "摇滚", job_id="normalize-job"
-        )
-
-    assert prepared.duration_seconds == 170
-    assert len(requests) == 1
-    diagnostics = json.loads(
-        (settings.output_dir / "jobs/normalize-job/prompts.json").read_text(encoding="utf-8")
-    )
-    normalization = diagnostics["llmAttempts"][0]["durationNormalization"]
-    assert normalization["rawDurationSeconds"] == 180
-    assert normalization["normalizedDurationPlan"]["introAndTransitionsSeconds"] == 20
-    assert normalization["computedDurationSeconds"] == 170
 
 
 async def test_prepare_retries_generated_lyrics_with_custom_stage_directions(
@@ -534,13 +447,6 @@ async def test_prepare_retries_generated_lyrics_with_custom_stage_directions(
                                 {
                                     "taggedLyrics": lyrics,
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
-                                    "durationSeconds": 90,
-                                    "durationPlan": {
-                                        "vocalSeconds": 70,
-                                        "introAndTransitionsSeconds": 10,
-                                        "soloAndInstrumentalSeconds": 5,
-                                        "outroSeconds": 5,
-                                    },
                                 }
                             )
                         }
@@ -562,13 +468,6 @@ async def test_prepare_extracts_json_surrounded_by_commentary(tmp_path: Path) ->
         {
             "taggedLyrics": ONE_MINUTE_LYRICS,
             "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
-            "durationSeconds": 60,
-            "durationPlan": {
-                "vocalSeconds": 45,
-                "introAndTransitionsSeconds": 10,
-                "soloAndInstrumentalSeconds": 0,
-                "outroSeconds": 5,
-            },
         },
         ensure_ascii=False,
     )
@@ -606,13 +505,6 @@ async def test_prepare_retries_once_after_invalid_json(tmp_path: Path) -> None:
                 {
                     "taggedLyrics": ONE_MINUTE_LYRICS,
                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
-                    "durationSeconds": 60,
-                    "durationPlan": {
-                        "vocalSeconds": 45,
-                        "introAndTransitionsSeconds": 10,
-                        "soloAndInstrumentalSeconds": 0,
-                        "outroSeconds": 5,
-                    },
                 },
                 ensure_ascii=False,
             )
@@ -650,13 +542,6 @@ async def test_prepare_retries_concise_style_and_adds_missing_verse_tag(tmp_path
                                         if len(requests) == 1
                                         else EXPANDED_MANDARIN_ROCK_PROMPT
                                     ),
-                                    "durationSeconds": 60,
-                                    "durationPlan": {
-                                        "vocalSeconds": 45,
-                                        "introAndTransitionsSeconds": 10,
-                                        "soloAndInstrumentalSeconds": 0,
-                                        "outroSeconds": 5,
-                                    },
                                 }
                             )
                         }
@@ -703,13 +588,6 @@ async def test_prepare_retries_lyrics_that_do_not_fit_fixed_duration(
                                         invalid_lyrics if len(requests) == 1 else ONE_MINUTE_LYRICS
                                     ),
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
-                                    "durationSeconds": 60,
-                                    "durationPlan": {
-                                        "vocalSeconds": 45,
-                                        "introAndTransitionsSeconds": 10,
-                                        "soloAndInstrumentalSeconds": 0,
-                                        "outroSeconds": 5,
-                                    },
                                 }
                             )
                         }
@@ -747,13 +625,6 @@ async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(
                                 {
                                     "taggedLyrics": "[Verse]\n被模型改写的歌词",
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
-                                    "durationSeconds": 150,
-                                    "durationPlan": {
-                                        "vocalSeconds": 130,
-                                        "introAndTransitionsSeconds": 10,
-                                        "soloAndInstrumentalSeconds": 5,
-                                        "outroSeconds": 5,
-                                    },
                                 }
                             )
                         }
@@ -787,13 +658,6 @@ async def test_prepare_accepts_style_tags_as_json_array(tmp_path: Path) -> None:
                                     "styleTags": [
                                         tag if tag.startswith("[") else f"[{tag}" for tag in tags
                                     ],
-                                    "durationSeconds": 150,
-                                    "durationPlan": {
-                                        "vocalSeconds": 130,
-                                        "introAndTransitionsSeconds": 10,
-                                        "soloAndInstrumentalSeconds": 5,
-                                        "outroSeconds": 5,
-                                    },
                                 }
                             )
                         }

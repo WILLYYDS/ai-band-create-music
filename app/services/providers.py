@@ -39,10 +39,9 @@ class MusicProvider(Protocol):
     async def generate(
         self,
         structured_prompt: str,
-        duration_seconds: int,
+        duration_seconds: int | None,
         user_prompt: str,
         *,
-        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -141,10 +140,9 @@ class MockMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_seconds: int,
+        duration_seconds: int | None,
         user_prompt: str,
         *,
-        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -172,10 +170,9 @@ class GenericMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_seconds: int,
+        duration_seconds: int | None,
         user_prompt: str,
         *,
-        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -274,10 +271,9 @@ class ElevenLabsMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_seconds: int,
+        duration_seconds: int | None,
         user_prompt: str,
         *,
-        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -400,10 +396,9 @@ class SunoMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_seconds: int,
+        duration_seconds: int | None,
         user_prompt: str,
         *,
-        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -491,10 +486,9 @@ class MiniMaxMusicProvider:
     async def generate(
         self,
         structured_prompt: str,
-        duration_seconds: int,
+        duration_seconds: int | None,
         user_prompt: str,
         *,
-        duration_is_maximum: bool = False,
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
@@ -507,7 +501,7 @@ class MiniMaxMusicProvider:
                 lyrics = await self._lyrics_writer.write_lyrics(
                     structured_prompt,
                     user_prompt,
-                    duration_seconds / 60,
+                    (duration_seconds or self._settings.default_duration_minutes * 60) / 60,
                 )
             if len(lyrics) < 10:
                 raise GenerationError("MiniMax 音乐生成失败：生成的歌词不足 10 个字符。")
@@ -523,18 +517,20 @@ class MiniMaxMusicProvider:
             }
             if job_id:
                 request_body["jobId"] = uuid5(NAMESPACE_URL, f"{job_id}:{variation}").hex
-            request_body["audio_duration"] = duration_seconds
-            timing_instruction = (
-                f"[Timing: The {duration_seconds:g}-second audio duration is a maximum, not a "
-                "target to fill. Pace the arrangement so the final lyric ends 2-5 seconds before "
-                "the track ends. After the final lyric, stop all vocals completely and end the "
-                "song within 5 seconds.]"
-                if duration_is_maximum
-                else f"[Timing: The track must be exactly {duration_seconds:g} seconds long. "
-                "Pace the arrangement so the final lyric ends 2-5 seconds before that exact end. "
-                "After the final lyric, stop all vocals completely and use no more than 5 seconds "
-                "for the outro.]"
-            )
+            if duration_seconds is not None:
+                request_body["audio_duration"] = duration_seconds
+                timing_instruction = (
+                    f"[Timing: The track must be exactly {duration_seconds:g} seconds long. "
+                    "Pace the arrangement so the final lyric ends 2-5 seconds before that exact "
+                    "end. After the final lyric, stop all vocals completely and use no more than "
+                    "5 seconds for the outro.]"
+                )
+            else:
+                timing_instruction = (
+                    "[Timing: Choose the natural complete song duration. Sing every supplied lyric "
+                    "without cutting off the ending, then stop all vocals and finish with only a "
+                    "short natural outro.]"
+                )
             request_body["instructions"] += (
                 "\n[Lyric Fidelity: Sing every supplied non-tag lyric line exactly once, verbatim, "
                 "and in order. Never omit, repeat, paraphrase, invent, or replace any lyric words.]"
@@ -643,12 +639,11 @@ class MiniMaxMusicProvider:
                     actual_duration_seconds = round(
                         audio.getnframes() / audio.getframerate(), 3
                     )
+                duration_diagnostic = {"actualDurationSeconds": actual_duration_seconds}
+                if duration_seconds is not None:
+                    duration_diagnostic["requestedDurationSeconds"] = duration_seconds
                 update_provider_diagnostic(
-                    self._settings.output_dir,
-                    job_id,
-                    variation,
-                    requestedDurationSeconds=duration_seconds,
-                    actualDurationSeconds=actual_duration_seconds,
+                    self._settings.output_dir, job_id, variation, **duration_diagnostic
                 )
             finally:
                 # The durable local copy belongs to history; release the remote temporary WAV.
@@ -656,25 +651,24 @@ class MiniMaxMusicProvider:
                     await self._client.delete(job_url, timeout=10)
                 except httpx.HTTPError:
                     pass
-            return MusicResult(
-                target,
-                {
-                    "provider": "minimax_music",
-                    "modelId": self._settings.minimax_model,
-                    "mode": "self_hosted_wav",
-                    "jobId": remote_id,
-                    "step": step,
-                    "totalSteps": total,
-                    "requestedDurationSeconds": duration_seconds,
-                    "durationSeconds": actual_duration_seconds,
-                    "seed": self._settings.minimax_seed + variation,
-                    "numInferenceSteps": self._settings.minimax_num_inference_steps,
-                    "request": request_diagnostic,
-                    "createResponse": create_response,
-                    "statusResponse": status_response,
-                    "audioResponse": audio_response,
-                },
-            )
+            debug = {
+                "provider": "minimax_music",
+                "modelId": self._settings.minimax_model,
+                "mode": "self_hosted_wav",
+                "jobId": remote_id,
+                "step": step,
+                "totalSteps": total,
+                "durationSeconds": actual_duration_seconds,
+                "seed": self._settings.minimax_seed + variation,
+                "numInferenceSteps": self._settings.minimax_num_inference_steps,
+                "request": request_diagnostic,
+                "createResponse": create_response,
+                "statusResponse": status_response,
+                "audioResponse": audio_response,
+            }
+            if duration_seconds is not None:
+                debug["requestedDurationSeconds"] = duration_seconds
+            return MusicResult(target, debug)
         except GenerationError:
             raise
         except httpx.ConnectError as exc:

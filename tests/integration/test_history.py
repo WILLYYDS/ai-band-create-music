@@ -29,9 +29,9 @@ async def test_direct_history_restart_and_duplicate_import(tmp_path):
     )
     assert stored["diagnostics"]["prompt"] == "rock"
     assert stored["diagnostics"]["provider"] == "minimax_music"
-    assert stored["diagnostics"]["durationSource"] == "llm"
-    assert stored["diagnostics"]["effectiveDurationSeconds"] == 150
-    assert stored["diagnostics"]["effectiveDurationMinutes"] == 2.5
+    assert stored["diagnostics"]["durationSource"] == "provider"
+    assert "effectiveDurationSeconds" not in stored["diagnostics"]
+    assert "effectiveDurationMinutes" not in stored["diagnostics"]
     orchestrator.stem_separator.split.assert_not_called()
     copy = settings.output_dir / "full_song_minimax_duplicate.wav"
     copy.write_bytes(b"ID3-full-audio")

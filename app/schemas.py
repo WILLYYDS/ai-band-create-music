@@ -35,7 +35,9 @@ class GenerateResponse(MusicOutput):
     createdAt: str | None = None
     provider: str | None = None
     requestedCount: int | None = None
-    requestedDurationSeconds: float | None = None
+    requestedDurationSeconds: float | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     prompt: str
     durationMinutes: int | Literal["auto"]
     structuredPrompt: str
