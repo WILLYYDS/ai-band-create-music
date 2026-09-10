@@ -114,6 +114,17 @@ FORBIDDEN_LYRICS_CONSTRAINT_PATTERN = re.compile(
 )
 
 
+def lyrics_duration_instruction(duration_minutes: float | None) -> str:
+    if duration_minutes is None:
+        return "目标时长：自动。根据风格写出自然完整的歌词，不要为凑固定时长重复或灌水。"
+    max_lines = round(duration_minutes * 20)
+    return (
+        f"目标时长：约 {duration_minutes:g} 分钟。必须让全部歌词在目标时长内完整唱完，"
+        f"并为前奏、间奏和尾奏留出时间；歌词最多 {max_lines} 行（结构标签不计），"
+        "每行简短，宁可少写，也不要让结尾歌词被截断。"
+    )
+
+
 class PromptExpander(Protocol):
     async def expand(self, user_prompt: str) -> str: ...
 
@@ -573,11 +584,7 @@ class OpenAICompatiblePromptExpander:
         lyrics, style = split_generation_prompt(user_prompt)
         generate_lyrics = not lyrics
         if generate_lyrics:
-            duration_instruction = (
-                f"目标时长：约 {duration_minutes} 分钟"
-                if duration_minutes is not None
-                else "目标时长：自动。根据风格写出自然完整的歌词，不要为凑固定时长重复或灌水。"
-            )
+            duration_instruction = lyrics_duration_instruction(duration_minutes)
             request_content = f"创作要求：\n{style or user_prompt}\n\n{duration_instruction}"
         else:
             request_content = f"歌词：\n{lyrics}\n\n风格要求：\n{style or '请补充协调的音乐风格'}"
@@ -717,10 +724,8 @@ class OpenAICompatiblePromptExpander:
                             structured_prompt[:1200],
                             "",
                             language,
-                            (
-                                f"目标时长约 {duration_minutes:g} 分钟，行数与之匹配，"
-                                "总长不超过 3500 字符。"
-                            ),
+                            lyrics_duration_instruction(duration_minutes),
+                            "总长不超过 3500 字符。",
                         ]
                     ),
                 },

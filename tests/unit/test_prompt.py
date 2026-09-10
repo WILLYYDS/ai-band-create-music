@@ -295,7 +295,9 @@ async def test_lyrics_writer_returns_normalized_lyrics(tmp_path: Path) -> None:
     assert body["temperature"] == 0.8
     assert body["messages"][0]["content"] == LYRICS_SYSTEM_PROMPT
     assert "请用简体中文" in body["messages"][1]["content"]
-    assert "目标时长约 2 分钟" in body["messages"][1]["content"]
+    assert "目标时长：约 2 分钟" in body["messages"][1]["content"]
+    assert "歌词最多 40 行" in body["messages"][1]["content"]
+    assert "结尾歌词被截断" in body["messages"][1]["content"]
 
 
 async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Path) -> None:
@@ -369,7 +371,10 @@ async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         await OpenAICompatiblePromptExpander(settings, client).prepare("[风格要求]\n男声摇滚", 1)
 
-    assert json.loads(requests[0].content)["response_format"] == {"type": "json_object"}
+    body = json.loads(requests[0].content)
+    assert body["response_format"] == {"type": "json_object"}
+    assert "歌词最多 20 行" in body["messages"][1]["content"]
+    assert "结尾歌词被截断" in body["messages"][1]["content"]
 
 
 async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Path) -> None:
