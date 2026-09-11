@@ -672,7 +672,6 @@ def create_app(
                 for job in sorted(
                     request.app.state.jobs.values(), key=lambda job: job.created_at, reverse=True
                 )
-                if job.status not in {"failed", "cancelled"}
             ]
         }
 
@@ -685,17 +684,17 @@ def create_app(
                 content={"success": False, "message": "生成任务不存在。"},
             )
 
-        queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
-        subscribers = request.app.state.job_subscribers.setdefault(job_id, set())
-        subscribers.add(queue)
-
         async def events() -> AsyncIterator[str]:
+            queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+            subscribers = request.app.state.job_subscribers.setdefault(job_id, set())
+            subscribers.add(queue)
             try:
                 while True:
                     payload = _job_response(job, request, application_settings)
-                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                     if job.status not in {"pending", "running"}:
+                        yield f"event: done\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
                         return
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                     try:
                         await asyncio.wait_for(queue.get(), timeout=15)
                     except asyncio.TimeoutError:

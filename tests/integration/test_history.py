@@ -152,7 +152,7 @@ async def test_job_forwards_actual_provider_counts(tmp_path):
         assert load_jobs(settings.output_dir)[job_id].status == "succeeded"
 
 
-async def test_history_hides_failed_jobs_but_detail_and_events_remain_available(tmp_path):
+async def test_history_preserves_failed_jobs_and_events_send_done(tmp_path):
     settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
     failed = GenerationJob(job_id="failed", prompt="bad", status="failed", stage="failed")
@@ -160,12 +160,29 @@ async def test_history_hides_failed_jobs_but_detail_and_events_remain_available(
     app.state.jobs[failed.job_id] = failed
 
     async with client(app) as http:
-        assert (await http.get("/api/jobs")).json()["jobs"] == []
+        assert (await http.get("/api/jobs")).json()["jobs"][0]["error"] == "provider died"
         assert (await http.get("/api/jobs/failed")).json()["error"] == "provider died"
         events = await http.get("/api/jobs/failed/events")
 
     assert events.headers["content-type"].startswith("text/event-stream")
-    assert json.loads(events.text.removeprefix("data: ").strip())["status"] == "failed"
+    assert events.text.startswith("event: done\ndata: ")
+    assert json.loads(events.text.split("data: ", 1)[1])["status"] == "failed"
+
+
+async def test_unstarted_job_events_do_not_register_subscriber(tmp_path):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    app.state.jobs["active"] = GenerationJob(
+        job_id="active", prompt="rock", status="running", stage="music"
+    )
+    endpoint = next(
+        route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
+    )
+    request = Request({"type": "http", "app": app, "headers": []})
+
+    await endpoint("active", request)
+
+    assert app.state.job_subscribers == {}
 
 
 async def test_job_events_keep_alive_after_timeout(tmp_path, monkeypatch):
