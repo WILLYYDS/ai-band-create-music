@@ -63,6 +63,25 @@ async def test_history_urls_do_not_persist_request_host(tmp_path):
     assert history[0]["result"]["fullTrack"].startswith("http://testserver/output/")
 
 
+async def test_invalid_persisted_output_url_does_not_break_history(tmp_path):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    async with client(app) as http:
+        job_id = (await http.post("/api/generate", json={"prompt": "rock"})).json()["jobId"]
+
+    job_file = settings.output_dir / "jobs" / job_id / "job.json"
+    stored = json.loads(job_file.read_text())
+    stored["result"]["fullTrack"] = "/etc/passwd"
+    job_file.write_text(json.dumps(stored))
+
+    async with client(create_app(settings, make_orchestrator(settings))) as http:
+        history = await http.get("/api/jobs")
+        detail = await http.get(f"/api/jobs/{job_id}")
+
+    assert history.status_code == detail.status_code == 200
+    assert detail.json()["result"]["fullTrack"] == "/etc/passwd"
+
+
 def test_interrupted_and_corrupt_metadata(tmp_path):
     settings = make_settings(tmp_path)
     job = GenerationJob(

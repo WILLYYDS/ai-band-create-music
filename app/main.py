@@ -912,7 +912,10 @@ def _render_result_urls(
 
 
 def _public_audio_url(audio_url: str, base_url: str, settings: Settings) -> str:
-    target = _output_path_from_url(audio_url, settings)
+    try:
+        target = _output_path_from_url(audio_url, settings)
+    except ValueError:
+        return audio_url
     return build_public_audio_url(base_url, target.relative_to(settings.output_dir.resolve()))
 
 
