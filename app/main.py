@@ -388,6 +388,7 @@ def create_app(
     )
     application.state.settings = application_settings
     application.state.jobs = load_jobs(application_settings.output_dir)
+    application.state.job_subscribers = {}
     history_lock = asyncio.Lock()
     legacy_imported = False
     legacy_candidates = sorted(application_settings.output_dir.glob("full_song_*"))
@@ -575,6 +576,16 @@ def create_app(
             else None
         )
         job = GenerationJob(job_id=job_id, prompt=prompt, warning=warning)
+
+        def publish() -> None:
+            for queue in request.app.state.job_subscribers.get(job_id, ()):
+                if queue.empty():
+                    queue.put_nowait(None)
+
+        def save_and_publish() -> None:
+            job.save(application_settings.output_dir)
+            publish()
+
         try:
             job.save(application_settings.output_dir)
         except Exception:
@@ -602,13 +613,13 @@ def create_app(
                 job.structured_prompt = structured_prompt
             if lyrics is not None:
                 job.lyrics = lyrics
-            job.save(application_settings.output_dir)
+            save_and_publish()
 
         async def execute() -> None:
             try:
                 job.status = "running"
                 job.message = "服务器正在生成音乐"
-                job.save(application_settings.output_dir)
+                save_and_publish()
                 job.result = await active_orchestrator.generate(
                     prompt,
                     duration,
@@ -639,7 +650,7 @@ def create_app(
                 if job.status != "succeeded":
                     job.progress = None
                 await active_orchestrator.capacity.release()
-                job.save(application_settings.output_dir)
+                save_and_publish()
 
         job.task = asyncio.create_task(execute(), name=job_id)
         return {"jobId": job_id, "status": job.status}
@@ -661,8 +672,44 @@ def create_app(
                 for job in sorted(
                     request.app.state.jobs.values(), key=lambda job: job.created_at, reverse=True
                 )
+                if job.status not in {"failed", "cancelled"}
             ]
         }
+
+    @application.get("/api/jobs/{job_id}/events")
+    async def generation_job_events(job_id: str, request: Request):
+        job = request.app.state.jobs.get(job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"success": False, "message": "生成任务不存在。"},
+            )
+
+        queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+        subscribers = request.app.state.job_subscribers.setdefault(job_id, set())
+        subscribers.add(queue)
+
+        async def events() -> AsyncIterator[str]:
+            try:
+                while True:
+                    payload = _job_response(job, request, application_settings)
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    if job.status not in {"pending", "running"}:
+                        return
+                    try:
+                        await asyncio.wait_for(queue.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+            finally:
+                subscribers.discard(queue)
+                if not subscribers:
+                    request.app.state.job_subscribers.pop(job_id, None)
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @application.get(
         "/api/jobs/{job_id}",
@@ -701,6 +748,9 @@ def create_app(
             job.message = "任务已取消"
             job.progress = job.step = job.total_steps = None
             job.save(application_settings.output_dir)
+            for queue in request.app.state.job_subscribers.get(job_id, ()):
+                if queue.empty():
+                    queue.put_nowait(None)
         return _job_response(job, request, application_settings)
 
     @application.delete(
