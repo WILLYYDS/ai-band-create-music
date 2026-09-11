@@ -3,24 +3,29 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
 
 from app.core.config import Settings
 from app.core.errors import GenerationError
+from app.services.job_files import update_job_diagnostics
 
 logger = logging.getLogger(__name__)
 
 LLM_SYSTEM_PROMPT = "\n".join(
     [
-        "你是一位专业音乐制作人和 ElevenLabs Music Prompt 扩写助手。",
-        "将用户的简短中文需求扩写为可直接用于音乐生成的详细英文制作说明；"
+        "你是一位专业音乐制作人和音乐风格 Prompt 扩写助手。",
+        "将用户的简短风格要求扩写为可直接用于音乐生成的详细英文制作说明；"
         "不是逐词翻译，也不是只提取用户已经说过的词。",
+        "只扩写曲风、编曲、演唱和制作参数，不生成、改写或复述歌词。",
+        "不得把“不生成歌词”误写成音乐要求；Negative Constraints 禁止出现 no lyrics、"
+        "no vocals 或 no melody。",
         "保留所有显式要求，并为未指定项补充协调一致的专业选择；不要引用具体艺人或受版权保护作品。",
-        "输出 8-14 个逗号分隔的方括号标签，总长度约 350-1200 字符。",
+        "输出恰好 8 个简洁的英文方括号标签，总长度约 350-900 字符。",
         "必须覆盖 Genre and Era、Tempo and Meter、Mood、Instrumentation、Vocal、"
-        "Arrangement、Production and Mix；建议补充 Harmony、Dynamics、Negative Constraints。",
+        "Arrangement、Production and Mix、Negative Constraints。",
         "标签值要包含可听见、可执行的细节，例如 BPM、鼓组律动、乐器音色、人声语言与唱法、"
         "段落推进、空间效果、动态变化和需要避免的声音。",
         "优先使用 [Category: detailed value]，每个分类各占一个方括号。",
@@ -29,19 +34,57 @@ LLM_SYSTEM_PROMPT = "\n".join(
     ]
 )
 
+LYRICS_SYSTEM_PROMPT = "\n".join(
+    [
+        "你是专业音乐填词人，为指定歌曲创作可直接演唱的原创歌词。",
+        "只输出歌词本身：每行一句歌词，用换行分隔；",
+        "在合适位置使用 [Intro]、[Verse]、[Chorus]、[Bridge]、[Outro] 结构标签，每个标签独占一行。",
+        "不解释、不寒暄、不输出代码块，不要写歌名、艺人名或音乐风格描述。",
+        "歌词需贴合主题与情绪，韵脚自然、便于演唱，严禁抄袭受版权保护的作品。",
+    ]
+)
+
+LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
+    [
+        "你是专业音乐制作人与歌词结构编辑，同时完成歌词分段和音乐风格扩写。",
+        "只能插入 [Intro]、[Verse]、[Pre-Chorus]、[Chorus]、[Post-Chorus]、"
+        "[Bridge]、[Instrumental]、[Solo]、[Outro]，标签必须单独占一行。",
+        "不得增加、删除、改写、重排或重复任何歌词。",
+        "将风格要求扩写为 8-14 个详细英文音乐制作标签，格式为 [Category: value]。",
+        "风格标签需覆盖曲风、速度、情绪、配器、人声、编曲、制作与混音。",
+        "只返回 JSON 对象，包含字符串 taggedLyrics 和字符串 styleTags；不要解释或输出代码块。",
+    ]
+)
+
+GENERATE_LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
+    [
+        "你是专业音乐制作人与填词人，根据用户的创作要求同时生成原创歌词和音乐风格说明。",
+        "taggedLyrics 必须是可直接演唱的原创中文歌词，使用 [Intro]、[Verse]、[Chorus]、"
+        "[Bridge]、[Outro] 等结构标签，每个标签独占一行。",
+        "taggedLyrics 只能包含支持的英文结构标签和真正需要唱出的歌词；禁止 [Guitar Solo]、"
+        "[Final Chorus] 等自造标签，禁止用括号写演奏、制作或时长说明。独奏只能写 [Solo]，"
+        "最后副歌仍写 [Chorus]。",
+        "styleTags 必须是恰好 8 个简洁的英文 [Category: value] 音乐制作标签，覆盖流派、"
+        "速度、情绪、配器、人声、编曲、制作与混音、排除项。",
+        "保留用户指定的人声、时长和风格；不得引用具体艺人或受版权保护作品。",
+        "排除项禁止出现 no lyrics、no vocals 或 no melody。",
+        "只返回 JSON 对象，包含字符串 taggedLyrics 和字符串 styleTags；不要解释或输出代码块。",
+    ]
+)
+
 STRICT_LLM_SYSTEM_PROMPT = " ".join(
     [
-        "Expand the user's request into 8-14 detailed English music-production tags, "
-        "roughly 350-1200 characters total.",
+        "Expand the user's request into exactly 8 concise English music-production tags, "
+        "roughly 350-900 characters total.",
         "Preserve explicit requirements and make coherent professional decisions "
         "for missing details.",
         "Required categories: Genre and Era, Tempo and Meter, Mood, Instrumentation, Vocal, "
-        "Arrangement, Production and Mix.",
-        "Also add useful Harmony, Dynamics, and Negative Constraints when appropriate.",
+        "Arrangement, Production and Mix, and Negative Constraints.",
         "Use concrete audible directions: BPM, groove, timbre, vocal language and delivery, "
         "section progression, spatial effects, dynamics, and exclusions.",
         "Prefer one bracket per category in the form [Category: detailed value].",
         "Do not name artists or copyrighted songs.",
+        "Never include no lyrics, no vocals, or no melody as a production constraint.",
         "Start with [ and end with ].",
         "Do not explain, reason, use Markdown, or repeat these instructions.",
     ]
@@ -49,15 +92,78 @@ STRICT_LLM_SYSTEM_PROMPT = " ".join(
 EXPANDED_PROMPT_MIN_TAGS = 8
 EXPANDED_PROMPT_MAX_TAGS = 14
 EXPANDED_PROMPT_MIN_CHARS = 280
-EXPANDED_PROMPT_MAX_CHARS = 1800
+EXPANDED_PROMPT_MAX_CHARS = 3000
 LLM_OUTPUT_TOKEN_CEILING = 4096
 STRUCTURED_TAG_PATTERN = re.compile(
-    r"\[\s*[A-Za-z][A-Za-z0-9 /_-]{0,39}\s*:\s*[^\[\]\r\n]{1,200}\s*\]"
+    r"\[\s*[A-Za-z][A-Za-z0-9 /_-]{0,39}\s*:\s*[^\[\]\r\n]{1,320}\s*\]"
 )
+LYRICS_SECTION_PATTERN = re.compile(
+    r"\[(?:Intro|Verse(?: \d+)?|Pre-Chorus|Chorus(?: \d+)?|Post-Chorus|"
+    r"Bridge(?: \d+)?|Instrumental(?: Break)?|Solo|Outro)\]",
+    re.IGNORECASE,
+)
+FORBIDDEN_LYRICS_CONSTRAINT_PATTERN = re.compile(
+    r"(?:[,;]\s*)?\bno (?:lyrics(?:\s+or\s+melody(?:\s+generation)?)?|"
+    r"vocals?|melody(?:\s+generation)?)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPrompt:
+    structured_prompt: str
+    lyrics: str
+    duration_seconds: int | None
+
+
+def lyrics_duration_instruction(duration_minutes: float | None) -> str:
+    if duration_minutes is None:
+        return (
+            "目标时长：自动，由音乐生成模型自行决定；不要估算或返回任何时长字段。"
+            "生成结构完整、长度自然的歌词，不要重复、灌水或在歌词唱完后继续演唱。"
+        )
+    duration_seconds = round(duration_minutes * 60)
+    minimum_lines = (duration_seconds + 5) // 6
+    maximum_lines = duration_seconds // 3
+    return (
+        f"目标时长：严格 {duration_seconds} 秒（约 {duration_minutes:g} 分钟）；"
+        f"必须让全部歌词在目标时长内完整唱完；生成 {minimum_lines}-{maximum_lines} 行歌词"
+        "（结构标签不计），"
+        "每句应能在 2-6 秒内唱完，每行不超过 32 个字符，宁可少写，也不要让结尾歌词被截断；"
+        "前奏、过渡和尾奏合计"
+        "尽量不超过 25 秒，尾奏不得超过 5 秒；歌词唱完后绝对不能继续演唱。"
+    )
 
 
 class PromptExpander(Protocol):
     async def expand(self, user_prompt: str) -> str: ...
+
+    async def prepare(
+        self,
+        user_prompt: str,
+        duration_minutes: int | None = None,
+        *,
+        job_id: str | None = None,
+    ) -> PreparedPrompt: ...
+
+    async def write_lyrics(
+        self, structured_prompt: str, user_prompt: str, duration_minutes: int
+    ) -> str: ...
+
+
+def split_generation_prompt(user_prompt: str) -> tuple[str, str]:
+    """Split the exact section format sent by the Create page."""
+    prompt = user_prompt.strip()
+    lyrics_marker = "[歌词与创作内容]"
+    style_marker = "[风格要求]"
+    if prompt.startswith(lyrics_marker):
+        parts = re.split(
+            r"(?:\r\n|\n|\r)\[风格要求\](?:\r\n|\n|\r)", prompt[len(lyrics_marker) :], maxsplit=1
+        )
+        return parts[0].strip(), parts[1].strip() if len(parts) > 1 else ""
+    if prompt.startswith(style_marker):
+        return "", prompt[len(style_marker) :].strip()
+    return "", prompt
 
 
 def normalize_llm_output(raw_content: object) -> str:
@@ -65,6 +171,51 @@ def normalize_llm_output(raw_content: object) -> str:
     content = re.sub(r"^```[a-z]*\s*", "", content, flags=re.IGNORECASE)
     content = re.sub(r"```$", "", content)
     return content.strip().strip("\"'").strip()
+
+
+def extract_json_object(raw_content: object) -> dict[str, Any]:
+    """Extract the first JSON object from an otherwise chatty LLM response."""
+    content = normalize_llm_output(raw_content)
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            return parsed
+    except (TypeError, ValueError):
+        pass
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", content):
+        try:
+            parsed, _ = decoder.raw_decode(content[match.start() :])
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("模型未返回 JSON 对象")
+
+
+def extract_tagged_lyrics(raw_content: object, original_lyrics: str) -> str | None:
+    lines = [
+        line.strip() for line in normalize_llm_output(raw_content).splitlines() if line.strip()
+    ]
+    lyric_lines = [line for line in lines if not LYRICS_SECTION_PATTERN.fullmatch(line)]
+    original_lines = [line.strip() for line in original_lyrics.splitlines() if line.strip()]
+    if lyric_lines != original_lines or len(lyric_lines) == len(lines):
+        return None
+    return "\n".join(lines)
+
+
+def truncate_lyrics(lyrics: str, limit: int = 3500) -> str:
+    """Keep complete lyric lines within the local model input budget."""
+    lines: list[str] = []
+    size = 0
+    for line in lyrics.splitlines():
+        added = len(line) + (1 if lines else 0)
+        if size + added > limit:
+            break
+        lines.append(line)
+        size += added
+    return "\n".join(lines)
 
 
 def extract_structured_music_tags(raw_content: object) -> str | None:
@@ -122,7 +273,10 @@ def _normalize_tags_only(candidate: str) -> str | None:
     remainder = STRUCTURED_TAG_PATTERN.sub("", candidate)
     if remainder.strip(" \t\r\n,;*_`-'\""):
         return None
-    normalized_tags = [re.sub(r"\s+", " ", tag).strip() for tag in tags]
+    normalized_tags = [
+        FORBIDDEN_LYRICS_CONSTRAINT_PATTERN.sub("", re.sub(r"\s+", " ", tag)).strip()
+        for tag in tags
+    ]
     return ", ".join(normalized_tags)
 
 
@@ -244,10 +398,11 @@ def looks_like_chinese_music_request(*values: object) -> bool:
 
 def build_elevenlabs_planning_prompt(
     structured_prompt: str,
-    duration_minutes: int,
+    duration_minutes: float,
     clear_chinese_vocal_mode: bool,
+    lyrics: str = "",
 ) -> str:
-    requirements = [structured_prompt, f"Target duration: {duration_minutes} minutes."]
+    requirements = [structured_prompt, f"Target duration: {duration_minutes:g} minutes."]
     if clear_chinese_vocal_mode:
         requirements.append(
             " ".join(
@@ -262,6 +417,10 @@ def build_elevenlabs_planning_prompt(
                     "or swallowed syllables.",
                 ]
             )
+        )
+    if lyrics:
+        requirements.extend(
+            ["Original lyrics (preserve wording and line order):", truncate_lyrics(lyrics)]
         )
     return "\n".join(requirements)
 
@@ -339,14 +498,15 @@ class OpenAICompatiblePromptExpander:
             raise GenerationError("LLM 扩写失败：缺少 LLM_API_KEY 环境变量。")
 
         try:
-            first_content = await self._completion(user_prompt, strict=False)
+            _, style_prompt = split_generation_prompt(user_prompt)
+            first_content = await self._completion(style_prompt, strict=False)
             first_structured_prompt = extract_structured_music_tags(first_content)
             if first_structured_prompt and is_expanded_music_prompt(first_structured_prompt):
                 return first_structured_prompt
             self._log_insufficient_expansion(first_structured_prompt, strict=False)
 
             retry_content = await self._completion(
-                user_prompt,
+                style_prompt,
                 strict=True,
                 rejected_draft=first_structured_prompt,
             )
@@ -373,6 +533,276 @@ class OpenAICompatiblePromptExpander:
         except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
             raise GenerationError(f"LLM 扩写失败：{_http_failure_message(exc)}") from exc
 
+    async def prepare(
+        self,
+        user_prompt: str,
+        duration_minutes: int | None = None,
+        *,
+        job_id: str | None = None,
+    ) -> PreparedPrompt:
+        if self._settings.llm_api_key is None:
+            raise GenerationError("歌词与风格处理失败：缺少 LLM_API_KEY 环境变量。")
+        lyrics, style = split_generation_prompt(user_prompt)
+        generate_lyrics = not lyrics
+        duration_instruction = lyrics_duration_instruction(duration_minutes)
+        if generate_lyrics:
+            request_content = f"创作要求：\n{style or user_prompt}\n\n{duration_instruction}"
+        else:
+            request_content = (
+                f"歌词：\n{lyrics}\n\n风格要求：\n{style or '请补充协调的音乐风格'}"
+                f"\n\n{duration_instruction}"
+            )
+        request_body: dict[str, object] = {
+            "model": self._settings.llm_model,
+            "temperature": 0,
+            "max_tokens": LLM_OUTPUT_TOKEN_CEILING,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        GENERATE_LYRICS_AND_STYLE_SYSTEM_PROMPT
+                        if generate_lyrics
+                        else LYRICS_AND_STYLE_SYSTEM_PROMPT
+                    ),
+                },
+                {"role": "user", "content": request_content},
+            ],
+        }
+        if self._settings.llm_disable_thinking:
+            if "qwen3" in self._settings.llm_model.lower():
+                request_body["chat_template_kwargs"] = {"enable_thinking": False}
+            elif "doubao" in self._settings.llm_model.lower():
+                request_body["thinking"] = {"type": "disabled"}
+        if "doubao" in self._settings.llm_model.lower() or self._settings.llm_url.startswith(
+            "https://api.openai.com/"
+        ):
+            request_body["response_format"] = {"type": "json_object"}
+        try:
+            original_messages = list(request_body["messages"])
+            rejected_content = ""
+            rejection_reason = ""
+            diagnostics: list[dict[str, object]] = []
+            for attempt in range(2):
+                if attempt:
+                    request_body["messages"] = [
+                        *original_messages,
+                        {"role": "assistant", "content": rejected_content[:2000]},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"上次响应未满足要求：{rejection_reason}。"
+                                "请修正后只输出 JSON 对象。"
+                            ),
+                        },
+                    ]
+                try:
+                    diagnostics.append(
+                        {
+                            "attempt": attempt + 1,
+                            "request": {
+                                "method": "POST",
+                                "url": self._settings.llm_url,
+                                "timeoutSeconds": self._settings.llm_timeout_seconds,
+                                "body": json.loads(json.dumps(request_body)),
+                            },
+                        }
+                    )
+                    if job_id:
+                        update_job_diagnostics(
+                            self._settings.output_dir, job_id, llmAttempts=diagnostics
+                        )
+                    response = await self._client.post(
+                        self._settings.llm_url,
+                        json=request_body,
+                        headers={
+                            "Authorization": (
+                                f"Bearer {self._settings.llm_api_key.get_secret_value()}"
+                            ),
+                            "Content-Type": "application/json",
+                        },
+                        timeout=httpx.Timeout(
+                            self._settings.llm_timeout_seconds,
+                            connect=min(10, self._settings.llm_timeout_seconds),
+                        ),
+                    )
+                    try:
+                        response_body: object = response.json()
+                    except ValueError:
+                        response_body = response.text
+                    diagnostics[-1]["response"] = {
+                        "statusCode": response.status_code,
+                        "headers": dict(response.headers),
+                        "body": response_body,
+                    }
+                    if job_id:
+                        update_job_diagnostics(
+                            self._settings.output_dir, job_id, llmAttempts=diagnostics
+                        )
+                    response.raise_for_status()
+                    data = response.json()
+                    content = data["choices"][0]["message"]["content"]
+                    if isinstance(content, list):
+                        content = "\n".join(
+                            str(part.get("text") or part.get("content") or "")
+                            for part in content
+                            if isinstance(part, dict)
+                        )
+                    rejected_content = str(content or "")
+                    prepared = extract_json_object(content)
+                    tagged_content = (
+                        prepared.get("taggedLyrics")
+                        or prepared.get("tagged_lyrics")
+                        or prepared.get("lyrics")
+                    )
+                    if isinstance(tagged_content, list):
+                        tagged_content = "\n".join(str(line) for line in tagged_content)
+                    if generate_lyrics:
+                        tagged = normalize_llm_output(tagged_content)
+                        if tagged and not LYRICS_SECTION_PATTERN.search(tagged):
+                            tagged = f"[Verse]\n{tagged}"
+                    elif LYRICS_SECTION_PATTERN.search(lyrics):
+                        tagged = lyrics
+                    else:
+                        tagged = extract_tagged_lyrics(tagged_content, lyrics) or (
+                            f"[Verse]\n{lyrics}"
+                        )
+                    style_tags = (
+                        prepared.get("styleTags")
+                        or prepared.get("style_tags")
+                        or prepared.get("structuredPrompt")
+                        or prepared.get("style")
+                    )
+                    if isinstance(style_tags, list):
+                        style_tags = ", ".join(str(tag) for tag in style_tags)
+                    elif isinstance(style_tags, dict):
+                        style_tags = json.dumps(style_tags, ensure_ascii=False)
+                    structured = extract_structured_music_tags(style_tags) or normalize_llm_output(
+                        style_tags
+                    )
+                    if not tagged or len(tagged) < 10 or not LYRICS_SECTION_PATTERN.search(tagged):
+                        raise ValueError(
+                            "模型未生成结构化歌词"
+                            if generate_lyrics
+                            else "模型修改了歌词或未添加段落标签"
+                        )
+                    lines = [line.strip() for line in tagged.splitlines() if line.strip()]
+                    lyric_lines = [
+                        line for line in lines if not LYRICS_SECTION_PATTERN.fullmatch(line)
+                    ]
+                    if not lyric_lines:
+                        raise ValueError("模型未返回可演唱的歌词行")
+                    if generate_lyrics:
+                        if any(
+                            (line.startswith("[") and not LYRICS_SECTION_PATTERN.fullmatch(line))
+                            or re.fullmatch(r"[（(].*[）)]", line)
+                            for line in lines
+                        ):
+                            raise ValueError("模型在歌词中加入了不支持的标签或演奏说明")
+                    if not structured or not is_expanded_music_prompt(structured):
+                        raise ValueError("模型未返回至少 8 个详细风格标签")
+                    if generate_lyrics:
+                        if any(len(line) > 32 for line in lyric_lines):
+                            raise ValueError("模型生成了超过 32 个字符的歌词行")
+                        if duration_minutes is not None:
+                            duration_seconds = duration_minutes * 60
+                            minimum_lines = (duration_seconds + 5) // 6
+                            maximum_lines = duration_seconds // 3
+                            if not minimum_lines <= len(lyric_lines) <= maximum_lines:
+                                raise ValueError(
+                                    f"严格 {duration_seconds} 秒需要 {minimum_lines}-"
+                                    f"{maximum_lines} 句歌词，实际返回 {len(lyric_lines)} 句"
+                                )
+                    return PreparedPrompt(
+                        structured,
+                        tagged,
+                        round(duration_minutes * 60) if duration_minutes is not None else None,
+                    )
+                except (ValueError, KeyError, IndexError, TypeError) as exc:
+                    rejection_reason = str(exc)
+                    diagnostics[-1]["validationError"] = rejection_reason
+                    if job_id:
+                        update_job_diagnostics(
+                            self._settings.output_dir, job_id, llmAttempts=diagnostics
+                        )
+                    if attempt:
+                        raise
+        except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
+            raise GenerationError(f"歌词与风格处理失败：{_http_failure_message(exc)}") from exc
+
+    async def write_lyrics(
+        self, structured_prompt: str, user_prompt: str, duration_minutes: float
+    ) -> str:
+        if self._settings.llm_api_key is None:
+            raise GenerationError("歌词生成失败：缺少 LLM_API_KEY 环境变量。")
+        language = (
+            "请用简体中文。"
+            if looks_like_chinese_music_request(user_prompt, structured_prompt)
+            else "Write in English."
+        )
+        request_body: dict[str, object] = {
+            "model": self._settings.llm_model,
+            "temperature": 0.8,
+            "max_tokens": effective_llm_output_tokens(self._settings.llm_max_tokens, strict=False),
+            "messages": [
+                {"role": "system", "content": LYRICS_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": "\n".join(
+                        [
+                            "Original request:",
+                            user_prompt,
+                            "",
+                            "Music style tags:",
+                            structured_prompt[:1200],
+                            "",
+                            language,
+                            lyrics_duration_instruction(duration_minutes),
+                            "总长不超过 3500 字符。",
+                        ]
+                    ),
+                },
+            ],
+        }
+        if self._settings.llm_disable_thinking:
+            if "qwen3" in self._settings.llm_model.lower():
+                request_body["chat_template_kwargs"] = {"enable_thinking": False}
+            elif "doubao" in self._settings.llm_model.lower():
+                request_body["thinking"] = {"type": "disabled"}
+        try:
+            response = await self._client.post(
+                self._settings.llm_url,
+                json=request_body,
+                headers={
+                    "Authorization": f"Bearer {self._settings.llm_api_key.get_secret_value()}",
+                    "Content-Type": "application/json",
+                },
+                timeout=httpx.Timeout(
+                    self._settings.llm_timeout_seconds,
+                    connect=min(10, self._settings.llm_timeout_seconds),
+                ),
+            )
+            response.raise_for_status()
+            data = response.json()
+            choices = data.get("choices") if isinstance(data, dict) else None
+            message = choices[0].get("message") if isinstance(choices, list) and choices else None
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                content = "\n".join(
+                    str(part.get("text") or part.get("content") or "")
+                    for part in content
+                    if isinstance(part, dict)
+                )
+            lyrics = normalize_llm_output(content)
+            if len(lyrics) < 10:
+                raise ValueError("模型未返回足够的歌词")
+            return lyrics
+        except GenerationError:
+            raise
+        except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
+            raise GenerationError(
+                f"歌词生成失败：模型 {self._settings.llm_model}：{_http_failure_message(exc)}"
+            ) from exc
+
     async def _completion(
         self,
         user_prompt: str,
@@ -397,9 +827,9 @@ class OpenAICompatiblePromptExpander:
         request_body: dict[str, object] = {
             "model": self._settings.llm_model,
             "temperature": 0 if strict else self._settings.llm_temperature,
-            "max_tokens": effective_llm_output_tokens(
-                self._settings.llm_max_tokens,
-                strict=strict,
+            "max_tokens": min(
+                1024,
+                effective_llm_output_tokens(self._settings.llm_max_tokens, strict=strict),
             ),
             "messages": [
                 {
@@ -409,8 +839,11 @@ class OpenAICompatiblePromptExpander:
                 {"role": "user", "content": request_prompt},
             ],
         }
-        if self._settings.llm_disable_thinking and "qwen3" in self._settings.llm_model.lower():
-            request_body["chat_template_kwargs"] = {"enable_thinking": False}
+        if self._settings.llm_disable_thinking:
+            if "qwen3" in self._settings.llm_model.lower():
+                request_body["chat_template_kwargs"] = {"enable_thinking": False}
+            elif "doubao" in self._settings.llm_model.lower():
+                request_body["thinking"] = {"type": "disabled"}
         response = await self._client.post(
             self._settings.llm_url,
             json=request_body,
@@ -476,6 +909,8 @@ def _http_failure_message(error: Exception) -> str:
             detail = data.get("detail") if isinstance(data, dict) else None
             if isinstance(detail, dict):
                 message = str(detail.get("message", ""))
+            elif detail:
+                message = str(detail)
             if not message and isinstance(data, dict):
                 nested_error = data.get("error")
                 if isinstance(nested_error, dict):

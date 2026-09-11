@@ -7,6 +7,7 @@ from app.core.config import Settings
 from app.infrastructure.events import NullEventPublisher
 from app.infrastructure.queue import InlineTaskDispatcher
 from app.services.orchestrator import GenerationOrchestrator
+from app.services.prompt import PreparedPrompt
 from app.services.providers import MusicResult
 from app.services.stems import SplitResult, stem_output_files
 
@@ -14,6 +15,28 @@ from app.services.stems import SplitResult, stem_output_files
 class StubPromptExpander:
     async def expand(self, user_prompt: str) -> str:
         return f"[Genre: Test], [Source: {user_prompt}]"
+
+    async def prepare(
+        self,
+        user_prompt: str,
+        duration_minutes: int | None = None,
+        *,
+        job_id: str | None = None,
+    ) -> PreparedPrompt:
+        duration_seconds = duration_minutes * 60 if duration_minutes is not None else None
+        if user_prompt.startswith("[歌词与创作内容]"):
+            lyrics = user_prompt.split("\n\n[风格要求]", 1)[0].split("\n", 1)[1]
+            return PreparedPrompt(
+                await self.expand(user_prompt), f"[Verse]\n{lyrics}", duration_seconds
+            )
+        return PreparedPrompt(
+            await self.expand(user_prompt), "[Verse]\n自动生成的测试歌词", duration_seconds
+        )
+
+    async def write_lyrics(
+        self, structured_prompt: str, user_prompt: str, duration_minutes: int
+    ) -> str:
+        return "[Verse]\n自动生成的测试歌词"
 
 
 class BlockingPromptExpander:
@@ -26,15 +49,49 @@ class BlockingPromptExpander:
         await self.release.wait()
         return "[Genre: Test]"
 
+    async def prepare(
+        self,
+        user_prompt: str,
+        duration_minutes: int | None = None,
+        *,
+        job_id: str | None = None,
+    ) -> PreparedPrompt:
+        return PreparedPrompt(
+            await self.expand(user_prompt),
+            "[Verse]\n自动生成的测试歌词",
+            duration_minutes * 60 if duration_minutes is not None else None,
+        )
+
+    async def write_lyrics(
+        self, structured_prompt: str, user_prompt: str, duration_minutes: int
+    ) -> str:
+        return "[Verse]\n自动生成的测试歌词"
+
 
 class StubMusicProvider:
-    def __init__(self, source: Path) -> None:
+    def __init__(self, source: Path, name: str = "stub") -> None:
         self.source = source
+        self.name = name
+        self.user_prompt = ""
+        self.variations: list[int] = []
+        self.requested_durations: list[int | None] = []
 
     async def generate(
-        self, structured_prompt: str, duration_minutes: int, user_prompt: str
+        self,
+        structured_prompt: str,
+        duration_seconds: int | None,
+        user_prompt: str,
+        *,
+        variation: int = 0,
+        progress=None,
+        job_id=None,
     ) -> MusicResult:
-        return MusicResult(self.source, {"provider": "stub"})
+        self.user_prompt = user_prompt
+        self.variations.append(variation)
+        self.requested_durations.append(duration_seconds)
+        return MusicResult(
+            self.source, {"provider": self.name, "durationSeconds": duration_seconds or 150}
+        )
 
 
 class StubStemSeparator:

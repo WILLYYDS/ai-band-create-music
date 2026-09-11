@@ -1,6 +1,6 @@
 # AI Band Generate Module
 
-AI 音乐生成、四轨分离与 RVC 人声替换的纯 FastAPI 后端。项目使用 `uv` 固定 Python 和依赖版本，
+AI 音乐生成与 RVC 人声替换的纯 FastAPI 后端。项目使用 `uv` 固定 Python 和依赖版本，
 不包含原 Vue/Vite 前端。
 
 ## 功能
@@ -8,7 +8,7 @@ AI 音乐生成、四轨分离与 RVC 人声替换的纯 FastAPI 后端。项目
 - OpenAI-compatible LLM 音乐 Prompt 结构化扩写与质量校验
 - ElevenLabs Music API（Composition Plan / 直接 Prompt）
 - Suno sidecar 和 Generic Provider 兼容适配器
-- Demucs `vocal / drums / bass / other` 四轨分离
+- 内置 Demucs `vocal / drums / bass / other` 四轨分离实现（当前生成管线未启用）
 - RVC 人声替换、结果下载、软删除与恢复
 - `/api/health`、`/api/generate` 和 `/output/*` 音频访问接口
 - 本地内联任务执行，以及队列、缓存、事件发布的可替换接口
@@ -29,7 +29,8 @@ cp .env.example .env
 Blackwell `sm_120`；Demucs 和 RVC 共用这一套 CUDA 环境，不再安装 CPU Torch。
 运行拆轨或默认的 RVC 配置需要可用的 NVIDIA 驱动和 CUDA GPU。
 
-编辑 `.env`，至少配置 LLM Key。真实 ElevenLabs 模式还需要配置：
+编辑 `.env`，至少配置 LLM Key。`MUSIC_PROVIDER` 只是请求未传 `provider` 时的默认值；
+MiniMax 和 ElevenLabs 的配置可以同时保留。真实 ElevenLabs 模式还需要配置：
 
 ```env
 MUSIC_API_MODE=real
@@ -39,14 +40,34 @@ LLM_MAX_TOKENS=1024
 LLM_TIMEOUT_SECONDS=120
 LLM_DISABLE_THINKING=true
 ELEVENLABS_API_KEY=...
-ENABLE_AUDIO_SPLITTING=true
+ENABLE_AUDIO_SPLITTING=false
 ```
+
+自部署 MiniMax Music 3 使用兼容的 `/v1/audio/jobs` 接口：
+
+```env
+MUSIC_API_MODE=real
+MUSIC_PROVIDER=minimax_music
+MINIMAX_BASE_URL=http://127.0.0.1:8111
+MINIMAX_MODEL=MiniMaxAI/MiniMax-Music3
+MINIMAX_SEED=42
+MINIMAX_NUM_INFERENCE_STEPS=30
+MINIMAX_TIMEOUT_SECONDS=7200
+LLM_API_KEY=...
+```
+
+后端将 LLM 生成的歌词作为 `input`，结构化音乐描述作为 `instructions`，并将返回的
+44.1 kHz WAV 直接保存到 `output`。传 `durationMinutes: "auto"`、`null` 或省略该字段时，
+MiniMax 请求不包含 `audio_duration`，由模型选择自然完整的时长；其他 Provider 使用
+`DEFAULT_DURATION_MINUTES`。传 `1` 到 `6` 时直接换算为对应秒数。
+如果两个服务分别运行在 Docker 容器中，请将 `MINIMAX_BASE_URL` 改为可达的容器服务名
+或宿主机地址。
 
 音乐 Prompt 扩写建议使用非推理模型。推理模型可能先输出很长的思考过程，增加
 延迟并触发读取超时。遇到 LLM `ReadTimeout` 时，应先确认 `LLM_MODEL`，再根据
 服务延迟调整 `LLM_TIMEOUT_SECONDS`；后端不会自动重试网络超时，以免产生重复调用。
-分类格式的合格扩写结果必须包含 8–14 个详细英文制作标签，覆盖风格与年代、速度与
-拍号、情绪、配器、人声、编曲结构以及制作与混音，目标长度为 350–1200 字符。
+分类格式的合格扩写结果必须包含 8 个简洁英文制作标签，覆盖风格与年代、速度与拍号、
+情绪、配器、人声、编曲结构、制作与混音以及排除项，目标长度为 350–900 字符。
 同时兼容 Qwen 返回的单方括号扁平制作标签列表，但至少需要 10 个标签和 280 字符。
 未指定的要素由 LLM 做协调一致的专业补充，短标签翻译不会再被当作扩写成功。
 
@@ -97,12 +118,13 @@ curl -X POST http://127.0.0.1:8010/api/voice/convert \
 `DELETE /api/voice/result` 软删除结果，`PUT /api/voice/result` 恢复结果；三个请求均以
 表单字段 `filename` 传入文件名。
 
-生成音乐：
+生成音乐。`provider` 可传 `minimax_music` 或 `elevenlabs_music`，不传时使用
+`MUSIC_PROVIDER`：
 
 ```bash
 curl -X POST http://127.0.0.1:8010/api/generate \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"明亮的普通话摇滚，清晰女声和有力鼓组","durationMinutes":2}'
+  -d '{"prompt":"明亮的普通话摇滚，清晰女声和有力鼓组","durationMinutes":2,"provider":"minimax_music"}'
 ```
 
 前端使用异步任务接口，以便刷新后恢复任务并显示真实阶段进度：
@@ -138,8 +160,10 @@ curl -X DELETE http://127.0.0.1:8010/api/jobs/<jobId>/stems/vocal
 curl -X PUT http://127.0.0.1:8010/api/jobs/<jobId>/stems/vocal
 ```
 
-任务状态当前保存在单个后端进程内，适配推荐的单 Uvicorn worker 配置。服务重启后
-运行中任务不会恢复；需要多 worker 或重启恢复时再接入共享任务存储。
+任务元数据会原子写入 `output/jobs/<jobId>/job.json`，服务重启后会重新加载历史。
+重启时仍为 `pending` 或 `running` 的任务会恢复为 `failed`，并标记“服务器重启，生成任务已中断”；
+不会自动续跑未完成的音乐生成。执行队列和并发计数仍为单进程状态，因此仍推荐单
+Uvicorn worker；需要多 worker 时再接入共享任务存储。
 
 成功响应继续包含：
 
@@ -148,39 +172,11 @@ jobId, prompt, durationMinutes, structuredPrompt, fullTrack,
 stems, stemUrls, waveforms, splitEnabled, debug
 ```
 
-## 四轨分离配置
+## 四轨分离（当前未接入生成管线）
 
-Demucs 的 `mdx_q` 和 `htdemucs` 默认就是四源模型，不需要单独填写 stem
-列表。开启四轨分离的推荐配置：
-
-```env
-ENABLE_AUDIO_SPLITTING=true
-SPLIT_PROFILE=balanced
-DEMUCS_MODEL=htdemucs
-DEMUCS_DEVICE=cuda
-SPLIT_KEEP_WORKDIR=false
-```
-
-输出位于：
-
-```text
-output/jobs/<jobId>/<原始音乐名>_vocal.mp3
-output/jobs/<jobId>/<原始音乐名>_drums.mp3
-output/jobs/<jobId>/<原始音乐名>_bass.mp3
-output/jobs/<jobId>/<原始音乐名>_other.mp3
-```
-
-快速本地验证可以改为：
-
-```env
-SPLIT_PROFILE=fast
-DEMUCS_MODEL=mdx_q
-```
-
-`SPLIT_PROFILE` 已经包含默认模型；显式设置 `DEMUCS_MODEL` 只是为了让配置
-更直观。首次运行模型时会下载权重到 `.torch-cache`。
-当 `DEMUCS_DEVICE=cuda` 时，拆轨前会检查 PyTorch CUDA 可用性；检查失败会直接
-返回配置错误，不会静默回退 CPU。
+仓库保留了 Demucs 四轨分离实现和相关配置，但当前生成管线不会调用它。
+`ENABLE_AUDIO_SPLITTING` 的值不会改变生成结果；响应固定为空 `stems`/`stemUrls`，并返回
+`splitEnabled: false`。
 
 ## 本地基础设施模式
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class GenerateRequest(BaseModel):
@@ -10,6 +10,8 @@ class GenerateRequest(BaseModel):
 
     prompt: str
     durationMinutes: int | float | str | None = None
+    provider: Literal["minimax_music", "elevenlabs_music"] | None = None
+    count: Literal[1, 2] = 1
 
 
 class ErrorResponse(BaseModel):
@@ -17,18 +19,32 @@ class ErrorResponse(BaseModel):
     message: str
 
 
-class GenerateResponse(BaseModel):
-    success: bool = True
-    jobId: str
-    prompt: str
-    durationMinutes: int
-    structuredPrompt: str
+class MusicOutput(BaseModel):
     fullTrack: str
+    durationSeconds: float | None = None
     stems: dict[str, str]
     stemUrls: list[str]
     waveforms: dict[str, list[float]]
     splitEnabled: bool
     debug: dict[str, Any]
+
+
+class GenerateResponse(MusicOutput):
+    success: bool = True
+    jobId: str
+    createdAt: str | None = None
+    provider: str | None = None
+    requestedCount: int | None = None
+    requestedDurationSeconds: float | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    prompt: str
+    durationMinutes: int | Literal["auto"]
+    structuredPrompt: str
+    lyrics: str
+    count: Literal[1, 2] = 1
+    alternatives: list[MusicOutput] = Field(default_factory=list)
+    warning: str | None = None
 
 
 class CreateGenerationJobResponse(BaseModel):
@@ -44,9 +60,16 @@ class UpdateGenerationJobRequest(BaseModel):
 
 class GenerationJobResponse(BaseModel):
     jobId: str
+    createdAt: str
+    prompt: str
+    structuredPrompt: str | None = None
+    lyrics: str | None = None
     status: Literal["pending", "running", "succeeded", "failed", "cancelled"]
     stage: str
-    progress: int
+    progress: int | None = None
+    step: int | None = None
+    totalSteps: int | None = None
     message: str
+    warning: str | None = None
     result: GenerateResponse | None = None
     error: str | None = None

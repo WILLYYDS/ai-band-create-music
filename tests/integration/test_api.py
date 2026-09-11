@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -8,7 +9,12 @@ import httpx
 import pytest
 
 from app.main import create_app
-from tests.helpers import BlockingPromptExpander, make_orchestrator, make_settings
+from tests.helpers import (
+    BlockingPromptExpander,
+    StubMusicProvider,
+    make_orchestrator,
+    make_settings,
+)
 
 
 async def _client(app) -> httpx.AsyncClient:
@@ -84,7 +90,8 @@ async def test_generate_preserves_not_ready_response(tmp_path: Path) -> None:
 
 async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> None:
     settings = make_settings(tmp_path, enable_audio_splitting=True)
-    app = create_app(settings, make_orchestrator(settings))
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
     async with await _client(app) as client:
         response = await client.post(
             "/api/generate",
@@ -92,18 +99,122 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
         )
         assert response.status_code == 200
         body = response.json()
-        assert body["splitEnabled"] is True
-        assert list(body["stems"]) == ["vocal", "drums", "bass", "other"]
-        assert body["stems"]["vocal"].endswith("_vocal.mp3")
-        assert body["stems"]["drums"].endswith("_drums.mp3")
+        assert body["durationMinutes"] == 3
+        assert body["requestedDurationSeconds"] == 180
+        assert body["debug"]["music"]["durationSeconds"] == 180
+        assert body["splitEnabled"] is False
+        assert body["stems"] == {}
         assert body["waveforms"] == {}
         assert "splitterStdout" not in body["debug"]
         assert "splitterStderr" not in body["debug"]
-        audio = await client.get(body["stems"]["vocal"])
+        audio = await client.get(body["fullTrack"])
     assert audio.status_code == 200
     assert audio.headers["content-type"].startswith("audio/mpeg")
     assert audio.headers["cache-control"] == "no-store"
-    assert audio.content == b"ID3-stem-audio"
+    assert audio.content == b"ID3-full-audio"
+    assert orchestrator.music_provider.requested_durations == [180]
+
+
+@pytest.mark.parametrize(
+    "duration_field",
+    [{"durationMinutes": "auto"}, {"durationMinutes": None}, {}],
+)
+async def test_generate_lets_provider_choose_duration_for_auto(
+    tmp_path: Path, duration_field: dict[str, object]
+) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            json={"prompt": "自动长度普通话歌曲", **duration_field},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["durationMinutes"] == "auto"
+    assert "requestedDurationSeconds" not in body
+    assert body["debug"]["music"]["durationSeconds"] == 150
+    assert orchestrator.music_provider.requested_durations == [None]
+
+
+async def test_generate_selects_provider_per_request(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    orchestrator = make_orchestrator(settings)
+    orchestrator.music_providers = {
+        name: StubMusicProvider(settings.mock_full_song_path, name)
+        for name in ("minimax_music", "elevenlabs_music")
+    }
+    app = create_app(settings, orchestrator)
+
+    async with await _client(app) as client:
+        for provider in orchestrator.music_providers:
+            response = await client.post(
+                "/api/generate", json={"prompt": "rock", "provider": provider}
+            )
+            assert response.status_code == 200
+            assert response.json()["debug"]["music"]["provider"] == provider
+
+
+async def test_minimax_count_two_returns_two_results(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    orchestrator = make_orchestrator(settings)
+    provider = StubMusicProvider(settings.mock_full_song_path, "minimax_music")
+    orchestrator.music_providers = {"minimax_music": provider}
+    app = create_app(settings, orchestrator)
+
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            json={"prompt": "两首摇滚", "provider": "minimax_music", "count": 2},
+        )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["count"] == 2
+    assert len(body["alternatives"]) == 1
+    assert provider.variations == [0, 1]
+
+
+async def test_elevenlabs_count_two_warns_and_generates_one(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    orchestrator = make_orchestrator(settings)
+    provider = StubMusicProvider(settings.mock_full_song_path, "elevenlabs_music")
+    orchestrator.music_providers = {"elevenlabs_music": provider}
+    app = create_app(settings, orchestrator)
+
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            json={"prompt": "两首摇滚", "provider": "elevenlabs_music", "count": 2},
+        )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["count"] == 1
+    assert body["alternatives"] == []
+    assert "暂不支持" in body["warning"]
+    assert provider.variations == [0]
+
+
+async def test_ai_talk_lyrics_are_tagged_before_music_generation(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    orchestrator = make_orchestrator(settings)
+    provider = StubMusicProvider(settings.mock_full_song_path)
+    orchestrator.music_provider = provider
+    app = create_app(settings, orchestrator)
+
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            json={"prompt": ("[歌词与创作内容]\n第一句\n第二句\n\n[风格要求]\n梦幻流行")},
+        )
+
+    assert response.status_code == 200
+    assert provider.user_prompt == (
+        "[歌词与创作内容]\n[Verse]\n第一句\n第二句\n\n[风格要求]\n梦幻流行"
+    )
 
 
 async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
@@ -119,7 +230,22 @@ async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
         running = await client.get(f"/api/jobs/{job_id}")
         assert running.json()["status"] == "running"
         assert running.json()["stage"] == "expanding_prompt"
-        assert running.json()["progress"] == 10
+        assert running.json()["progress"] is None
+        assert running.json()["step"] is None
+        assert running.json()["totalSteps"] is None
+        assert running.json()["prompt"] == "真实进度"
+        assert running.json()["structuredPrompt"] is None
+        prompt_file = settings.output_dir / "jobs" / job_id / "prompts.json"
+        initial_diagnostics = json.loads(prompt_file.read_text(encoding="utf-8"))
+        assert initial_diagnostics["jobId"] == job_id
+        assert initial_diagnostics["prompt"] == "真实进度"
+        assert initial_diagnostics["structuredPrompt"] is None
+        assert initial_diagnostics["lyrics"] is None
+        assert initial_diagnostics["provider"] == "minimax_music"
+        assert initial_diagnostics["requestedDurationMinutes"] == "auto"
+        assert initial_diagnostics["requestedCount"] == 1
+        assert initial_diagnostics["effectiveCount"] == 1
+        assert initial_diagnostics["requestId"]
 
         blocker.release.set()
         for _ in range(20):
@@ -130,8 +256,19 @@ async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
 
     body = completed.json()
     assert body["progress"] == 100
-    assert body["result"]["splitEnabled"] is True
-    assert set(body["result"]["stems"]) == {"vocal", "drums", "bass", "other"}
+    assert body["prompt"] == "真实进度"
+    assert body["structuredPrompt"] == "[Genre: Test]"
+    assert body["lyrics"] == "[Verse]\n自动生成的测试歌词"
+    final_diagnostics = json.loads(prompt_file.read_text(encoding="utf-8"))
+    assert final_diagnostics["structuredPrompt"] == "[Genre: Test]"
+    assert final_diagnostics["lyrics"] == "[Verse]\n自动生成的测试歌词"
+    assert final_diagnostics["style"] == "真实进度"
+    assert final_diagnostics["providerPrompt"].startswith("[歌词与创作内容]")
+    assert final_diagnostics["durationSource"] == "provider"
+    assert "effectiveDurationSeconds" not in final_diagnostics
+    assert "effectiveDurationMinutes" not in final_diagnostics
+    assert body["result"]["splitEnabled"] is False
+    assert body["result"]["stems"] == {}
 
 
 async def test_async_job_can_be_cancelled(tmp_path: Path) -> None:
@@ -163,6 +300,8 @@ async def test_async_job_deleted_stem_stays_deleted(tmp_path: Path) -> None:
                 break
             await asyncio.sleep(0)
 
+        seed_legacy_stems(app, settings, job_id)
+        completed = await client.get(f"/api/jobs/{job_id}")
         vocal_url = completed.json()["result"]["stems"]["vocal"]
         deleted = await client.delete(f"/api/jobs/{job_id}/stems/vocal")
         refreshed = await client.get(f"/api/jobs/{job_id}")
@@ -181,6 +320,37 @@ async def test_async_job_deleted_stem_stays_deleted(tmp_path: Path) -> None:
     assert restored_file.status_code == 200
 
 
+async def test_async_second_song_stem_can_be_deleted_and_restored(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    orchestrator = make_orchestrator(settings)
+    provider = StubMusicProvider(settings.mock_full_song_path, "minimax_music")
+    orchestrator.music_providers = {"minimax_music": provider}
+    app = create_app(settings, orchestrator)
+
+    async with await _client(app) as client:
+        created = await client.post(
+            "/api/jobs",
+            json={"prompt": "两首摇滚", "provider": "minimax_music", "count": 2},
+        )
+        job_id = created.json()["jobId"]
+        for _ in range(20):
+            completed = await client.get(f"/api/jobs/{job_id}")
+            if completed.json()["status"] == "succeeded":
+                break
+            await asyncio.sleep(0)
+
+        seed_legacy_stems(app, settings, job_id)
+        deleted = await client.delete(f"/api/jobs/{job_id}/stems/vocal?song=1")
+        after_delete = (await client.get(f"/api/jobs/{job_id}")).json()
+        restored = await client.put(f"/api/jobs/{job_id}/stems/vocal?song=1")
+
+    assert deleted.status_code == 204
+    assert "vocal" in after_delete["result"]["stems"]
+    assert "vocal" not in after_delete["result"]["alternatives"][0]["stems"]
+    assert restored.status_code == 200
+    assert "vocal" in restored.json()["result"]["alternatives"][0]["stems"]
+
+
 async def test_restore_forgets_missing_trash_file(tmp_path: Path) -> None:
     settings = make_settings(tmp_path, enable_audio_splitting=True)
     app = create_app(settings, make_orchestrator(settings))
@@ -193,6 +363,8 @@ async def test_restore_forgets_missing_trash_file(tmp_path: Path) -> None:
                 break
             await asyncio.sleep(0)
 
+        seed_legacy_stems(app, settings, job_id)
+        completed = await client.get(f"/api/jobs/{job_id}")
         vocal_url = completed.json()["result"]["stems"]["vocal"]
         await client.delete(f"/api/jobs/{job_id}/stems/vocal")
         trash = settings.output_dir / ".trash" / job_id / Path(vocal_url).name
@@ -213,7 +385,7 @@ async def test_split_disabled_returns_full_track_compatibility_stems(tmp_path: P
         response = await client.post("/api/generate", json={"prompt": "ambient"})
     body = response.json()
     assert body["splitEnabled"] is False
-    assert set(body["stems"].values()) == {body["fullTrack"]}
+    assert body["stems"] == {}
 
 
 async def test_request_size_limit_returns_413(tmp_path: Path) -> None:
@@ -357,3 +529,14 @@ async def test_application_lifespan_accepts_proxy_environment(
 
     async with app.router.lifespan_context(app):
         assert app.state.orchestrator is not None
+
+
+def seed_legacy_stems(app, settings, job_id):
+    job = app.state.jobs[job_id]
+    for index, result in enumerate([job.result, *job.result.get("alternatives", [])]):
+        path = settings.output_dir / "jobs" / job_id / f"legacy_{index}_vocal.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"ID3-legacy-stem")
+        url = f"http://testserver/output/{path.relative_to(settings.output_dir)}"
+        result.update(stems={"vocal": url}, stemUrls=[url], splitEnabled=True)
+    job.save(settings.output_dir)
