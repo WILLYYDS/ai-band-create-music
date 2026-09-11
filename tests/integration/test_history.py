@@ -43,6 +43,26 @@ async def test_direct_history_restart_and_duplicate_import(tmp_path):
     assert copy.exists()
 
 
+async def test_history_urls_do_not_persist_request_host(tmp_path):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    async with client(app) as http:
+        result = (
+            await http.post(
+                "/api/generate", json={"prompt": "rock"}, headers={"Host": "attacker.test"}
+            )
+        ).json()
+        stored = json.loads(
+            (settings.output_dir / "jobs" / result["jobId"] / "job.json").read_text()
+        )
+        history = (await http.get("/api/jobs")).json()["jobs"]
+
+    assert result["fullTrack"].startswith("http://attacker.test/output/")
+    assert stored["result"]["fullTrack"].endswith(f"{result['jobId']}_1.mp3")
+    assert "://" not in stored["result"]["fullTrack"]
+    assert history[0]["result"]["fullTrack"].startswith("http://testserver/output/")
+
+
 def test_interrupted_and_corrupt_metadata(tmp_path):
     settings = make_settings(tmp_path)
     job = GenerationJob(

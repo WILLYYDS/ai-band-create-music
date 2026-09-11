@@ -555,7 +555,7 @@ class MiniMaxMusicProvider:
             response = await self._client.post(
                 url,
                 json=request_body,
-                timeout=self._settings.minimax_timeout_seconds,
+                timeout=httpx.Timeout(self._settings.minimax_timeout_seconds, connect=10),
             )
             create_response = _response_diagnostic(response)
             update_provider_diagnostic(
@@ -615,7 +615,7 @@ class MiniMaxMusicProvider:
                 async with self._client.stream(
                     "GET",
                     f"{job_url}/audio",
-                    timeout=self._settings.minimax_timeout_seconds,
+                    timeout=httpx.Timeout(self._settings.minimax_timeout_seconds, connect=10),
                 ) as response:
                     if not response.is_success:
                         await response.aread()

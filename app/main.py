@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -12,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -37,7 +38,7 @@ from app.schemas import (
     GenerationJobResponse,
     UpdateGenerationJobRequest,
 )
-from app.services.audio_files import detect_audio_content_type
+from app.services.audio_files import build_public_audio_url, detect_audio_content_type
 from app.services.job_files import read_job_diagnostics
 from app.services.orchestrator import GenerationOrchestrator
 from app.services.prompt import OpenAICompatiblePromptExpander, effective_llm_output_tokens
@@ -203,7 +204,7 @@ def load_jobs(output_dir: Path) -> dict[str, GenerationJob]:
 
 
 async def import_legacy_songs(
-    jobs: dict[str, GenerationJob], settings: Settings, base: str, candidates: list[Path]
+    jobs: dict[str, GenerationJob], settings: Settings, candidates: list[Path]
 ) -> None:
     represented = set()
     fingerprints = set()
@@ -274,7 +275,7 @@ async def import_legacy_songs(
             "durationMinutes": "auto",
             "count": 1,
             "alternatives": [],
-            "fullTrack": f"{base}/output/{quote(path.name)}",
+            "fullTrack": path.relative_to(settings.output_dir).as_posix(),
             "stems": {},
             "stemUrls": [],
             "waveforms": await extract_waveforms({"full": path}),
@@ -494,7 +495,6 @@ def create_app(
             result = await _orchestrator(request).generate(
                 prompt,
                 duration,
-                _public_base_url(request, application_settings),
                 request_id,
                 job_id=job.job_id,
                 progress=report,
@@ -507,7 +507,9 @@ def create_app(
             result["createdAt"] = job.created_at
             job.save(application_settings.output_dir)
             request.app.state.jobs[job.job_id] = job
-            return result
+            return _render_result_urls(
+                result, _public_base_url(request, application_settings), application_settings
+            )
         except HTTPException as exc:
             job.error = str(exc)
             raise
@@ -579,7 +581,6 @@ def create_app(
             await active_orchestrator.capacity.release()
             raise
         jobs[job_id] = job
-        base_url = _public_base_url(request, application_settings)
         request_id = request.headers.get("X-Request-ID") or uuid4().hex
 
         async def report(
@@ -611,7 +612,6 @@ def create_app(
                 job.result = await active_orchestrator.generate(
                     prompt,
                     duration,
-                    base_url,
                     request_id,
                     job_id=job_id,
                     progress=report,
@@ -652,13 +652,12 @@ def create_app(
                 await import_legacy_songs(
                     request.app.state.jobs,
                     application_settings,
-                    _public_base_url(request, application_settings),
                     legacy_candidates,
                 )
                 legacy_imported = True
         return {
             "jobs": [
-                job.response()
+                _job_response(job, request, application_settings)
                 for job in sorted(
                     request.app.state.jobs.values(), key=lambda job: job.created_at, reverse=True
                 )
@@ -677,7 +676,7 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "生成任务不存在。"},
             )
-        return job.response()
+        return _job_response(job, request, application_settings)
 
     @application.patch(
         "/api/jobs/{job_id}",
@@ -702,7 +701,7 @@ def create_app(
             job.message = "任务已取消"
             job.progress = job.step = job.total_steps = None
             job.save(application_settings.output_dir)
-        return job.response()
+        return _job_response(job, request, application_settings)
 
     @application.delete(
         "/api/jobs/{job_id}/stems/{stem_name}",
@@ -786,7 +785,7 @@ def create_app(
 
         stems = result.get("stems", {})
         if stem_name in stems:
-            return job.response()
+            return _job_response(job, request, application_settings)
         deleted_key = f"{song}:{stem_name}"
         deleted = job.deleted_stems.get(deleted_key)
         if deleted is None:
@@ -823,7 +822,7 @@ def create_app(
         del job.deleted_stems[deleted_key]
         job.message = f"音轨 {stem_name} 已恢复"
         job.save(application_settings.output_dir)
-        return job.response()
+        return _job_response(job, request, application_settings)
 
     @application.get("/output/{file_path:path}")
     async def audio_file(file_path: str, request: Request) -> StreamingResponse:
@@ -882,13 +881,50 @@ def _public_base_url(request: Request, settings: Settings) -> str:
     return settings.public_base_url or str(request.base_url).rstrip("/")
 
 
+def _job_response(job: GenerationJob, request: Request, settings: Settings) -> dict[str, Any]:
+    response = job.response()
+    if job.result is not None:
+        response["result"] = _render_result_urls(
+            job.result, _public_base_url(request, settings), settings
+        )
+    return response
+
+
+def _render_result_urls(
+    result: dict[str, Any], base_url: str, settings: Settings
+) -> dict[str, Any]:
+    rendered = copy.deepcopy(result)
+    for output in [rendered, *rendered.get("alternatives", [])]:
+        if not isinstance(output, dict):
+            continue
+        full_track = output.get("fullTrack")
+        if isinstance(full_track, str):
+            output["fullTrack"] = _public_audio_url(full_track, base_url, settings)
+        stems = output.get("stems")
+        if isinstance(stems, dict):
+            output["stems"] = {
+                name: _public_audio_url(url, base_url, settings)
+                for name, url in stems.items()
+                if isinstance(url, str)
+            }
+            output["stemUrls"] = list(output["stems"].values())
+    return rendered
+
+
+def _public_audio_url(audio_url: str, base_url: str, settings: Settings) -> str:
+    target = _output_path_from_url(audio_url, settings)
+    return build_public_audio_url(base_url, target.relative_to(settings.output_dir.resolve()))
+
+
 def _output_path_from_url(audio_url: str, settings: Settings):
     path = unquote(urlsplit(audio_url).path)
     marker = "/output/"
-    if marker not in path:
+    if marker in path:
+        path = path.split(marker, 1)[1]
+    elif urlsplit(audio_url).scheme or path.startswith("/"):
         raise ValueError("Not an output URL")
     root = settings.output_dir.resolve()
-    target = (root / path.split(marker, 1)[1]).resolve()
+    target = (root / path).resolve()
     target.relative_to(root)
     return target
 
