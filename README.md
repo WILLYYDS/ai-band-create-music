@@ -1,6 +1,6 @@
 # AI Band Generate Module
 
-AI 音乐生成、四轨分离与 RVC 人声替换的纯 FastAPI 后端。项目使用 `uv` 固定 Python 和依赖版本，
+AI 音乐生成与 RVC 人声替换的纯 FastAPI 后端。项目使用 `uv` 固定 Python 和依赖版本，
 不包含原 Vue/Vite 前端。
 
 ## 功能
@@ -8,7 +8,7 @@ AI 音乐生成、四轨分离与 RVC 人声替换的纯 FastAPI 后端。项目
 - OpenAI-compatible LLM 音乐 Prompt 结构化扩写与质量校验
 - ElevenLabs Music API（Composition Plan / 直接 Prompt）
 - Suno sidecar 和 Generic Provider 兼容适配器
-- Demucs `vocal / drums / bass / other` 四轨分离
+- 内置 Demucs `vocal / drums / bass / other` 四轨分离实现（当前生成管线未启用）
 - RVC 人声替换、结果下载、软删除与恢复
 - `/api/health`、`/api/generate` 和 `/output/*` 音频访问接口
 - 本地内联任务执行，以及队列、缓存、事件发布的可替换接口
@@ -40,10 +40,10 @@ LLM_MAX_TOKENS=1024
 LLM_TIMEOUT_SECONDS=120
 LLM_DISABLE_THINKING=true
 ELEVENLABS_API_KEY=...
-ENABLE_AUDIO_SPLITTING=true
+ENABLE_AUDIO_SPLITTING=false
 ```
 
-自部署 MiniMax Music 3 使用兼容的 `/v1/audio/speech` 接口：
+自部署 MiniMax Music 3 使用兼容的 `/v1/audio/jobs` 接口：
 
 ```env
 MUSIC_API_MODE=real
@@ -57,9 +57,9 @@ LLM_API_KEY=...
 ```
 
 后端将 LLM 生成的歌词作为 `input`，结构化音乐描述作为 `instructions`，并将返回的
-44.1 kHz WAV 直接保存到 `output`。前端传 `durationMinutes: "auto"` 时，后端会在歌词
-生成或标签化、风格扩写完成后，根据明确时长描述、歌词长度、段落、BPM 与快慢风格计算
-60–360 秒的目标时长，并将明确秒数发送给音乐模型；传 `1` 到 `6` 时直接换算为对应秒数。
+44.1 kHz WAV 直接保存到 `output`。传 `durationMinutes: "auto"`、`null` 或省略该字段时，
+MiniMax 请求不包含 `audio_duration`，由模型选择自然完整的时长；其他 Provider 使用
+`DEFAULT_DURATION_MINUTES`。传 `1` 到 `6` 时直接换算为对应秒数。
 如果两个服务分别运行在 Docker 容器中，请将 `MINIMAX_BASE_URL` 改为可达的容器服务名
 或宿主机地址。
 
@@ -160,8 +160,10 @@ curl -X DELETE http://127.0.0.1:8010/api/jobs/<jobId>/stems/vocal
 curl -X PUT http://127.0.0.1:8010/api/jobs/<jobId>/stems/vocal
 ```
 
-任务状态当前保存在单个后端进程内，适配推荐的单 Uvicorn worker 配置。服务重启后
-运行中任务不会恢复；需要多 worker 或重启恢复时再接入共享任务存储。
+任务元数据会原子写入 `output/jobs/<jobId>/job.json`，服务重启后会重新加载历史。
+重启时仍为 `pending` 或 `running` 的任务会恢复为 `failed`，并标记“服务器重启，生成任务已中断”；
+不会自动续跑未完成的音乐生成。执行队列和并发计数仍为单进程状态，因此仍推荐单
+Uvicorn worker；需要多 worker 时再接入共享任务存储。
 
 成功响应继续包含：
 
@@ -170,39 +172,11 @@ jobId, prompt, durationMinutes, structuredPrompt, fullTrack,
 stems, stemUrls, waveforms, splitEnabled, debug
 ```
 
-## 四轨分离配置
+## 四轨分离（当前未接入生成管线）
 
-Demucs 的 `mdx_q` 和 `htdemucs` 默认就是四源模型，不需要单独填写 stem
-列表。开启四轨分离的推荐配置：
-
-```env
-ENABLE_AUDIO_SPLITTING=true
-SPLIT_PROFILE=balanced
-DEMUCS_MODEL=htdemucs
-DEMUCS_DEVICE=cuda
-SPLIT_KEEP_WORKDIR=false
-```
-
-输出位于：
-
-```text
-output/jobs/<jobId>/<原始音乐名>_vocal.mp3
-output/jobs/<jobId>/<原始音乐名>_drums.mp3
-output/jobs/<jobId>/<原始音乐名>_bass.mp3
-output/jobs/<jobId>/<原始音乐名>_other.mp3
-```
-
-快速本地验证可以改为：
-
-```env
-SPLIT_PROFILE=fast
-DEMUCS_MODEL=mdx_q
-```
-
-`SPLIT_PROFILE` 已经包含默认模型；显式设置 `DEMUCS_MODEL` 只是为了让配置
-更直观。首次运行模型时会下载权重到 `.torch-cache`。
-当 `DEMUCS_DEVICE=cuda` 时，拆轨前会检查 PyTorch CUDA 可用性；检查失败会直接
-返回配置错误，不会静默回退 CPU。
+仓库保留了 Demucs 四轨分离实现和相关配置，但当前生成管线不会调用它。
+`ENABLE_AUDIO_SPLITTING` 的值不会改变生成结果；响应固定为空 `stems`/`stemUrls`，并返回
+`splitEnabled: false`。
 
 ## 本地基础设施模式
 
