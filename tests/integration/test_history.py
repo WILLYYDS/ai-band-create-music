@@ -4,6 +4,7 @@ import wave
 from unittest.mock import AsyncMock
 
 import httpx
+from starlette.requests import Request
 
 from app.main import GenerationJob, create_app, load_jobs
 from tests.helpers import make_orchestrator, make_settings
@@ -149,6 +150,70 @@ async def test_job_forwards_actual_provider_counts(tmp_path):
         release.set()
         await app.state.jobs[job_id].task
         assert load_jobs(settings.output_dir)[job_id].status == "succeeded"
+
+
+async def test_history_preserves_failed_jobs_and_events_send_done(tmp_path):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    failed = GenerationJob(job_id="failed", prompt="bad", status="failed", stage="failed")
+    failed.error = failed.message = "provider died"
+    app.state.jobs[failed.job_id] = failed
+
+    async with client(app) as http:
+        assert (await http.get("/api/jobs")).json()["jobs"][0]["error"] == "provider died"
+        assert (await http.get("/api/jobs/failed")).json()["error"] == "provider died"
+        events = await http.get("/api/jobs/failed/events")
+
+    assert events.headers["content-type"].startswith("text/event-stream")
+    assert events.text.startswith("event: done\ndata: ")
+    assert json.loads(events.text.split("data: ", 1)[1])["status"] == "failed"
+
+
+async def test_unstarted_job_events_do_not_register_subscriber(tmp_path):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    app.state.jobs["active"] = GenerationJob(
+        job_id="active", prompt="rock", status="running", stage="music"
+    )
+    endpoint = next(
+        route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
+    )
+    request = Request({"type": "http", "app": app, "headers": []})
+
+    await endpoint("active", request)
+
+    assert app.state.job_subscribers == {}
+
+
+async def test_job_events_keep_alive_after_timeout(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    job = GenerationJob(job_id="active", prompt="rock", status="running", stage="music")
+    app.state.jobs[job.job_id] = job
+    endpoint = next(
+        route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
+    )
+    request = Request({
+        "type": "http",
+        "app": app,
+        "headers": [],
+        "scheme": "http",
+        "server": ("testserver", 80),
+        "path": "/api/jobs/active/events",
+        "root_path": "",
+        "query_string": b"",
+        "method": "GET",
+    })
+
+    async def time_out(awaitable, *_args, **_kwargs):
+        awaitable.close()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(asyncio, "wait_for", time_out)
+    response = await endpoint("active", request)
+    assert (await anext(response.body_iterator)).startswith("data: ")
+    assert await anext(response.body_iterator) == ": keep-alive\n\n"
+    await response.body_iterator.aclose()
 
 
 async def test_direct_failure_is_persisted(tmp_path):

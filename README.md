@@ -133,6 +133,7 @@ curl -X POST http://127.0.0.1:8010/api/generate \
 | --- | --- | --- |
 | `POST` | `/api/jobs` | 创建生成任务 |
 | `GET` | `/api/jobs/{jobId}` | 查询任务状态与结果 |
+| `GET` | `/api/jobs/{jobId}/events` | 通过 SSE 接收任务阶段和终态 |
 | `PATCH` | `/api/jobs/{jobId}` | 局部更新任务状态（当前用于取消） |
 | `DELETE` | `/api/jobs/{jobId}/stems/{stemId}` | 删除指定分轨及其输出文件 |
 | `PUT` | `/api/jobs/{jobId}/stems/{stemId}` | 撤回删除并恢复指定分轨 |
@@ -147,6 +148,9 @@ curl -X POST http://127.0.0.1:8010/api/jobs \
 
 # 查询任务状态、阶段、进度和最终 result
 curl http://127.0.0.1:8010/api/jobs/<jobId>
+
+# 订阅阶段进度；收到具名 done 事件后客户端应主动关闭 EventSource
+curl -N http://127.0.0.1:8010/api/jobs/<jobId>/events
 
 # 取消任务
 curl -X PATCH http://127.0.0.1:8010/api/jobs/<jobId> \
