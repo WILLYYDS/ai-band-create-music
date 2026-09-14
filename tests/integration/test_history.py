@@ -166,8 +166,9 @@ async def test_split_failure_and_cancel_preserve_completed_generation(tmp_path, 
         await app.state.jobs[job_id].split_task
         failed = (await http.get(f"/api/jobs/{job_id}")).json()
 
-    assert failed["status"] == "failed"
-    assert failed["error"] == "音轨分离失败，请检查服务配置后重试。"
+    assert failed["status"] == "succeeded"
+    assert failed["splitStatus"] == "failed"
+    assert failed["splitError"] == "音轨分离失败，请检查服务配置后重试。"
     assert "secret" not in json.dumps(failed)
     assert app.state.jobs[job_id].status == "succeeded"
     assert load_jobs(settings.output_dir)[job_id].status == "succeeded"
@@ -185,10 +186,12 @@ async def test_split_failure_and_cancel_preserve_completed_generation(tmp_path, 
         await http.post(f"/api/jobs/{job_id}/split?song=0")
         await asyncio.wait_for(started.wait(), 2)
         await http.patch(f"/api/jobs/{job_id}", json={"status": "cancelled"})
+        assert app.state.jobs[job_id].split_status == "cancelled"
         await asyncio.sleep(0)
         cancelled = (await http.get(f"/api/jobs/{job_id}")).json()
 
-    assert cancelled["status"] == "cancelled"
+    assert cancelled["status"] == "succeeded"
+    assert cancelled["splitStatus"] == "cancelled"
     assert app.state.jobs[job_id].status == "succeeded"
     assert load_jobs(settings.output_dir)[job_id].status == "succeeded"
 

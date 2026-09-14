@@ -49,6 +49,7 @@ from app.services.waveforms import extract_waveforms
 logger = logging.getLogger(__name__)
 SPLIT_PROGRESS = 76
 WAVEFORM_PROGRESS = 90
+SPLIT_COMPLETE_PROGRESS = 100
 
 
 class RequestSizeLimitMiddleware:
@@ -452,6 +453,7 @@ def create_app(
                 "clearChineseVocalMode": application_settings.elevenlabs_clear_chinese_vocal_mode,
             },
             "splitting": {
+                "enabled": True,
                 "mode": "on_demand",
                 "profile": application_settings.split_profile,
                 "model": application_settings.demucs_model or None,
@@ -736,12 +738,15 @@ def create_app(
         response_model=GenerationJobResponse,
         status_code=status.HTTP_202_ACCEPTED,
         responses={
+            200: {"model": GenerationJobResponse},
             404: {"model": ErrorResponse},
             409: {"model": ErrorResponse},
             429: {"model": ErrorResponse},
         },
     )
-    async def split_generation_job(job_id: str, request: Request, song: int = 0):
+    async def split_generation_job(
+        job_id: str, request: Request, response: Response, song: int = 0
+    ):
         job = request.app.state.jobs.get(job_id)
         if job is None:
             return JSONResponse(
@@ -771,10 +776,8 @@ def create_app(
             )
         stems = result.get("stems")
         if isinstance(stems, dict) and stems:
-            return JSONResponse(
-                status_code=status.HTTP_200_OK,
-                content=_job_response(job, request, application_settings),
-            )
+            response.status_code = status.HTTP_200_OK
+            return _job_response(job, request, application_settings)
         try:
             full_path = _output_path_from_url(result["fullTrack"], application_settings)
             if not full_path.is_file():
@@ -794,18 +797,23 @@ def create_app(
         job.split_error = None
         try:
             await active_orchestrator.capacity.acquire()
-        except (CapacityExceededError, asyncio.CancelledError) as exc:
+        except CapacityExceededError:
             job.split_song = None
             job.split_status = None
             job.split_stage = None
             job.split_progress = None
             job.split_message = None
-            if isinstance(exc, asyncio.CancelledError):
-                raise
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 content={"success": False, "message": "当前拆轨任务过多，请稍后重试。"},
             )
+        except asyncio.CancelledError:
+            job.split_song = None
+            job.split_status = None
+            job.split_stage = None
+            job.split_progress = None
+            job.split_message = None
+            raise
 
         def publish() -> None:
             for queue in request.app.state.job_subscribers.get(job_id, ()):
@@ -864,7 +872,7 @@ def create_app(
                 job.save(application_settings.output_dir)
                 job.split_status = "succeeded"
                 job.split_stage = "completed"
-                job.split_progress = 100
+                job.split_progress = SPLIT_COMPLETE_PROGRESS
                 job.split_message = "音轨分离完成"
             except asyncio.CancelledError:
                 job.split_status = "cancelled"
@@ -903,6 +911,10 @@ def create_app(
             )
         if job.split_task is not None and not job.split_task.done():
             job.split_task.cancel()
+            job.split_status = "cancelled"
+            job.split_stage = "cancelled"
+            job.split_progress = None
+            job.split_message = "音轨分离已取消"
         if job.task is not None and not job.task.done():
             job.task.cancel()
             job.status = "cancelled"
@@ -1095,14 +1107,16 @@ def _public_base_url(request: Request, settings: Settings) -> str:
 
 def _job_response(job: GenerationJob, request: Request, settings: Settings) -> dict[str, Any]:
     response = job.response()
-    if job.split_status is not None:
+    if job.split_status in {"pending", "running"}:
         response.update(
             status=job.split_status,
             stage=job.split_stage,
             progress=job.split_progress,
             message=job.split_message,
-            error=job.split_error,
         )
+    if job.split_status is not None:
+        response["splitStatus"] = job.split_status
+        response["splitError"] = job.split_error
     if job.result is not None:
         response["result"] = _render_result_urls(
             job.result, _public_base_url(request, settings), settings

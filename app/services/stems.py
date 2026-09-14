@@ -190,26 +190,28 @@ class DemucsStemSeparator:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(), timeout=self._settings.split_timeout_seconds
-            )
-        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
-            process.kill()
-            await process.wait()
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            raise GenerationError(
-                f"Demucs 拆轨超时（{self._settings.split_timeout_seconds:g} 秒）。"
-            ) from exc
-        stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
-        stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
-        if process.returncode != 0:
-            failure_detail = stderr or "无 stderr 输出"
-            raise GenerationError(
-                f"Demucs 拆轨失败，退出码：{process.returncode}，stderr={failure_detail}"
-            )
-        await anyio.to_thread.run_sync(_copy_stems, work_dir, output_dir, output_files)
-        if not self._settings.split_keep_workdir:
-            await anyio.to_thread.run_sync(shutil.rmtree, work_dir, True)
-        duration_ms = int((asyncio.get_running_loop().time() - started) * 1000)
-        return SplitResult(stdout, stderr, duration_ms, output_files)
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(), timeout=self._settings.split_timeout_seconds
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                process.kill()
+                await process.wait()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise GenerationError(
+                    f"Demucs 拆轨超时（{self._settings.split_timeout_seconds:g} 秒）。"
+                ) from exc
+            stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
+            stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+            if process.returncode != 0:
+                failure_detail = stderr or "无 stderr 输出"
+                raise GenerationError(
+                    f"Demucs 拆轨失败，退出码：{process.returncode}，stderr={failure_detail}"
+                )
+            await anyio.to_thread.run_sync(_copy_stems, work_dir, output_dir, output_files)
+            duration_ms = int((asyncio.get_running_loop().time() - started) * 1000)
+            return SplitResult(stdout, stderr, duration_ms, output_files)
+        finally:
+            if not self._settings.split_keep_workdir:
+                await anyio.to_thread.run_sync(shutil.rmtree, work_dir, True)
