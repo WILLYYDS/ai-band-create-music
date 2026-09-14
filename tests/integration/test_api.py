@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -50,6 +51,8 @@ async def test_health_preserves_legacy_contract(tmp_path: Path) -> None:
     assert body["llm"]["initialMaxTokens"] == 1024
     assert body["llm"]["retryMaxTokens"] == 2048
     assert body["llm"]["disableThinking"] is True
+    assert body["splitting"]["enabled"] is True
+    assert body["splitting"]["mode"] == "on_demand"
     assert body["splitting"]["device"] == "auto"
     assert body["infrastructure"] == {
         "taskBackend": "inline",
@@ -88,13 +91,13 @@ async def test_generate_preserves_not_ready_response(tmp_path: Path) -> None:
     assert response.json()["detail"] == "Application is not ready"
 
 
-async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> None:
+async def test_generate_returns_full_track_without_splitting(tmp_path: Path) -> None:
     settings = make_settings(
         tmp_path,
-        enable_audio_splitting=True,
         music_provider="elevenlabs_music",
     )
     orchestrator = make_orchestrator(settings)
+    orchestrator.stem_separator.split = AsyncMock(side_effect=AssertionError("no splitting"))
     app = create_app(settings, orchestrator)
     async with await _client(app) as client:
         response = await client.post(
@@ -109,14 +112,14 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
         assert body["splitEnabled"] is False
         assert body["stems"] == {}
         assert body["waveforms"] == {}
-        assert "splitterStdout" not in body["debug"]
-        assert "splitterStderr" not in body["debug"]
+        assert "splitterDurationMs" not in body["debug"]
         audio = await client.get(body["fullTrack"])
     assert audio.status_code == 200
     assert audio.headers["content-type"].startswith("audio/mpeg")
     assert audio.headers["cache-control"] == "no-store"
     assert audio.content == b"ID3-full-audio"
     assert orchestrator.music_provider.requested_durations == [180]
+    orchestrator.stem_separator.split.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -126,7 +129,7 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
 async def test_generate_lets_provider_choose_duration_for_auto(
     tmp_path: Path, duration_field: dict[str, object]
 ) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
     app = create_app(settings, orchestrator)
     async with await _client(app) as client:
@@ -144,7 +147,7 @@ async def test_generate_lets_provider_choose_duration_for_auto(
 
 
 async def test_generate_selects_provider_per_request(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
     orchestrator.music_providers = {
         name: StubMusicProvider(settings.mock_full_song_path, name)
@@ -162,7 +165,7 @@ async def test_generate_selects_provider_per_request(tmp_path: Path) -> None:
 
 
 async def test_minimax_count_two_returns_two_results(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
     provider = StubMusicProvider(settings.mock_full_song_path, "minimax_music")
     orchestrator.music_providers = {"minimax_music": provider}
@@ -182,7 +185,7 @@ async def test_minimax_count_two_returns_two_results(tmp_path: Path) -> None:
 
 
 async def test_elevenlabs_count_two_warns_and_generates_one(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
     provider = StubMusicProvider(settings.mock_full_song_path, "elevenlabs_music")
     orchestrator.music_providers = {"elevenlabs_music": provider}
@@ -203,7 +206,7 @@ async def test_elevenlabs_count_two_warns_and_generates_one(tmp_path: Path) -> N
 
 
 async def test_ai_talk_lyrics_are_tagged_before_music_generation(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
     provider = StubMusicProvider(settings.mock_full_song_path)
     orchestrator.music_provider = provider
@@ -222,7 +225,7 @@ async def test_ai_talk_lyrics_are_tagged_before_music_generation(tmp_path: Path)
 
 
 async def test_minimax_ignores_fixed_duration_and_preserves_user_lyrics(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
     provider = StubMusicProvider(settings.mock_full_song_path, "minimax_music")
     orchestrator.music_providers = {"minimax_music": provider}
@@ -256,7 +259,7 @@ async def test_minimax_ignores_fixed_duration_and_preserves_user_lyrics(tmp_path
 
 
 async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    settings = make_settings(tmp_path)
     blocker = BlockingPromptExpander()
     app = create_app(settings, make_orchestrator(settings, prompt_expander=blocker))
     async with await _client(app) as client:
@@ -327,7 +330,7 @@ async def test_async_job_can_be_cancelled(tmp_path: Path) -> None:
 
 
 async def test_async_job_deleted_stem_stays_deleted(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
     async with await _client(app) as client:
         created = await client.post("/api/jobs", json={"prompt": "删除分轨"})
@@ -359,7 +362,7 @@ async def test_async_job_deleted_stem_stays_deleted(tmp_path: Path) -> None:
 
 
 async def test_async_second_song_stem_can_be_deleted_and_restored(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
     provider = StubMusicProvider(settings.mock_full_song_path, "minimax_music")
     orchestrator.music_providers = {"minimax_music": provider}
@@ -390,7 +393,7 @@ async def test_async_second_song_stem_can_be_deleted_and_restored(tmp_path: Path
 
 
 async def test_restore_forgets_missing_trash_file(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
     async with await _client(app) as client:
         created = await client.post("/api/jobs", json={"prompt": "永久删除分轨"})
@@ -416,8 +419,8 @@ async def test_restore_forgets_missing_trash_file(tmp_path: Path) -> None:
     assert "没有可恢复" in retried.json()["message"]
 
 
-async def test_split_disabled_returns_full_track_compatibility_stems(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=False)
+async def test_generation_returns_full_track_without_stems(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
     async with await _client(app) as client:
         response = await client.post("/api/generate", json={"prompt": "ambient"})
@@ -510,7 +513,7 @@ async def test_audio_route_rejects_missing_file(tmp_path: Path) -> None:
 
 
 async def test_audio_route_supports_byte_ranges(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
     async with await _client(app) as client:
         generated = await client.post("/api/generate", json={"prompt": "range test"})
@@ -559,7 +562,7 @@ async def test_application_lifespan_accepts_proxy_environment(
     monkeypatch: pytest.MonkeyPatch,
     proxy_variables: dict[str, str],
 ) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    settings = make_settings(tmp_path)
     _clear_proxy_environment(monkeypatch)
     for name, value in proxy_variables.items():
         monkeypatch.setenv(name, value)

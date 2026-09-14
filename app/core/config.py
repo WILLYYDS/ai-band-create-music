@@ -91,7 +91,6 @@ class Settings(BaseSettings):
     minimax_num_inference_steps: int = Field(default=30, ge=1, le=100)
     minimax_timeout_seconds: float = Field(default=7200, gt=0)
 
-    enable_audio_splitting: bool = False
     split_profile: Literal["fast", "balanced", "quality"] = "fast"
     split_timeout_seconds: float = Field(default=1800, gt=0)
     split_keep_workdir: bool = False

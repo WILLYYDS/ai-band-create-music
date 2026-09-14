@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import os
-import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -48,6 +47,9 @@ from app.services.voice import RVCEngine, install_voice_api
 from app.services.waveforms import extract_waveforms
 
 logger = logging.getLogger(__name__)
+SPLIT_PROGRESS = 76
+WAVEFORM_PROGRESS = 90
+SPLIT_COMPLETE_PROGRESS = 100
 
 
 class RequestSizeLimitMiddleware:
@@ -130,6 +132,13 @@ class GenerationJob:
     error: str | None = None
     task: asyncio.Task[None] | None = None
     deleted_stems: dict[str, dict[str, Any]] = field(default_factory=dict)
+    split_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    split_song: int | None = field(default=None, repr=False)
+    split_status: str | None = field(default=None, repr=False)
+    split_stage: str | None = field(default=None, repr=False)
+    split_progress: int | None = field(default=None, repr=False)
+    split_message: str | None = field(default=None, repr=False)
+    split_error: str | None = field(default=None, repr=False)
 
     def response(self) -> dict[str, Any]:
         return {
@@ -444,8 +453,8 @@ def create_app(
                 "clearChineseVocalMode": application_settings.elevenlabs_clear_chinese_vocal_mode,
             },
             "splitting": {
-                "enabled": False,
-                "pythonCommand": sys.executable,
+                "enabled": True,
+                "mode": "on_demand",
                 "profile": application_settings.split_profile,
                 "model": application_settings.demucs_model or None,
                 "device": application_settings.demucs_device or "auto",
@@ -691,7 +700,7 @@ def create_app(
             try:
                 while True:
                     payload = _job_response(job, request, application_settings)
-                    if job.status not in {"pending", "running"}:
+                    if payload["status"] not in {"pending", "running"}:
                         yield f"event: done\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
                         return
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -724,6 +733,166 @@ def create_app(
             )
         return _job_response(job, request, application_settings)
 
+    @application.post(
+        "/api/jobs/{job_id}/split",
+        response_model=GenerationJobResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+        responses={
+            200: {"model": GenerationJobResponse},
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            429: {"model": ErrorResponse},
+        },
+    )
+    async def split_generation_job(
+        job_id: str, request: Request, response: Response, song: int = 0
+    ):
+        job = request.app.state.jobs.get(job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"success": False, "message": "生成任务不存在。"},
+            )
+        if job.status != "succeeded":
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "生成任务尚未完成，无法拆轨。"},
+            )
+        result = _song_result(job, song)
+        if result is None or not isinstance(result.get("fullTrack"), str):
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "该歌曲没有可供拆轨的完整音频。"},
+            )
+        if job.split_status in {"pending", "running"}:
+            if job.split_song == song:
+                return _job_response(job, request, application_settings)
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "success": False,
+                    "message": f"第 {(job.split_song or 0) + 1} 首歌曲正在拆轨。",
+                },
+            )
+        stems = result.get("stems")
+        if isinstance(stems, dict) and stems:
+            response.status_code = status.HTTP_200_OK
+            return _job_response(job, request, application_settings)
+        try:
+            full_path = _output_path_from_url(result["fullTrack"], application_settings)
+            if not full_path.is_file():
+                raise OSError(f"missing full track: {full_path}")
+        except (OSError, ValueError):
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "完整音频文件不存在，无法拆轨。"},
+            )
+
+        active_orchestrator = _orchestrator(request)
+        job.split_song = song
+        job.split_status = "pending"
+        job.split_stage = "splitting"
+        job.split_progress = SPLIT_PROGRESS
+        job.split_message = f"Demucs 正在分离第 {song + 1} 首"
+        job.split_error = None
+        try:
+            await active_orchestrator.capacity.acquire()
+        except CapacityExceededError:
+            job.split_song = None
+            job.split_status = None
+            job.split_stage = None
+            job.split_progress = None
+            job.split_message = None
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={"success": False, "message": "当前拆轨任务过多，请稍后重试。"},
+            )
+        except asyncio.CancelledError:
+            job.split_song = None
+            job.split_status = None
+            job.split_stage = None
+            job.split_progress = None
+            job.split_message = None
+            raise
+
+        def publish() -> None:
+            for queue in request.app.state.job_subscribers.get(job_id, ()):
+                if queue.empty():
+                    queue.put_nowait(None)
+
+        async def execute() -> None:
+            try:
+                job.split_status = "running"
+                publish()
+                relative_output = Path("jobs") / job_id / f"song_{song + 1}"
+                split_result = await active_orchestrator.stem_separator.split(
+                    full_path, application_settings.output_dir / relative_output
+                )
+                stems = {
+                    name: (relative_output / file_name).as_posix()
+                    for name, file_name in split_result.files.items()
+                }
+                job.split_stage = "waveform"
+                job.split_progress = WAVEFORM_PROGRESS
+                job.split_message = f"正在提取第 {song + 1} 首真实波形"
+                publish()
+                stem_waveforms = await extract_waveforms(
+                    {
+                        name: application_settings.output_dir / relative_output / file_name
+                        for name, file_name in split_result.files.items()
+                    }
+                )
+                waveforms = result.get("waveforms")
+                result["stems"] = stems
+                result["stemUrls"] = list(stems.values())
+                result["waveforms"] = {
+                    **(waveforms if isinstance(waveforms, dict) else {}),
+                    **stem_waveforms,
+                }
+                result["splitEnabled"] = bool(stems)
+                debug = result.get("debug")
+                if not isinstance(debug, dict):
+                    debug = result["debug"] = {}
+                debug["splitterDurationMs"] = split_result.duration_ms
+                deleted_prefix = f"{song}:"
+                for key, deleted in list(job.deleted_stems.items()):
+                    if key.startswith(deleted_prefix):
+                        try:
+                            target = _output_path_from_url(deleted["url"], application_settings)
+                            _stem_trash_path(target, application_settings, job_id, song).unlink(
+                                missing_ok=True
+                            )
+                        except (KeyError, OSError, ValueError):
+                            logger.warning(
+                                "failed to clear replaced stem trash job_id=%s key=%s",
+                                job_id,
+                                key,
+                            )
+                        del job.deleted_stems[key]
+                job.save(application_settings.output_dir)
+                job.split_status = "succeeded"
+                job.split_stage = "completed"
+                job.split_progress = SPLIT_COMPLETE_PROGRESS
+                job.split_message = "音轨分离完成"
+            except asyncio.CancelledError:
+                job.split_status = "cancelled"
+                job.split_stage = "cancelled"
+                job.split_progress = None
+                job.split_message = "音轨分离已取消"
+            except Exception:
+                logger.exception("history split failed job_id=%s song=%s", job_id, song)
+                job.split_status = "failed"
+                job.split_stage = "failed"
+                job.split_progress = None
+                job.split_message = "音轨分离失败"
+                job.split_error = "音轨分离失败，请检查服务配置后重试。"
+            finally:
+                await active_orchestrator.capacity.release()
+                publish()
+
+        job.split_task = asyncio.create_task(execute(), name=f"split-{job_id}-{song}")
+        return _job_response(job, request, application_settings)
+
     @application.patch(
         "/api/jobs/{job_id}",
         response_model=GenerationJobResponse,
@@ -740,6 +909,12 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "生成任务不存在。"},
             )
+        if job.split_task is not None and not job.split_task.done():
+            job.split_task.cancel()
+            job.split_status = "cancelled"
+            job.split_stage = "cancelled"
+            job.split_progress = None
+            job.split_message = "音轨分离已取消"
         if job.task is not None and not job.task.done():
             job.task.cancel()
             job.status = "cancelled"
@@ -932,6 +1107,16 @@ def _public_base_url(request: Request, settings: Settings) -> str:
 
 def _job_response(job: GenerationJob, request: Request, settings: Settings) -> dict[str, Any]:
     response = job.response()
+    if job.split_status in {"pending", "running"}:
+        response.update(
+            status=job.split_status,
+            stage=job.split_stage,
+            progress=job.split_progress,
+            message=job.split_message,
+        )
+    if job.split_status is not None:
+        response["splitStatus"] = job.split_status
+        response["splitError"] = job.split_error
     if job.result is not None:
         response["result"] = _render_result_urls(
             job.result, _public_base_url(request, settings), settings

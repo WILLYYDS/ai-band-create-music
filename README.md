@@ -40,7 +40,6 @@ LLM_MAX_TOKENS=1024
 LLM_TIMEOUT_SECONDS=120
 LLM_DISABLE_THINKING=true
 ELEVENLABS_API_KEY=...
-ENABLE_AUDIO_SPLITTING=false
 ```
 
 自部署 MiniMax Music 3 使用兼容的 `/v1/audio/jobs` 接口：
@@ -152,6 +151,9 @@ curl http://127.0.0.1:8010/api/jobs/<jobId>
 # 订阅阶段进度；收到具名 done 事件后客户端应主动关闭 EventSource
 curl -N http://127.0.0.1:8010/api/jobs/<jobId>/events
 
+# 对已完成的历史歌曲按需执行四轨分离；已有分轨时直接返回缓存
+curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/split?song=0'
+
 # 取消任务
 curl -X PATCH http://127.0.0.1:8010/api/jobs/<jobId> \
   -H 'Content-Type: application/json' \
@@ -176,11 +178,10 @@ jobId, prompt, durationMinutes, structuredPrompt, fullTrack,
 stems, stemUrls, waveforms, splitEnabled, debug
 ```
 
-## 四轨分离（当前未接入生成管线）
+## 按需四轨分离
 
-仓库保留了 Demucs 四轨分离实现和相关配置，但当前生成管线不会调用它。
-`ENABLE_AUDIO_SPLITTING` 的值不会改变生成结果；响应固定为空 `stems`/`stemUrls`，并返回
-`splitEnabled: false`。
+音乐生成只产出完整混音，不会自动拆轨。从历史记录进入编辑时，调用分轨接口执行
+Demucs 四轨分离并通过任务 SSE 推送真实进度；已有 `stems` 时直接复用结果。
 
 ## 本地基础设施模式
 

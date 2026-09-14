@@ -13,7 +13,7 @@ from tests.helpers import make_orchestrator, make_settings
 
 
 def test_complete_generation_over_real_http(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -39,11 +39,24 @@ def test_complete_generation_over_real_http(tmp_path: Path) -> None:
                 json={"prompt": "cinematic rock with Mandarin vocal", "durationMinutes": 2},
             )
             body = generated.json()
-            downloads = {name: client.get(url) for name, url in body["stems"].items()}
+            split = client.post(f"/api/jobs/{body['jobId']}/split?song=0")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                completed = client.get(f"/api/jobs/{body['jobId']}").json()
+                if completed["status"] not in {"pending", "running"}:
+                    break
+                time.sleep(0.01)
+            assert completed["status"] == "succeeded"
+            assert completed["splitStatus"] == "succeeded"
+            downloads = {
+                name: client.get(url) for name, url in completed["result"]["stems"].items()
+            }
         assert health.status_code == 200
         assert generated.status_code == 200
+        assert split.status_code == 202
         assert body["durationMinutes"] == 2
         assert body["structuredPrompt"].startswith("[Genre: Test]")
+        assert sorted(downloads) == ["bass", "drums", "other", "vocal"]
         assert all(response.status_code == 200 for response in downloads.values())
         assert all(response.content == b"ID3-stem-audio" for response in downloads.values())
     finally:
