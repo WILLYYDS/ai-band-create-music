@@ -28,8 +28,9 @@ class StreamingErrorBody(httpx.AsyncByteStream):
 
 class StubLyricsWriter:
     async def write_lyrics(
-        self, structured_prompt: str, user_prompt: str, duration_minutes: int
+        self, structured_prompt: str, user_prompt: str, duration_minutes: float | None
     ) -> str:
+        assert duration_minutes is None
         return "[Verse]\ntest lyrics"
 
 
@@ -191,7 +192,7 @@ async def test_minimax_provider_omits_duration_for_auto(tmp_path: Path) -> None:
     assert requests[0].url.path == "/v1/audio/jobs"
     assert "authorization" not in requests[0].headers
     assert body["model"] == "MiniMaxAI/MiniMax-Music3"
-    assert "Choose the natural complete song duration" in body["instructions"]
+    assert body["instructions"] == "[Genre: Rock]"
     assert body["input"] == "[Verse]\ntest lyrics"
     assert body["seed"] == 42
     assert body["num_inference_steps"] == 30
@@ -207,7 +208,7 @@ async def test_minimax_provider_omits_duration_for_auto(tmp_path: Path) -> None:
     assert result.debug["mode"] == "self_hosted_wav"
 
 
-async def test_minimax_provider_sends_selected_duration(tmp_path: Path) -> None:
+async def test_minimax_provider_ignores_selected_duration(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -221,19 +222,13 @@ async def test_minimax_provider_sends_selected_duration(tmp_path: Path) -> None:
         )
 
     body = json.loads(requests[0].content)
-    assert body["audio_duration"] == 60
-    assert "Sing every supplied non-tag lyric line exactly once" in body["instructions"]
-    assert "track must be exactly 60 seconds long" in body["instructions"]
-    assert "final lyric ends 2-5 seconds before that exact end" in body["instructions"]
-    assert "use no more than 5 seconds for the outro" in body["instructions"]
-    assert "extended instrumental outro" in body["instructions"]
-    assert "audio duration is a maximum" not in body["instructions"]
-    assert "reserve the final 10 seconds" not in body["instructions"]
+    assert "audio_duration" not in body
+    assert body["instructions"] == "[Genre: Rock]"
     diagnostics = json.loads(
         (settings.output_dir / "jobs/local-job/prompts.json").read_text(encoding="utf-8")
     )
     provider_request = diagnostics["providerRequests"][0]
-    assert provider_request["requestedDurationSeconds"] == 60
+    assert "requestedDurationSeconds" not in provider_request
     assert provider_request["actualDurationSeconds"] == 1
     assert provider_request["request"]["body"] == body
     assert provider_request["request"]["url"] == "https://minimax.test/v1/audio/jobs"
@@ -266,15 +261,18 @@ async def test_minimax_provider_preserves_create_page_lyrics(tmp_path: Path) -> 
         return minimax_response(request)
 
     settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
+    lyrics = "夜色落进空荡站台，最后一班车没有回来，月光沿着铁轨沉默地延伸，我仍在原地等待。"
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
             "[Genre: Dream Pop]",
             60,
-            "[歌词与创作内容]\n夜色落进空荡站台\n最后一班车没有回来\n\n[风格要求]\n梦幻流行、空灵女声",
+            f"[歌词与创作内容]\n[Verse]\n{lyrics}\n\n[风格要求]\n梦幻流行、空灵女声",
         )
 
     body = json.loads(requests[0].content)
-    assert body["input"] == "夜色落进空荡站台\n最后一班车没有回来"
+    assert body["input"].splitlines()[0] == "[Verse]"
+    assert len(body["input"].splitlines()) > 2
+    assert body["input"].replace("\n", "") == f"[Verse]{lyrics}"
     assert "梦幻流行、空灵女声" not in body["instructions"]
 
 
@@ -292,7 +290,7 @@ async def test_minimax_provider_reports_server_error(tmp_path: Path) -> None:
     diagnostics = json.loads(
         (settings.output_dir / "jobs/failed-job/prompts.json").read_text(encoding="utf-8")
     )["providerRequests"][0]
-    assert diagnostics["request"]["body"]["audio_duration"] == 120
+    assert "audio_duration" not in diagnostics["request"]["body"]
     assert diagnostics["createResponse"]["statusCode"] == 422
     assert diagnostics["createResponse"]["body"] == {"detail": "invalid request"}
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import wave
 from collections.abc import Awaitable, Callable
@@ -26,6 +27,8 @@ from app.services.prompt import (
 )
 
 MINIMAX_GENERATE_PATH = "/v1/audio/jobs"
+MINIMAX_LYRIC_LINE_LIMIT = 32
+LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")
 ProviderProgressCallback = Callable[[str, int | None, int | None], Awaitable[None]]
 
 
@@ -46,6 +49,25 @@ class MusicProvider(Protocol):
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
     ) -> MusicResult: ...
+
+
+def _wrap_long_lyric_lines(lyrics: str) -> str:
+    output: list[str] = []
+    for line in lyrics.splitlines():
+        if len(line) <= MINIMAX_LYRIC_LINE_LIMIT or (
+            line.strip().startswith("[") and line.strip().endswith("]")
+        ):
+            output.append(line)
+            continue
+        current = ""
+        for part in LYRIC_BREAK_PATTERN.split(line):
+            if current and len(current) + len(part) > MINIMAX_LYRIC_LINE_LIMIT:
+                output.append(current)
+                current = part
+            else:
+                current += part
+        output.append(current)
+    return "\n".join(output)
 
 def _response_diagnostic(response: httpx.Response) -> dict[str, Any]:
     try:
@@ -495,14 +517,17 @@ class MiniMaxMusicProvider:
     ) -> MusicResult:
         if not self._settings.minimax_base_url:
             raise GenerationError("MiniMax 音乐生成失败：MINIMAX_BASE_URL 不能为空。")
+        # MiniMax decides its own natural duration; fixed values from shared callers are ignored.
+        del duration_seconds
         try:
             lyrics, _ = split_generation_prompt(user_prompt)
             if not lyrics:
                 lyrics = await self._lyrics_writer.write_lyrics(
                     structured_prompt,
                     user_prompt,
-                    (duration_seconds or self._settings.default_duration_minutes * 60) / 60,
+                    None,
                 )
+            lyrics = _wrap_long_lyric_lines(lyrics)
             if len(lyrics) < 10:
                 raise GenerationError("MiniMax 音乐生成失败：生成的歌词不足 10 个字符。")
             target = self._settings.output_dir / f"full_song_minimax_{time.time_ns()}.wav"
@@ -517,27 +542,6 @@ class MiniMaxMusicProvider:
             }
             if job_id:
                 request_body["jobId"] = uuid5(NAMESPACE_URL, f"{job_id}:{variation}").hex
-            if duration_seconds is not None:
-                request_body["audio_duration"] = duration_seconds
-                timing_instruction = (
-                    f"[Timing: The track must be exactly {duration_seconds:g} seconds long. "
-                    "Pace the arrangement so the final lyric ends 2-5 seconds before that exact "
-                    "end. After the final lyric, stop all vocals completely and use no more than "
-                    "5 seconds for the outro.]"
-                )
-            else:
-                timing_instruction = (
-                    "[Timing: Choose the natural complete song duration. Sing every supplied lyric "
-                    "without cutting off the ending, then stop all vocals and finish with only a "
-                    "short natural outro.]"
-                )
-            request_body["instructions"] += (
-                "\n[Lyric Fidelity: Sing every supplied non-tag lyric line exactly once, verbatim, "
-                "and in order. Never omit, repeat, paraphrase, invent, or replace any lyric words.]"
-                f"\n{timing_instruction}"
-                "\n[Vocal Ending: Never fill unused time with repeated or invented vocals, "
-                "humming, chants, ad-libs, or an extended instrumental outro.]"
-            )
             url = f"{self._settings.minimax_base_url}{MINIMAX_GENERATE_PATH}"
             request_diagnostic = {
                 "method": "POST",
@@ -639,11 +643,11 @@ class MiniMaxMusicProvider:
                     actual_duration_seconds = round(
                         audio.getnframes() / audio.getframerate(), 3
                     )
-                duration_diagnostic = {"actualDurationSeconds": actual_duration_seconds}
-                if duration_seconds is not None:
-                    duration_diagnostic["requestedDurationSeconds"] = duration_seconds
                 update_provider_diagnostic(
-                    self._settings.output_dir, job_id, variation, **duration_diagnostic
+                    self._settings.output_dir,
+                    job_id,
+                    variation,
+                    actualDurationSeconds=actual_duration_seconds,
                 )
             finally:
                 # The durable local copy belongs to history; release the remote temporary WAV.
@@ -666,8 +670,6 @@ class MiniMaxMusicProvider:
                 "statusResponse": status_response,
                 "audioResponse": audio_response,
             }
-            if duration_seconds is not None:
-                debug["requestedDurationSeconds"] = duration_seconds
             return MusicResult(target, debug)
         except GenerationError:
             raise

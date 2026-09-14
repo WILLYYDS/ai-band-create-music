@@ -89,7 +89,11 @@ async def test_generate_preserves_not_ready_response(tmp_path: Path) -> None:
 
 
 async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, enable_audio_splitting=True)
+    settings = make_settings(
+        tmp_path,
+        enable_audio_splitting=True,
+        music_provider="elevenlabs_music",
+    )
     orchestrator = make_orchestrator(settings)
     app = create_app(settings, orchestrator)
     async with await _client(app) as client:
@@ -215,6 +219,33 @@ async def test_ai_talk_lyrics_are_tagged_before_music_generation(tmp_path: Path)
     assert provider.user_prompt == (
         "[歌词与创作内容]\n[Verse]\n第一句\n第二句\n\n[风格要求]\n梦幻流行"
     )
+
+
+async def test_minimax_ignores_fixed_duration_and_preserves_user_lyrics(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    orchestrator = make_orchestrator(settings)
+    provider = StubMusicProvider(settings.mock_full_song_path, "minimax_music")
+    orchestrator.music_providers = {"minimax_music": provider}
+    app = create_app(settings, orchestrator)
+    original = "\n".join(f"第 {index} 句用户歌词" for index in range(15))
+
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            json={
+                "prompt": f"[歌词与创作内容]\n{original}\n\n[风格要求]\n梦幻流行",
+                "durationMinutes": 1,
+                "provider": "minimax_music",
+            },
+        )
+
+    expected = f"[Verse]\n{original}"
+    assert response.status_code == 200
+    assert response.json()["durationMinutes"] == "auto"
+    assert "requestedDurationSeconds" not in response.json()
+    assert response.json()["lyrics"] == expected
+    assert provider.user_prompt == f"[歌词与创作内容]\n{expected}\n\n[风格要求]\n梦幻流行"
+    assert provider.requested_durations == [None]
 
 
 async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:

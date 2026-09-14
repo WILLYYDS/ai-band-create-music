@@ -88,6 +88,8 @@ class GenerationOrchestrator:
     ) -> dict[str, Any]:
         job_id = job_id or f"job_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
         selected_provider = provider or self.settings.music_provider
+        if selected_provider == "minimax_music":
+            duration_minutes = None
         effective_count = count if selected_provider == "minimax_music" else 1
         warning = (
             "ElevenLabs Music 暂不支持单次生成两首，已按一首生成。"
