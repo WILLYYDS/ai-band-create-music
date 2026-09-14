@@ -77,6 +77,10 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
         release.set()
         await app.state.jobs[job_id].task
         completed = (await http.get(f"/api/jobs/{job_id}")).json()
+        orchestrator.stem_separator.split = AsyncMock(
+            side_effect=AssertionError("cached split must not run again")
+        )
+        cached = await http.post(f"/api/jobs/{job_id}/split?song=0")
 
     assert accepted.status_code == duplicate.status_code == 202
     assert (running["status"], running["stage"], running["progress"]) == (
@@ -88,6 +92,9 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
     assert completed["result"]["splitEnabled"] is True
     assert sorted(completed["result"]["stems"]) == ["bass", "drums", "other", "vocal"]
     assert completed["result"]["waveforms"]["vocal"] == [0.5]
+    assert cached.status_code == 202
+    assert cached.json()["status"] == "succeeded"
+    orchestrator.stem_separator.split.assert_not_called()
 
 
 async def test_history_urls_do_not_persist_request_host(tmp_path):
