@@ -147,7 +147,7 @@ class PromptExpander(Protocol):
     ) -> PreparedPrompt: ...
 
     async def write_lyrics(
-        self, structured_prompt: str, user_prompt: str, duration_minutes: int
+        self, structured_prompt: str, user_prompt: str, duration_minutes: float | None
     ) -> str: ...
 
 
@@ -730,7 +730,7 @@ class OpenAICompatiblePromptExpander:
             raise GenerationError(f"歌词与风格处理失败：{_http_failure_message(exc)}") from exc
 
     async def write_lyrics(
-        self, structured_prompt: str, user_prompt: str, duration_minutes: float
+        self, structured_prompt: str, user_prompt: str, duration_minutes: float | None
     ) -> str:
         if self._settings.llm_api_key is None:
             raise GenerationError("歌词生成失败：缺少 LLM_API_KEY 环境变量。")
