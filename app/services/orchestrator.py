@@ -88,8 +88,9 @@ class GenerationOrchestrator:
     ) -> dict[str, Any]:
         job_id = job_id or f"job_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
         selected_provider = provider or self.settings.music_provider
-        if selected_provider == "minimax_music":
-            duration_minutes = None
+        effective_duration_minutes = (
+            None if selected_provider == "minimax_music" else duration_minutes
+        )
         effective_count = count if selected_provider == "minimax_music" else 1
         warning = (
             "ElevenLabs Music 暂不支持单次生成两首，已按一首生成。"
@@ -129,7 +130,7 @@ class GenerationOrchestrator:
             _, style = split_generation_prompt(user_prompt)
             prepared = await self.prompt_expander.prepare(
                 user_prompt,
-                duration_minutes,
+                effective_duration_minutes,
                 job_id=job_id,
             )
             structured_prompt = prepared.structured_prompt
@@ -142,10 +143,12 @@ class GenerationOrchestrator:
                 provider_prompt += f"\n\n[风格要求]\n{style}"
             duration_diagnostics: dict[str, object] = {
                 "durationSource": (
-                    "user"
-                    if duration_minutes is not None
+                    "provider_override"
+                    if selected_provider == "minimax_music" and duration_minutes is not None
                     else "provider"
                     if selected_provider == "minimax_music"
+                    else "user"
+                    if duration_minutes is not None
                     else "default"
                 )
             }

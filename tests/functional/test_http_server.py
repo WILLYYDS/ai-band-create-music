@@ -42,7 +42,7 @@ def test_complete_generation_over_real_http(tmp_path: Path) -> None:
             downloads = {name: client.get(url) for name, url in body["stems"].items()}
         assert health.status_code == 200
         assert generated.status_code == 200
-        assert body["durationMinutes"] == "auto"
+        assert body["durationMinutes"] == 2
         assert body["structuredPrompt"].startswith("[Genre: Test]")
         assert all(response.status_code == 200 for response in downloads.values())
         assert all(response.content == b"ID3-stem-audio" for response in downloads.values())

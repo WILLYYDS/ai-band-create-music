@@ -13,6 +13,7 @@ from app.services.providers import (
     ElevenLabsMusicProvider,
     GenericMusicProvider,
     MiniMaxMusicProvider,
+    _wrap_long_lyric_lines,
     create_music_provider,
     extract_generated_audio_url,
     extract_suno_audio_url,
@@ -51,6 +52,19 @@ def test_provider_response_extractors_cover_legacy_shapes() -> None:
         extract_suno_audio_url([{"id": "clip", "status": "streaming", "audio_url": "https://suno"}])
         == "https://suno"
     )
+
+
+def test_minimax_wraps_long_lyrics_without_empty_lines_or_lost_text() -> None:
+    samples = (
+        "短句一，" + "啊" * 40 + "。",
+        "啊" * 80,
+        "Mr. Smith walked down the long and winding road to nowhere at all tonight.",
+    )
+    for lyrics in samples:
+        wrapped = _wrap_long_lyric_lines(lyrics)
+        assert not wrapped.endswith("\n")
+        assert max(map(len, wrapped.splitlines())) <= 32
+        assert wrapped.replace("\n", "") == lyrics
 
 
 async def test_request_provider_overrides_configured_default(tmp_path: Path) -> None:
@@ -192,7 +206,9 @@ async def test_minimax_provider_omits_duration_for_auto(tmp_path: Path) -> None:
     assert requests[0].url.path == "/v1/audio/jobs"
     assert "authorization" not in requests[0].headers
     assert body["model"] == "MiniMaxAI/MiniMax-Music3"
-    assert body["instructions"] == "[Genre: Rock]"
+    assert "Choose the natural complete song duration" in body["instructions"]
+    assert "Sing every supplied non-tag lyric line exactly once" in body["instructions"]
+    assert "Never fill unused time with repeated or invented vocals" in body["instructions"]
     assert body["input"] == "[Verse]\ntest lyrics"
     assert body["seed"] == 42
     assert body["num_inference_steps"] == 30
@@ -223,7 +239,7 @@ async def test_minimax_provider_ignores_selected_duration(tmp_path: Path) -> Non
 
     body = json.loads(requests[0].content)
     assert "audio_duration" not in body
-    assert body["instructions"] == "[Genre: Rock]"
+    assert "Choose the natural complete song duration" in body["instructions"]
     diagnostics = json.loads(
         (settings.output_dir / "jobs/local-job/prompts.json").read_text(encoding="utf-8")
     )

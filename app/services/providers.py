@@ -61,12 +61,17 @@ def _wrap_long_lyric_lines(lyrics: str) -> str:
             continue
         current = ""
         for part in LYRIC_BREAK_PATTERN.split(line):
+            if not part:
+                continue
             if current and len(current) + len(part) > MINIMAX_LYRIC_LINE_LIMIT:
                 output.append(current)
-                current = part
-            else:
-                current += part
-        output.append(current)
+                current = ""
+            while len(part) > MINIMAX_LYRIC_LINE_LIMIT:
+                output.append(part[:MINIMAX_LYRIC_LINE_LIMIT])
+                part = part[MINIMAX_LYRIC_LINE_LIMIT:]
+            current += part
+        if current:
+            output.append(current)
     return "\n".join(output)
 
 def _response_diagnostic(response: httpx.Response) -> dict[str, Any]:
@@ -542,6 +547,16 @@ class MiniMaxMusicProvider:
             }
             if job_id:
                 request_body["jobId"] = uuid5(NAMESPACE_URL, f"{job_id}:{variation}").hex
+            request_body["instructions"] += (
+                "\n[Lyric Fidelity: Sing every supplied non-tag lyric line exactly once, "
+                "verbatim, and in order. Never omit, repeat, paraphrase, invent, or replace "
+                "any lyric words.]"
+                "\n[Timing: Choose the natural complete song duration. Sing every supplied "
+                "lyric without cutting off the ending, then stop all vocals and finish with "
+                "only a short natural outro.]"
+                "\n[Vocal Ending: Never fill unused time with repeated or invented vocals, "
+                "humming, chants, ad-libs, or an extended instrumental outro.]"
+            )
             url = f"{self._settings.minimax_base_url}{MINIMAX_GENERATE_PATH}"
             request_diagnostic = {
                 "method": "POST",

@@ -241,11 +241,18 @@ async def test_minimax_ignores_fixed_duration_and_preserves_user_lyrics(tmp_path
 
     expected = f"[Verse]\n{original}"
     assert response.status_code == 200
-    assert response.json()["durationMinutes"] == "auto"
+    assert response.json()["durationMinutes"] == 1
     assert "requestedDurationSeconds" not in response.json()
     assert response.json()["lyrics"] == expected
     assert provider.user_prompt == f"[歌词与创作内容]\n{expected}\n\n[风格要求]\n梦幻流行"
     assert provider.requested_durations == [None]
+    diagnostics = json.loads(
+        (settings.output_dir / f"jobs/{response.json()['jobId']}/prompts.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert diagnostics["requestedDurationMinutes"] == 1
+    assert diagnostics["durationSource"] == "provider_override"
 
 
 async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
