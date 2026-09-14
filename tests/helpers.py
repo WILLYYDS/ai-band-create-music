@@ -110,7 +110,6 @@ def make_settings(tmp_path: Path, **updates: object) -> Settings:
         "output_dir": tmp_path / "output",
         "mock_full_song_path": tmp_path / "source.mp3",
         "public_base_url": "",
-        "enable_audio_splitting": True,
         "rvc_model_path": rvc_model,
         "rvc_index_path": None,
         "rvc_base_model_dir": None,
