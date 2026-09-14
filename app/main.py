@@ -724,6 +724,126 @@ def create_app(
             )
         return _job_response(job, request, application_settings)
 
+    @application.post(
+        "/api/jobs/{job_id}/split",
+        status_code=status.HTTP_202_ACCEPTED,
+        responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    )
+    async def split_generation_job(job_id: str, request: Request, song: int = 0):
+        job = request.app.state.jobs.get(job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"success": False, "message": "生成任务不存在。"},
+            )
+        result = _song_result(job, song)
+        if result is None or not isinstance(result.get("fullTrack"), str):
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "该歌曲没有可供拆轨的完整音频。"},
+            )
+        if job.task is not None and not job.task.done():
+            if job.task.get_name() == f"split-{job_id}-{song}":
+                return {"jobId": job_id, "status": job.status}
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "该任务仍在处理中。"},
+            )
+        if result.get("splitEnabled"):
+            return {"jobId": job_id, "status": "succeeded"}
+        try:
+            full_path = _output_path_from_url(result["fullTrack"], application_settings)
+            if not full_path.is_file():
+                raise OSError
+        except (OSError, ValueError):
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "完整音频文件不存在，无法拆轨。"},
+            )
+
+        active_orchestrator = _orchestrator(request)
+        try:
+            await active_orchestrator.capacity.acquire()
+        except CapacityExceededError:
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={"success": False, "message": "当前拆轨任务过多，请稍后重试。"},
+            )
+
+        def save_and_publish() -> None:
+            job.save(application_settings.output_dir)
+            for queue in request.app.state.job_subscribers.get(job_id, ()):
+                if queue.empty():
+                    queue.put_nowait(None)
+
+        job.status = "pending"
+        job.stage = "splitting"
+        job.progress = 76
+        job.step = job.total_steps = None
+        job.message = f"Demucs 正在分离第 {song + 1} 首"
+        job.error = None
+        try:
+            save_and_publish()
+        except Exception:
+            await active_orchestrator.capacity.release()
+            raise
+
+        async def execute() -> None:
+            try:
+                job.status = "running"
+                save_and_publish()
+                relative_output = Path("jobs") / job_id / f"song_{song + 1}"
+                split_result = await active_orchestrator.stem_separator.split(
+                    full_path, application_settings.output_dir / relative_output
+                )
+                stems = {
+                    name: (relative_output / file_name).as_posix()
+                    for name, file_name in split_result.files.items()
+                }
+                job.stage = "waveform"
+                job.progress = 90
+                job.message = f"正在提取第 {song + 1} 首真实波形"
+                save_and_publish()
+                stem_waveforms = await extract_waveforms(
+                    {
+                        name: application_settings.output_dir / relative_output / file_name
+                        for name, file_name in split_result.files.items()
+                    }
+                )
+                waveforms = result.get("waveforms")
+                result["stems"] = stems
+                result["stemUrls"] = list(stems.values())
+                result["waveforms"] = {
+                    **(waveforms if isinstance(waveforms, dict) else {}),
+                    **stem_waveforms,
+                }
+                result["splitEnabled"] = bool(stems)
+                debug = result.get("debug")
+                if not isinstance(debug, dict):
+                    debug = result["debug"] = {}
+                debug["splitterDurationMs"] = split_result.duration_ms
+                job.status = "succeeded"
+                job.stage = "completed"
+                job.progress = 100
+                job.message = "音轨分离完成"
+            except asyncio.CancelledError:
+                job.status = "cancelled"
+                job.stage = "cancelled"
+                job.message = "音轨分离已取消"
+            except Exception as exc:
+                logger.exception("history split failed job_id=%s song=%s", job_id, song)
+                job.status = "failed"
+                job.stage = "failed"
+                job.progress = None
+                job.message = "音轨分离失败"
+                job.error = str(exc)
+            finally:
+                await active_orchestrator.capacity.release()
+                save_and_publish()
+
+        job.task = asyncio.create_task(execute(), name=f"split-{job_id}-{song}")
+        return {"jobId": job_id, "status": job.status}
+
     @application.patch(
         "/api/jobs/{job_id}",
         response_model=GenerationJobResponse,

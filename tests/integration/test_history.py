@@ -45,6 +45,51 @@ async def test_direct_history_restart_and_duplicate_import(tmp_path):
     assert copy.exists()
 
 
+async def test_history_song_starts_async_split_and_updates_result(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path, enable_audio_splitting=False)
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
+
+    async with client(app) as http:
+        generated = (await http.post("/api/generate", json={"prompt": "rock"})).json()
+        job_id = generated["jobId"]
+        original_split = orchestrator.stem_separator.split
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def split(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return await original_split(*args, **kwargs)
+
+        orchestrator.stem_separator.split = split
+        monkeypatch.setattr(
+            "app.main.extract_waveforms",
+            AsyncMock(
+                return_value={
+                    name: [0.5] for name in ("vocal", "drums", "bass", "other")
+                }
+            ),
+        )
+        accepted = await http.post(f"/api/jobs/{job_id}/split?song=0")
+        await asyncio.wait_for(started.wait(), 2)
+        running = (await http.get(f"/api/jobs/{job_id}")).json()
+        duplicate = await http.post(f"/api/jobs/{job_id}/split?song=0")
+        release.set()
+        await app.state.jobs[job_id].task
+        completed = (await http.get(f"/api/jobs/{job_id}")).json()
+
+    assert accepted.status_code == duplicate.status_code == 202
+    assert (running["status"], running["stage"], running["progress"]) == (
+        "running",
+        "splitting",
+        76,
+    )
+    assert completed["status"] == "succeeded"
+    assert completed["result"]["splitEnabled"] is True
+    assert sorted(completed["result"]["stems"]) == ["bass", "drums", "other", "vocal"]
+    assert completed["result"]["waveforms"]["vocal"] == [0.5]
+
+
 async def test_history_urls_do_not_persist_request_host(tmp_path):
     settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))

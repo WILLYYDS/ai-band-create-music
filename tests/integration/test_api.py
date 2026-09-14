@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -88,13 +89,14 @@ async def test_generate_preserves_not_ready_response(tmp_path: Path) -> None:
     assert response.json()["detail"] == "Application is not ready"
 
 
-async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> None:
+async def test_generate_returns_full_track_without_splitting(tmp_path: Path) -> None:
     settings = make_settings(
         tmp_path,
         enable_audio_splitting=True,
         music_provider="elevenlabs_music",
     )
     orchestrator = make_orchestrator(settings)
+    orchestrator.stem_separator.split = AsyncMock(side_effect=AssertionError("no splitting"))
     app = create_app(settings, orchestrator)
     async with await _client(app) as client:
         response = await client.post(
@@ -106,16 +108,17 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
         assert body["durationMinutes"] == 3
         assert body["requestedDurationSeconds"] == 180
         assert body["debug"]["music"]["durationSeconds"] == 180
-        assert body["splitEnabled"] is True
-        assert sorted(body["stems"]) == ["bass", "drums", "other", "vocal"]
-        assert len(body["stemUrls"]) == 4
-        assert body["debug"]["splitterDurationMs"] == 5
+        assert body["splitEnabled"] is False
+        assert body["stems"] == {}
+        assert body["waveforms"] == {}
+        assert "splitterDurationMs" not in body["debug"]
         audio = await client.get(body["fullTrack"])
     assert audio.status_code == 200
     assert audio.headers["content-type"].startswith("audio/mpeg")
     assert audio.headers["cache-control"] == "no-store"
     assert audio.content == b"ID3-full-audio"
     assert orchestrator.music_provider.requested_durations == [180]
+    orchestrator.stem_separator.split.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -304,8 +307,8 @@ async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
     assert final_diagnostics["durationSource"] == "provider"
     assert "effectiveDurationSeconds" not in final_diagnostics
     assert "effectiveDurationMinutes" not in final_diagnostics
-    assert body["result"]["splitEnabled"] is True
-    assert sorted(body["result"]["stems"]) == ["bass", "drums", "other", "vocal"]
+    assert body["result"]["splitEnabled"] is False
+    assert body["result"]["stems"] == {}
 
 
 async def test_async_job_can_be_cancelled(tmp_path: Path) -> None:
