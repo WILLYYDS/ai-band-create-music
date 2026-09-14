@@ -103,6 +103,8 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8010
 curl http://127.0.0.1:8010/api/health
 ```
 
+服务器 Docker 部署、离线镜像和发布包清单见 [`DEPLOYMENT.md`](DEPLOYMENT.md)。
+
 RVC 默认自动查找 `assets/rvc` 中的模型、索引和 HuBERT/RMVPE 基础模型；也可通过
 `RVC_MODEL_PATH`、`RVC_INDEX_PATH` 和 `RVC_BASE_MODEL_DIR` 显式指定。RVC 推理在
 第一次转换时懒加载到 `cuda:0`：
