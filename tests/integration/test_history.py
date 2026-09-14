@@ -15,8 +15,9 @@ def client(app):
 
 
 async def test_direct_history_restart_and_duplicate_import(tmp_path):
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path, enable_audio_splitting=False)
     orchestrator = make_orchestrator(settings)
+    # 关闭拆轨时不得调用分离器：历史导入这条路径只关心完整混音。
     orchestrator.stem_separator.split = AsyncMock(side_effect=AssertionError("no splitting"))
     app = create_app(settings, orchestrator)
     async with client(app) as http:
@@ -117,7 +118,7 @@ async def test_legacy_import_real_waveform_and_restart(tmp_path):
     async with client(app) as http:
         rows = (await http.get("/api/jobs")).json()["jobs"]
     assert len(rows) == 1
-    assert rows[0]["result"]["waveforms"]["full"] == [1.0] * 64
+    assert rows[0]["result"]["waveforms"]["full"] == [1.0] * 640
     async with client(create_app(settings, orchestrator)) as http:
         assert (await http.get("/api/jobs")).json()["jobs"] == rows
     assert song.read_bytes() == original

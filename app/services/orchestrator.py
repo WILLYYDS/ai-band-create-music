@@ -5,6 +5,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -208,16 +209,36 @@ class GenerationOrchestrator:
                 )
                 full_relative = full_path.relative_to(self.settings.output_dir)
 
+                stems: dict[str, str] = {}
+                waveform_paths = {"full": full_path}
+                split_debug: dict[str, Any] = {}
+                if self.settings.enable_audio_splitting:
+                    await report("splitting", None, f"Demucs 正在分离第 {song_number} 首")
+                    relative_output = Path("jobs") / job_id / f"song_{song_number}"
+                    split_result = await self.stem_separator.split(
+                        full_path, self.settings.output_dir / relative_output
+                    )
+                    # main.py 的 _render_result_urls 负责拼公网地址，这里只存相对路径。
+                    stems = {
+                        name: (relative_output / file_name).as_posix()
+                        for name, file_name in split_result.files.items()
+                    }
+                    waveform_paths = {
+                        name: self.settings.output_dir / relative_output / file_name
+                        for name, file_name in split_result.files.items()
+                    }
+                    split_debug = {"splitterDurationMs": split_result.duration_ms}
+
                 await report("waveform", None, f"正在提取第 {song_number} 首真实波形")
                 outputs.append(
                     {
                         "fullTrack": full_relative.as_posix(),
-                        "stems": {},
-                        "stemUrls": [],
-                        "waveforms": await extract_waveforms({"full": full_path}),
-                        "splitEnabled": False,
+                        "stems": stems,
+                        "stemUrls": list(stems.values()),
+                        "waveforms": await extract_waveforms(waveform_paths),
+                        "splitEnabled": bool(stems),
                         "durationSeconds": music_result.debug.get("durationSeconds"),
-                        "debug": {"music": music_result.debug},
+                        "debug": {"music": music_result.debug, **split_debug},
                     }
                 )
 

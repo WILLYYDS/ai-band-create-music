@@ -106,11 +106,10 @@ async def test_generate_returns_stems_and_downloadable_audio(tmp_path: Path) -> 
         assert body["durationMinutes"] == 3
         assert body["requestedDurationSeconds"] == 180
         assert body["debug"]["music"]["durationSeconds"] == 180
-        assert body["splitEnabled"] is False
-        assert body["stems"] == {}
-        assert body["waveforms"] == {}
-        assert "splitterStdout" not in body["debug"]
-        assert "splitterStderr" not in body["debug"]
+        assert body["splitEnabled"] is True
+        assert sorted(body["stems"]) == ["bass", "drums", "other", "vocal"]
+        assert len(body["stemUrls"]) == 4
+        assert body["debug"]["splitterDurationMs"] == 5
         audio = await client.get(body["fullTrack"])
     assert audio.status_code == 200
     assert audio.headers["content-type"].startswith("audio/mpeg")
@@ -305,8 +304,8 @@ async def test_async_job_reports_real_stage_and_result(tmp_path: Path) -> None:
     assert final_diagnostics["durationSource"] == "provider"
     assert "effectiveDurationSeconds" not in final_diagnostics
     assert "effectiveDurationMinutes" not in final_diagnostics
-    assert body["result"]["splitEnabled"] is False
-    assert body["result"]["stems"] == {}
+    assert body["result"]["splitEnabled"] is True
+    assert sorted(body["result"]["stems"]) == ["bass", "drums", "other", "vocal"]
 
 
 async def test_async_job_can_be_cancelled(tmp_path: Path) -> None:
