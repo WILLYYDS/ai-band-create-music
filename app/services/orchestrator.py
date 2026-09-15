@@ -13,7 +13,7 @@ from app.core.errors import CapacityExceededError
 from app.infrastructure.events import EventPublisher, GenerationEvent
 from app.infrastructure.queue import TaskDispatcher
 from app.services.audio_files import ensure_file_under_root
-from app.services.job_files import update_job_diagnostics
+from app.services.job_files import job_song_dir, update_job_diagnostics
 from app.services.prompt import PromptExpander, split_generation_prompt
 from app.services.providers import MusicProvider
 from app.services.stems import StemSeparator
@@ -201,9 +201,10 @@ class GenerationOrchestrator:
                     job_id=job_id,
                 )
                 await report("saving_audio", None, f"正在保存第 {song_number} 首")
+                song_dir = job_song_dir(self.settings.output_dir, job_id, index)
                 full_path = await ensure_file_under_root(
                     music_result.audio_path,
-                    self.settings.output_dir,
+                    song_dir,
                     f"full_song_{job_id}_{song_number}{music_result.audio_path.suffix}",
                 )
                 full_relative = full_path.relative_to(self.settings.output_dir)

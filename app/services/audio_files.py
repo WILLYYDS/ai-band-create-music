@@ -4,7 +4,7 @@ import os
 import shutil
 from collections.abc import AsyncIterator
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
@@ -34,6 +34,19 @@ def build_public_audio_url(base_url: str, relative_path: str | Path) -> str:
         quote(part, safe="") for part in Path(relative_path).parts if part not in {"/", ""}
     )
     return f"{base_url.rstrip('/')}/output/{encoded}"
+
+
+def output_path_from_url(audio_url: str, output_dir: Path) -> Path:
+    parsed = urlsplit(audio_url)
+    path = unquote(parsed.path)
+    if "/output/" in path:
+        path = path.split("/output/", 1)[1]
+    elif parsed.scheme or path.startswith("/"):
+        raise ValueError("Not an output URL")
+    root = output_dir.resolve()
+    target = (root / path).resolve()
+    target.relative_to(root)
+    return target
 
 
 async def write_stream_atomically(
@@ -94,7 +107,11 @@ async def download_audio(
         raise GenerationError(f"音乐生成音频下载失败：{exc}") from exc
 
 
-async def ensure_file_under_root(source: Path, root: Path, target_name: str) -> Path:
+async def ensure_file_under_root(
+    source: Path,
+    root: Path,
+    target_name: str,
+) -> Path:
     source = source.resolve()
     root = root.resolve()
     require_readable_file(source, "完整音频不可读")

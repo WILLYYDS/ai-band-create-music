@@ -113,7 +113,7 @@ class Settings(BaseSettings):
     rvc_device: str = "cuda:0"
     rvc_cpu_threads: int = Field(default_factory=lambda: min(6, os.cpu_count() or 1), ge=1)
     rvc_max_upload_mb: int = Field(default=50, ge=1)
-    rvc_result_dir: Path = PROJECT_ROOT / "output" / "rvc"
+    rvc_mix_timeout_seconds: float = Field(default=300, gt=0)
 
     task_backend: Literal["inline"] = "inline"
     cache_backend: Literal["none"] = "none"
@@ -127,7 +127,6 @@ class Settings(BaseSettings):
         "output_dir",
         "mock_full_song_path",
         "rvc_model_path",
-        "rvc_result_dir",
         mode="before",
     )
     @classmethod
