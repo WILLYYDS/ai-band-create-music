@@ -16,8 +16,9 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, sta
 from fastapi.responses import Response
 
 from app.core.config import Settings
-from app.core.errors import CapacityExceededError
+from app.core.errors import CapacityExceededError, GenerationError
 from app.services.audio_files import (
+    build_public_audio_url,
     output_path_from_url,
     require_readable_file,
 )
@@ -160,16 +161,17 @@ def install_voice_api(
     active_engine = engine or RVCEngine(settings)
     application.state.voice_engine = active_engine
 
-    @application.post("/api/voice/mix", response_class=Response)
+    @application.post("/api/voice/mix")
     async def mix_voice(
         request: Request,
+        response: Response,
         job_id: Annotated[str, Form(min_length=1, max_length=100)],
         vocal_filename: Annotated[str, Form(min_length=1, max_length=260)],
         drums: Annotated[str, Form(min_length=1, max_length=2048)],
         bass: Annotated[str, Form(min_length=1, max_length=2048)],
         other: Annotated[str, Form(min_length=1, max_length=2048)],
         song: Annotated[int, Form(ge=0)] = 0,
-    ) -> Response:
+    ) -> dict[str, object]:
         vocal_path = _result_path(settings, vocal_filename, job_id, song)
         job_result = _job_song_result(request, job_id, song)
         output_dir = vocal_path.parent
@@ -186,8 +188,9 @@ def install_voice_api(
         for input_path in [reference_path, *inputs]:
             try:
                 require_readable_file(input_path, "混音输入文件不可读")
-            except RuntimeError as exc:
-                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except GenerationError:
+                logger.warning("Mix input unreadable: %s", input_path)
+                raise HTTPException(status_code=404, detail="混音输入文件不可读") from None
 
         output_name = f"{_source_song_name(vocal_filename, 'completed')}_rvc_mix.wav"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -208,17 +211,18 @@ def install_voice_api(
         except RVCConversionError as exc:
             logger.exception("Audio mixing failed")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except GenerationError as exc:
+            logger.error("Audio processing is unavailable: %s", exc)
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-        return Response(
-            content=result_path.read_bytes(),
-            media_type="audio/wav",
-            headers={
-                "Content-Disposition": (
-                    f"attachment; filename*=UTF-8''{quote(output_name, safe='')}"
-                ),
-                "X-Mix-Output": quote(output_name, safe=""),
-            },
-        )
+        response.headers["X-Mix-Output"] = quote(output_name, safe="")
+        return {
+            "success": True,
+            "filename": output_name,
+            "url": build_public_audio_url(
+                "", result_path.relative_to(settings.output_dir.resolve())
+            ),
+        }
 
     @application.delete("/api/voice/result")
     async def delete_result(
@@ -255,9 +259,10 @@ def install_voice_api(
         trash_path.replace(result_path)
         return {"success": True}
 
-    @application.post("/api/voice/convert", response_class=Response)
+    @application.post("/api/voice/convert")
     async def convert_voice(
         request: Request,
+        response: Response,
         job_id: Annotated[str, Form(min_length=1, max_length=100)],
         file: Annotated[UploadFile | None, File(description="Input audio file")] = None,
         audio: Annotated[UploadFile | None, File(description="Alias of the 'file' field")] = None,
@@ -270,7 +275,7 @@ def install_voice_api(
         protect: Annotated[float, Form(ge=0.0, le=0.5)] = 0.33,
         song_name: Annotated[str, Form(min_length=1, max_length=200)] = "converted",
         song: Annotated[int, Form(ge=0)] = 0,
-    ) -> Response:
+    ) -> dict[str, object]:
         upload = file or audio
         if upload is None:
             raise HTTPException(status_code=400, detail="Upload an audio file in 'file'")
@@ -309,17 +314,15 @@ def install_voice_api(
         finally:
             await upload.close()
 
-        return Response(
-            content=result_path.read_bytes(),
-            media_type="audio/wav",
-            headers={
-                "Content-Disposition": (
-                    f"attachment; filename*=UTF-8''{quote(output_name, safe='')}"
-                ),
-                "X-RVC-Model": settings.rvc_model_path.name,
-                "X-RVC-Output": quote(output_name, safe=""),
-            },
-        )
+        response.headers["X-RVC-Model"] = settings.rvc_model_path.name
+        response.headers["X-RVC-Output"] = quote(output_name, safe="")
+        return {
+            "success": True,
+            "filename": output_name,
+            "url": build_public_audio_url(
+                "", result_path.relative_to(settings.output_dir.resolve())
+            ),
+        }
 
     return active_engine
 

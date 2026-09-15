@@ -213,6 +213,7 @@ def load_jobs(output_dir: Path) -> dict[str, GenerationJob]:
             logger.exception("Unable to load job metadata: %s", target)
     return jobs
 
+
 def _song_result(job: GenerationJob, song: int) -> dict[str, Any] | None:
     if job.result is None or song < 0:
         return None
@@ -326,6 +327,12 @@ def create_app(
         allow_credentials="*" not in cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=[
+            "Content-Disposition",
+            "X-Mix-Output",
+            "X-RVC-Model",
+            "X-RVC-Output",
+        ],
     )
     application.add_middleware(
         RequestSizeLimitMiddleware,

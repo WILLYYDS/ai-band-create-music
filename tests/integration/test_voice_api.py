@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import httpx
 
+from app.core.errors import GenerationError
 from app.main import create_app
 from tests.helpers import make_orchestrator, make_settings
 
@@ -48,7 +49,7 @@ async def test_voice_conversion_download_delete_and_restore(tmp_path: Path) -> N
             files={"file": ("real_song_vocal.mp3", b"ID3" + b"0" * 20_000, "audio/mpeg")},
             data={"job_id": job_id, "index_rate": "0.5", "song_name": "AI 生成曲目"},
         )
-        direct_download = await client.get(f"/output/jobs/{job_id}/song_1/real_song_rvc_vocal.wav")
+        direct_download = await client.get(converted.json()["url"])
         deleted = await client.request(
             "DELETE",
             "/api/voice/result",
@@ -63,6 +64,11 @@ async def test_voice_conversion_download_delete_and_restore(tmp_path: Path) -> N
 
     assert converted.status_code == 200
     assert converted.headers["x-rvc-output"] == "real_song_rvc_vocal.wav"
+    assert converted.json() == {
+        "success": True,
+        "filename": "real_song_rvc_vocal.wav",
+        "url": f"/output/jobs/{job_id}/song_1/real_song_rvc_vocal.wav",
+    }
     assert direct_download.content == b"RIFF-converted-wav"
     assert deleted.status_code == 200
     assert missing.status_code == 404
@@ -156,12 +162,46 @@ async def test_voice_mix_uses_server_side_stems(tmp_path: Path, monkeypatch) -> 
         response = await client.post(
             "/api/voice/mix",
             data={"job_id": job_id, "vocal_filename": vocal.name, **stems},
+            headers={"Origin": "https://frontend.example"},
+        )
+        direct_download = await client.get(response.json()["url"])
+
+        (song_dir / "real_song_drums.mp3").unlink()
+        missing = await client.post(
+            "/api/voice/mix",
+            data={"job_id": job_id, "vocal_filename": vocal.name, **stems},
+        )
+        (song_dir / "real_song_drums.mp3").write_bytes(b"ID3-stem")
+
+        async def unavailable(*_args, **_kwargs):
+            raise GenerationError("音频处理需要 ffmpeg 和 ffprobe")
+
+        monkeypatch.setattr("app.services.voice._mix_tracks", unavailable)
+        unavailable_response = await client.post(
+            "/api/voice/mix",
+            data={"job_id": job_id, "vocal_filename": vocal.name, **stems},
         )
 
     assert response.status_code == 200
-    assert response.content == b"RIFF-mixed"
-    assert response.headers["content-type"] == "audio/wav"
+    assert response.json() == {
+        "success": True,
+        "filename": "real_song_rvc_mix.wav",
+        "url": f"/output/jobs/{job_id}/song_1/real_song_rvc_mix.wav",
+    }
     assert response.headers["x-mix-output"] == "real_song_rvc_mix.wav"
+    exposed_headers = {
+        value.strip().lower()
+        for value in response.headers["access-control-expose-headers"].split(",")
+    }
+    assert {"content-disposition", "x-mix-output", "x-rvc-model", "x-rvc-output"} <= (
+        exposed_headers
+    )
+    assert direct_download.content == b"RIFF-mixed"
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "混音输入文件不可读"
+    assert str(song_dir) not in missing.text
+    assert unavailable_response.status_code == 503
+    assert unavailable_response.json()["detail"] == "音频处理需要 ffmpeg 和 ffprobe"
     assert (song_dir / "real_song_rvc_mix.wav").read_bytes() == b"RIFF-mixed"
 
 
