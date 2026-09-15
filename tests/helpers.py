@@ -113,7 +113,6 @@ def make_settings(tmp_path: Path, **updates: object) -> Settings:
         "rvc_model_path": rvc_model,
         "rvc_index_path": None,
         "rvc_base_model_dir": None,
-        "rvc_result_dir": tmp_path / "output" / "rvc",
     }
     values.update(updates)
     return Settings(_env_file=None, **values)

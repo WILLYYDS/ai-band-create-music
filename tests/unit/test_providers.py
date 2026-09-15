@@ -135,9 +135,12 @@ async def test_elevenlabs_uses_composition_plan_and_streams_audio(tmp_path: Path
             "[Genre: Rock]",
             120,
             "[歌词与创作内容]\n第一句原歌词\n第二句原歌词\n\n[风格要求]\n普通话摇滚",
+            job_id="job-1",
         )
 
     assert result.audio_path.read_bytes() == b"ID3-generated-audio"
+    assert result.audio_path == settings.output_dir / "jobs/job-1/song_1/full_song_job-1_1.mp3"
+    assert not list(settings.output_dir.glob("full_song_*"))
     assert result.debug["mode"] == "composition_plan"
     assert len(requests) == 2
     plan_body = json.loads(requests[0].content)
@@ -179,8 +182,11 @@ async def test_generic_provider_accepts_direct_audio_url(tmp_path: Path) -> None
         music_api_base_url="https://provider.test",
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result = await GenericMusicProvider(settings, client).generate("[Genre: Folk]", 60, "folk")
+        result = await GenericMusicProvider(settings, client).generate(
+            "[Genre: Folk]", 60, "folk", job_id="job-1"
+        )
     assert result.audio_path.read_bytes() == b"ID3-generic"
+    assert result.audio_path == settings.output_dir / "jobs/job-1/song_1/full_song_job-1_1.mp3"
     assert result.debug["mode"] == "direct_audio_url"
 
 
@@ -233,13 +239,16 @@ async def test_minimax_provider_ignores_selected_duration(tmp_path: Path) -> Non
 
     settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
+        result = await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
             "[Genre: Rock]", 60, "rock", job_id="local-job"
         )
 
     body = json.loads(requests[0].content)
     assert "audio_duration" not in body
     assert "Choose the natural complete song duration" in body["instructions"]
+    assert result.audio_path == (
+        settings.output_dir / "jobs/local-job/song_1/full_song_local-job_1.wav"
+    )
     diagnostics = json.loads(
         (settings.output_dir / "jobs/local-job/prompts.json").read_text(encoding="utf-8")
     )

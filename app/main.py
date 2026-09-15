@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import json
 import logging
 import os
@@ -12,7 +11,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -37,8 +35,12 @@ from app.schemas import (
     GenerationJobResponse,
     UpdateGenerationJobRequest,
 )
-from app.services.audio_files import build_public_audio_url, detect_audio_content_type
-from app.services.job_files import read_job_diagnostics
+from app.services.audio_files import (
+    build_public_audio_url,
+    detect_audio_content_type,
+    output_path_from_url,
+)
+from app.services.job_files import job_song_dir, read_job_diagnostics
 from app.services.orchestrator import GenerationOrchestrator
 from app.services.prompt import OpenAICompatiblePromptExpander, effective_llm_output_tokens
 from app.services.providers import create_music_provider
@@ -212,90 +214,6 @@ def load_jobs(output_dir: Path) -> dict[str, GenerationJob]:
     return jobs
 
 
-async def import_legacy_songs(
-    jobs: dict[str, GenerationJob], settings: Settings, candidates: list[Path]
-) -> None:
-    represented = set()
-    fingerprints = set()
-    legacy_prompts = {}
-    for prompt_file in (settings.output_dir / "jobs").glob("*/prompts.json"):
-        try:
-            metadata = json.loads(prompt_file.read_text(encoding="utf-8"))
-            if isinstance(metadata, dict):
-                for stem in prompt_file.parent.rglob("full_song_*"):
-                    legacy_prompts[stem.stem.rsplit("_", 1)[0]] = metadata
-                legacy_prompts[prompt_file.parent.name] = metadata
-        except (OSError, ValueError):
-            logger.warning("Unable to read legacy prompts: %s", prompt_file)
-
-    def fingerprint(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-
-    for job in jobs.values():
-        if job.result:
-            for result in [job.result, *job.result.get("alternatives", [])]:
-                try:
-                    path = _output_path_from_url(result["fullTrack"], settings)
-                    represented.add(path)
-                    fingerprints.add(fingerprint(path))
-                except (KeyError, ValueError, OSError):
-                    pass
-    for path in candidates:
-        if path.suffix.lower() not in {".wav", ".mp3", ".flac", ".ogg", ".m4a"}:
-            continue
-        job_id = "legacy_" + hashlib.sha256(path.name.encode()).hexdigest()[:20]
-        if path.resolve() in represented or job_id in jobs or not path.is_file():
-            continue
-        try:
-            digest = fingerprint(path)
-        except OSError:
-            logger.exception("Unable to read legacy audio: %s", path)
-            continue
-        if digest in fingerprints or path.stat().st_size == 0:
-            continue
-        created = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
-        metadata = legacy_prompts.get(path.stem, {})
-        if not metadata and path.stem.startswith("full_song_job_"):
-            metadata = legacy_prompts.get(
-                path.stem.removeprefix("full_song_").rsplit("_", 1)[0], {}
-            )
-        job = GenerationJob(
-            job_id=job_id,
-            prompt=metadata.get("prompt") or path.stem,
-            structured_prompt=metadata.get("structuredPrompt"),
-            lyrics=metadata.get("lyrics"),
-            created_at=created,
-            status="succeeded",
-            stage="completed",
-            progress=100,
-            message="已导入历史完整歌曲",
-        )
-        job.result = {
-            "success": True,
-            "jobId": job_id,
-            "createdAt": created,
-            "prompt": job.prompt,
-            "structuredPrompt": job.structured_prompt or "",
-            "lyrics": job.lyrics or "",
-            "durationMinutes": "auto",
-            "count": 1,
-            "alternatives": [],
-            "fullTrack": path.relative_to(settings.output_dir).as_posix(),
-            "stems": {},
-            "stemUrls": [],
-            "waveforms": await extract_waveforms({"full": path}),
-            "splitEnabled": False,
-            "debug": {"imported": True},
-        }
-        job.save(settings.output_dir)
-        jobs[job_id] = job
-        fingerprints.add(digest)
-
-
 def _song_result(job: GenerationJob, song: int) -> dict[str, Any] | None:
     if job.result is None or song < 0:
         return None
@@ -398,9 +316,6 @@ def create_app(
     application.state.settings = application_settings
     application.state.jobs = load_jobs(application_settings.output_dir)
     application.state.job_subscribers = {}
-    history_lock = asyncio.Lock()
-    legacy_imported = False
-    legacy_candidates = sorted(application_settings.output_dir.glob("full_song_*"))
     install_voice_api(application, application_settings, voice_engine)
     if orchestrator is not None:
         application.state.orchestrator = orchestrator
@@ -412,6 +327,12 @@ def create_app(
         allow_credentials="*" not in cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=[
+            "Content-Disposition",
+            "X-Mix-Output",
+            "X-RVC-Model",
+            "X-RVC-Output",
+        ],
     )
     application.add_middleware(
         RequestSizeLimitMiddleware,
@@ -666,15 +587,6 @@ def create_app(
 
     @application.get("/api/jobs")
     async def generation_history(request: Request):
-        nonlocal legacy_imported
-        async with history_lock:
-            if not legacy_imported:
-                await import_legacy_songs(
-                    request.app.state.jobs,
-                    application_settings,
-                    legacy_candidates,
-                )
-                legacy_imported = True
         return {
             "jobs": [
                 _job_response(job, request, application_settings)
@@ -824,10 +736,9 @@ def create_app(
             try:
                 job.split_status = "running"
                 publish()
-                relative_output = Path("jobs") / job_id / f"song_{song + 1}"
-                split_result = await active_orchestrator.stem_separator.split(
-                    full_path, application_settings.output_dir / relative_output
-                )
+                output_dir = job_song_dir(application_settings.output_dir, job_id, song)
+                relative_output = output_dir.relative_to(application_settings.output_dir)
+                split_result = await active_orchestrator.stem_separator.split(full_path, output_dir)
                 stems = {
                     name: (relative_output / file_name).as_posix()
                     for name, file_name in split_result.files.items()
@@ -1154,16 +1065,7 @@ def _public_audio_url(audio_url: str, base_url: str, settings: Settings) -> str:
 
 
 def _output_path_from_url(audio_url: str, settings: Settings):
-    path = unquote(urlsplit(audio_url).path)
-    marker = "/output/"
-    if marker in path:
-        path = path.split(marker, 1)[1]
-    elif urlsplit(audio_url).scheme or path.startswith("/"):
-        raise ValueError("Not an output URL")
-    root = settings.output_dir.resolve()
-    target = (root / path).resolve()
-    target.relative_to(root)
-    return target
+    return output_path_from_url(audio_url, settings.output_dir)
 
 
 def _stem_trash_path(target, settings: Settings, job_id: str, song: int = 0):

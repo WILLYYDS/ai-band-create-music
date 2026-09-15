@@ -16,7 +16,7 @@ import httpx
 from app.core.config import PROJECT_ROOT, Settings
 from app.core.errors import GenerationError
 from app.services.audio_files import download_audio, require_readable_file, write_stream_atomically
-from app.services.job_files import update_provider_diagnostic
+from app.services.job_files import job_song_dir, update_provider_diagnostic
 from app.services.prompt import (
     OpenAICompatiblePromptExpander,
     _http_failure_message,
@@ -30,6 +30,17 @@ MINIMAX_GENERATE_PATH = "/v1/audio/jobs"
 MINIMAX_LYRIC_LINE_LIMIT = 32
 LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")
 ProviderProgressCallback = Callable[[str, int | None, int | None], Awaitable[None]]
+
+
+def _audio_target(
+    settings: Settings, fallback_name: str, job_id: str | None, variation: int
+) -> Path:
+    if job_id:
+        suffix = Path(fallback_name).suffix
+        return job_song_dir(settings.output_dir, job_id, variation) / (
+            f"full_song_{job_id}_{variation + 1}{suffix}"
+        )
+    return settings.output_dir / fallback_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +84,7 @@ def _wrap_long_lyric_lines(lyrics: str) -> str:
         if current:
             output.append(current)
     return "\n".join(output)
+
 
 def _response_diagnostic(response: httpx.Response) -> dict[str, Any]:
     try:
@@ -225,14 +237,16 @@ class GenericMusicProvider:
             data = response.json()
             audio_url = extract_generated_audio_url(data)
             if audio_url:
-                audio_path = await self._download(audio_url, f"full_song_{time.time_ns()}.mp3")
+                audio_path = await self._download(
+                    audio_url, f"full_song_{time.time_ns()}.mp3", job_id, variation
+                )
                 return MusicResult(audio_path, {"provider": "generic", "mode": "direct_audio_url"})
             task_id = extract_task_id(data)
             if not task_id:
                 raise GenerationError(
                     "音乐生成接口未返回 taskId 或 audioUrl，请检查代理接口响应结构。"
                 )
-            audio_path = await self._poll(task_id)
+            audio_path = await self._poll(task_id, job_id, variation)
             return MusicResult(
                 audio_path, {"provider": "generic", "mode": "polling", "taskId": task_id}
             )
@@ -241,7 +255,7 @@ class GenericMusicProvider:
         except (httpx.HTTPError, ValueError) as exc:
             raise GenerationError(f"音乐生成失败：{_http_failure_message(exc)}") from exc
 
-    async def _poll(self, task_id: str) -> Path:
+    async def _poll(self, task_id: str, job_id: str | None, variation: int) -> Path:
         url = f"{self._settings.music_api_base_url}{self._settings.music_status_path}"
         for _ in range(self._settings.music_max_poll_attempts):
             await asyncio.sleep(self._settings.music_poll_interval_seconds)
@@ -263,16 +277,20 @@ class GenericMusicProvider:
                 "done",
                 "",
             }:
-                return await self._download(audio_url, f"full_song_{task_id}.mp3")
+                return await self._download(
+                    audio_url, f"full_song_{task_id}.mp3", job_id, variation
+                )
             if status in {"failed", "error", "canceled", "cancelled"}:
                 raise GenerationError(f"音乐生成任务失败，taskId={task_id}，status={status}")
         raise GenerationError(f"音乐生成任务超时，taskId={task_id}")
 
-    async def _download(self, audio_url: str, name: str) -> Path:
+    async def _download(
+        self, audio_url: str, name: str, job_id: str | None, variation: int
+    ) -> Path:
         return await download_audio(
             self._client,
             audio_url,
-            self._settings.output_dir / name,
+            _audio_target(self._settings, name, job_id, variation),
             timeout=self._settings.music_download_timeout_seconds,
             trusted_local_root=PROJECT_ROOT,
         )
@@ -345,7 +363,12 @@ class ElevenLabsMusicProvider:
                     "force_instrumental": self._settings.elevenlabs_force_instrumental,
                 }
 
-            target = self._settings.output_dir / f"full_song_elevenlabs_{time.time_ns()}.mp3"
+            target = _audio_target(
+                self._settings,
+                f"full_song_elevenlabs_{time.time_ns()}.mp3",
+                job_id,
+                variation,
+            )
             async with self._client.stream(
                 "POST",
                 f"{self._settings.elevenlabs_music_base_url}/v1/music",
@@ -462,15 +485,17 @@ class SunoMusicProvider:
 
         audio_url = extract_suno_audio_url(data)
         if audio_url:
-            path = await self._download(audio_url, f"full_song_suno_{time.time_ns()}.mp3")
+            path = await self._download(
+                audio_url, f"full_song_suno_{time.time_ns()}.mp3", job_id, variation
+            )
             return MusicResult(path, {"provider": "suno_api", "mode": "direct_audio_url"})
         clip_ids = extract_suno_clip_ids(data)
         if not clip_ids:
             raise GenerationError("Suno 音乐生成失败：suno-api 未返回 clip id。")
-        path = await self._poll(clip_ids)
+        path = await self._poll(clip_ids, job_id, variation)
         return MusicResult(path, {"provider": "suno_api", "mode": "polling", "clipIds": clip_ids})
 
-    async def _poll(self, clip_ids: list[str]) -> Path:
+    async def _poll(self, clip_ids: list[str], job_id: str | None, variation: int) -> Path:
         ids = ",".join(clip_ids)
         url = f"{self._settings.music_api_base_url}{self._settings.music_status_path}"
         for _ in range(self._settings.music_max_poll_attempts):
@@ -484,14 +509,16 @@ class SunoMusicProvider:
             response.raise_for_status()
             audio_url = extract_suno_audio_url(response.json())
             if audio_url:
-                return await self._download(audio_url, f"full_song_suno_{clip_ids[0]}.mp3")
+                return await self._download(
+                    audio_url, f"full_song_suno_{clip_ids[0]}.mp3", job_id, variation
+                )
         raise GenerationError(f"suno-api 生成任务超时，ids={ids}")
 
-    async def _download(self, url: str, name: str) -> Path:
+    async def _download(self, url: str, name: str, job_id: str | None, variation: int) -> Path:
         return await download_audio(
             self._client,
             url,
-            self._settings.output_dir / name,
+            _audio_target(self._settings, name, job_id, variation),
             timeout=self._settings.music_download_timeout_seconds,
             trusted_local_root=PROJECT_ROOT,
         )
@@ -535,7 +562,12 @@ class MiniMaxMusicProvider:
             lyrics = _wrap_long_lyric_lines(lyrics)
             if len(lyrics) < 10:
                 raise GenerationError("MiniMax 音乐生成失败：生成的歌词不足 10 个字符。")
-            target = self._settings.output_dir / f"full_song_minimax_{time.time_ns()}.wav"
+            target = _audio_target(
+                self._settings,
+                f"full_song_minimax_{time.time_ns()}.wav",
+                job_id,
+                variation,
+            )
             request_body = {
                 "model": self._settings.minimax_model,
                 "input": lyrics,
@@ -655,9 +687,7 @@ class MiniMaxMusicProvider:
                         response.aiter_bytes(), target, "MiniMax Music 3 服务返回空音频。"
                     )
                 with wave.open(str(target), "rb") as audio:
-                    actual_duration_seconds = round(
-                        audio.getnframes() / audio.getframerate(), 3
-                    )
+                    actual_duration_seconds = round(audio.getnframes() / audio.getframerate(), 3)
                 update_provider_diagnostic(
                     self._settings.output_dir,
                     job_id,

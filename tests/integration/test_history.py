@@ -1,6 +1,5 @@
 import asyncio
 import json
-import wave
 from unittest.mock import AsyncMock
 
 import httpx
@@ -15,7 +14,7 @@ def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://testserver")
 
 
-async def test_direct_history_restart_and_duplicate_import(tmp_path):
+async def test_direct_history_restart(tmp_path):
     settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
     # 生成路径只产出完整混音。
@@ -27,23 +26,19 @@ async def test_direct_history_restart_and_duplicate_import(tmp_path):
     assert len(history) == 1
     assert history[0]["createdAt"] == result["createdAt"]
     assert history[0]["result"]["fullTrack"] == result["fullTrack"]
-    stored = json.loads(
-        (settings.output_dir / "jobs" / result["jobId"] / "job.json").read_text()
-    )
+    stored = json.loads((settings.output_dir / "jobs" / result["jobId"] / "job.json").read_text())
     assert stored["diagnostics"]["prompt"] == "rock"
     assert stored["diagnostics"]["provider"] == "minimax_music"
     assert stored["diagnostics"]["durationSource"] == "provider"
     assert "effectiveDurationSeconds" not in stored["diagnostics"]
     assert "effectiveDurationMinutes" not in stored["diagnostics"]
+    assert list((settings.output_dir / "jobs" / result["jobId"] / "song_1").glob("full_song_*"))
     orchestrator.stem_separator.split.assert_not_called()
-    copy = settings.output_dir / "full_song_minimax_duplicate.wav"
-    copy.write_bytes(b"ID3-full-audio")
     restarted = create_app(settings, orchestrator)
     async with client(restarted) as http:
         restored = (await http.get("/api/jobs")).json()["jobs"]
         assert len(restored) == 1
         assert (await http.get(result["fullTrack"])).content == b"ID3-full-audio"
-    assert copy.exists()
 
 
 async def test_history_song_starts_async_split_and_updates_result(tmp_path, monkeypatch):
@@ -65,11 +60,7 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
         monkeypatch.setattr(orchestrator.stem_separator, "split", split)
         monkeypatch.setattr(
             "app.main.extract_waveforms",
-            AsyncMock(
-                return_value={
-                    name: [0.5] for name in ("vocal", "drums", "bass", "other")
-                }
-            ),
+            AsyncMock(return_value={name: [0.5] for name in ("vocal", "drums", "bass", "other")}),
         )
         accepted = await http.post(f"/api/jobs/{job_id}/split?song=0")
         await asyncio.wait_for(started.wait(), 2)
@@ -78,9 +69,7 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
         release.set()
         await app.state.jobs[job_id].split_task
         completed = (await http.get(f"/api/jobs/{job_id}")).json()
-        cache_guard = AsyncMock(
-            side_effect=AssertionError("cached split must not run again")
-        )
+        cache_guard = AsyncMock(side_effect=AssertionError("cached split must not run again"))
         monkeypatch.setattr(orchestrator.stem_separator, "split", cache_guard)
         cached = await http.post(f"/api/jobs/{job_id}/split?song=0")
 
@@ -131,9 +120,9 @@ async def test_split_reserves_job_before_capacity_await(tmp_path, monkeypatch):
         AsyncMock(return_value={name: [0.5] for name in ("vocal", "drums", "bass", "other")}),
     )
     async with client(app) as http:
-        job_id = (
-            await http.post("/api/generate", json={"prompt": "rock", "count": 2})
-        ).json()["jobId"]
+        job_id = (await http.post("/api/generate", json={"prompt": "rock", "count": 2})).json()[
+            "jobId"
+        ]
         monkeypatch.setattr(orchestrator.capacity, "acquire", acquire)
         first = asyncio.create_task(http.post(f"/api/jobs/{job_id}/split?song=0"))
         await asyncio.wait_for(entered.wait(), 2)
@@ -207,7 +196,7 @@ async def test_split_rejects_invalid_or_unavailable_jobs(tmp_path, monkeypatch):
         full_track = job.result.pop("fullTrack")
         assert (await http.post(f"/api/jobs/{job_id}/split")).status_code == 409
         job.result["fullTrack"] = full_track
-        full_file = next(settings.output_dir.glob(f"full_song_{job_id}*"))
+        full_file = next(settings.output_dir.rglob(f"full_song_{job_id}*"))
         full_file.unlink()
         assert (await http.post(f"/api/jobs/{job_id}/split")).status_code == 409
         full_file.write_bytes(b"ID3-full-audio")
@@ -282,25 +271,6 @@ def test_interrupted_and_corrupt_metadata(tmp_path):
     assert not list(settings.output_dir.rglob("*.tmp"))
 
 
-async def test_legacy_import_real_waveform_and_restart(tmp_path):
-    settings = make_settings(tmp_path)
-    orchestrator = make_orchestrator(settings)
-    settings.output_dir.mkdir(parents=True, exist_ok=True)
-    song = settings.output_dir / "full_song_old.wav"
-    with wave.open(str(song), "wb") as audio:
-        audio.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
-        audio.writeframes(b"\x00\x10" * 8000)
-    original = song.read_bytes()
-    app = create_app(settings, orchestrator)
-    async with client(app) as http:
-        rows = (await http.get("/api/jobs")).json()["jobs"]
-    assert len(rows) == 1
-    assert rows[0]["result"]["waveforms"]["full"] == [1.0] * 64
-    async with client(create_app(settings, orchestrator)) as http:
-        assert (await http.get("/api/jobs")).json()["jobs"] == rows
-    assert song.read_bytes() == original
-
-
 async def test_job_forwards_actual_provider_counts(tmp_path):
     settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
@@ -371,17 +341,19 @@ async def test_job_events_keep_alive_after_timeout(tmp_path, monkeypatch):
     endpoint = next(
         route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
     )
-    request = Request({
-        "type": "http",
-        "app": app,
-        "headers": [],
-        "scheme": "http",
-        "server": ("testserver", 80),
-        "path": "/api/jobs/active/events",
-        "root_path": "",
-        "query_string": b"",
-        "method": "GET",
-    })
+    request = Request(
+        {
+            "type": "http",
+            "app": app,
+            "headers": [],
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "path": "/api/jobs/active/events",
+            "root_path": "",
+            "query_string": b"",
+            "method": "GET",
+        }
+    )
 
     async def time_out(awaitable, *_args, **_kwargs):
         awaitable.close()

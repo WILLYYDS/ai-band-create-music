@@ -107,17 +107,37 @@ curl http://127.0.0.1:8010/api/health
 
 RVC 默认自动查找 `assets/rvc` 中的模型、索引和 HuBERT/RMVPE 基础模型；也可通过
 `RVC_MODEL_PATH`、`RVC_INDEX_PATH` 和 `RVC_BASE_MODEL_DIR` 显式指定。RVC 推理在
-第一次转换时懒加载到 `cuda:0`：
+第一次转换时懒加载到 `cuda:0`；默认 `rms_mix_rate=1`，使替换人声沿用原人声的音量包络：
 
 ```bash
 curl -X POST http://127.0.0.1:8010/api/voice/convert \
+  -F 'job_id=<jobId>' \
   -F 'file=@vocal.wav' \
   -F 'song_name=歌曲名称'
 ```
 
-输出保存在 `output/rvc/<原音乐文件名>_rvc_vocal.wav`。`POST /api/voice/result` 下载结果，
-`DELETE /api/voice/result` 软删除结果，`PUT /api/voice/result` 恢复结果；三个请求均以
-表单字段 `filename` 传入文件名。
+输出保存在 `output/jobs/<jobId>/song_1/<原音乐文件名>_rvc_vocal.wav`。多首生成时以
+从 0 开始的 `song` 表单字段选择歌曲。前端直接使用 `/output/jobs/...wav` URL
+播放或下载；转换接口的 JSON 响应会返回该 URL。`DELETE /api/voice/result`
+软删除结果，`PUT` 恢复结果；
+请求均传 `job_id`、`filename` 和可选的 `song`。
+
+完成创作时直接提交服务端已有的替换人声文件名和三条伴奏 URL；后端使用不衰减音轨的
+FFmpeg 混音，增强人声清晰度，并以分轨前的完整歌曲为基准自适应匹配响度，最后在 -1 dBFS 限峰。
+返回与母带采样率、声道数和 PCM 位深匹配的 WAV。整个混音流程默认 300 秒超时，可通过
+`RVC_MIX_TIMEOUT_SECONDS` 调整：
+
+```bash
+curl -X POST http://127.0.0.1:8010/api/voice/mix \
+  -F 'job_id=<jobId>' \
+  -F 'vocal_filename=歌曲_rvc_vocal.wav' \
+  -F 'drums=/output/jobs/<jobId>/song_1/歌曲_drums.mp3' \
+  -F 'bass=/output/jobs/<jobId>/song_1/歌曲_bass.mp3' \
+  -F 'other=/output/jobs/<jobId>/song_1/歌曲_other.mp3'
+```
+
+转换和混音接口均返回 `{"success":true,"filename":"...wav","url":"/output/jobs/...wav"}`，
+音频由 `/output` 接口以 Range 流式传输。
 
 生成音乐。`provider` 可传 `minimax_music` 或 `elevenlabs_music`，不传时使用
 `MUSIC_PROVIDER`：
@@ -168,7 +188,8 @@ curl -X DELETE http://127.0.0.1:8010/api/jobs/<jobId>/stems/vocal
 curl -X PUT http://127.0.0.1:8010/api/jobs/<jobId>/stems/vocal
 ```
 
-任务元数据会原子写入 `output/jobs/<jobId>/job.json`，服务重启后会重新加载历史。
+任务元数据写入 `output/jobs/<jobId>/job.json`，完整歌曲、分轨、RVC 人声和最终混音统一
+写入 `output/jobs/<jobId>/song_<n>/`。服务重启后会重新加载历史。
 重启时仍为 `pending` 或 `running` 的任务会恢复为 `failed`，并标记“服务器重启，生成任务已中断”；
 不会自动续跑未完成的音乐生成。执行队列和并发计数仍为单进程状态，因此仍推荐单
 Uvicorn worker；需要多 worker 时再接入共享任务存储。

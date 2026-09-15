@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+
+def job_song_dir(output_dir: Path, job_id: str, song: int = 0) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", job_id) or song < 0:
+        raise ValueError("Invalid job output path")
+    return output_dir / "jobs" / job_id / f"song_{song + 1}"
 
 
 def read_job_diagnostics(output_dir: Path, job_id: str) -> dict[str, Any]:
