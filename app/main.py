@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import os
+import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -45,13 +46,15 @@ from app.services.orchestrator import GenerationOrchestrator
 from app.services.prompt import OpenAICompatiblePromptExpander, effective_llm_output_tokens
 from app.services.providers import create_music_provider
 from app.services.stems import DemucsStemSeparator
-from app.services.voice import RVCEngine, install_voice_api
+from app.services.voice import RVCEngine, install_voice_api, replacement_filename
 from app.services.waveforms import extract_waveforms, merge_waveform_sets
 
 logger = logging.getLogger(__name__)
 SPLIT_PROGRESS = 76
 WAVEFORM_PROGRESS = 90
 SPLIT_COMPLETE_PROGRESS = 100
+REPLACE_PROGRESS = 90
+REPLACE_COMPLETE_PROGRESS = 100
 
 
 class RequestSizeLimitMiddleware:
@@ -141,6 +144,14 @@ class GenerationJob:
     split_progress: int | None = field(default=None, repr=False)
     split_message: str | None = field(default=None, repr=False)
     split_error: str | None = field(default=None, repr=False)
+    replace_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    replace_song: int | None = field(default=None, repr=False)
+    replace_status: str | None = field(default=None, repr=False)
+    replace_stage: str | None = field(default=None, repr=False)
+    replace_progress: int | None = field(default=None, repr=False)
+    replace_message: str | None = field(default=None, repr=False)
+    replace_error: str | None = field(default=None, repr=False)
+    replace_cancel_requested: bool = field(default=False, repr=False)
 
     def response(self) -> dict[str, Any]:
         return {
@@ -589,13 +600,7 @@ def create_app(
     async def generation_history(request: Request):
         return {
             "jobs": [
-                _job_response(
-                    job,
-                    request,
-                    application_settings,
-                    include_split=False,
-                    include_waveforms=False,
-                )
+                _job_response(job, request, application_settings, include_split=False)
                 for job in sorted(
                     request.app.state.jobs.values(), key=lambda job: job.created_at, reverse=True
                 )
@@ -689,6 +694,14 @@ def create_app(
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"success": False, "message": "该歌曲没有可供拆轨的完整音频。"},
+            )
+        if job.replace_task is not None and not job.replace_task.done():
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "success": False,
+                    "message": f"第 {(job.replace_song or 0) + 1} 首歌曲正在替换人声。",
+                },
             )
         if job.split_status in {"pending", "running"}:
             if job.split_song == song:
@@ -819,6 +832,164 @@ def create_app(
         job.split_task = asyncio.create_task(execute(), name=f"split-{job_id}-{song}")
         return _job_response(job, request, application_settings)
 
+    @application.post(
+        "/api/jobs/{job_id}/replace",
+        response_model=GenerationJobResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+        responses={
+            200: {"model": GenerationJobResponse},
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            429: {"model": ErrorResponse},
+        },
+    )
+    async def replace_generation_vocal(
+        job_id: str, request: Request, response: Response, song: int = 0
+    ):
+        job = request.app.state.jobs.get(job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"success": False, "message": "生成任务不存在。"},
+            )
+        if job.status != "succeeded":
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "生成任务尚未完成，无法替换人声。"},
+            )
+        result = _song_result(job, song)
+        if result is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"success": False, "message": "歌曲不存在。"},
+            )
+        if job.split_status in {"pending", "running"}:
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "success": False,
+                    "message": f"第 {(job.split_song or 0) + 1} 首歌曲正在拆轨。",
+                },
+            )
+        if job.replace_task is not None and not job.replace_task.done():
+            if job.replace_song == song:
+                return _job_response(job, request, application_settings)
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "success": False,
+                    "message": f"第 {(job.replace_song or 0) + 1} 首歌曲正在替换人声。",
+                },
+            )
+
+        stems = result.get("stems")
+        vocal_url = next(
+            (
+                value
+                for name, value in (stems.items() if isinstance(stems, dict) else ())
+                if name.lower() in {"vocal", "vocals", "voice"} and isinstance(value, str)
+            ),
+            None,
+        )
+        if vocal_url is None:
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "该歌曲没有人声音轨，请先完成拆轨。"},
+            )
+        try:
+            output_dir = job_song_dir(application_settings.output_dir, job_id, song)
+            vocal_path = _output_path_from_url(vocal_url, application_settings)
+            if vocal_path.parent != output_dir.resolve() or not vocal_path.is_file():
+                raise OSError("missing vocal stem")
+        except (OSError, ValueError):
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "人声音轨文件不存在，无法替换。"},
+            )
+
+        cached_url = result.get("replacedVocal")
+        if isinstance(cached_url, str):
+            try:
+                cached_path = _output_path_from_url(cached_url, application_settings)
+                if cached_path.parent == output_dir.resolve() and cached_path.is_file():
+                    response.status_code = status.HTTP_200_OK
+                    return _job_response(job, request, application_settings)
+            except ValueError:
+                pass
+
+        active_orchestrator = _orchestrator(request)
+        job.replace_song = song
+        job.replace_status = "pending"
+        job.replace_stage = "replacing_vocal"
+        job.replace_progress = REPLACE_PROGRESS
+        job.replace_message = "RVC 正在替换人声"
+        job.replace_error = None
+        job.replace_cancel_requested = False
+        try:
+            await active_orchestrator.capacity.acquire()
+        except CapacityExceededError:
+            job.replace_song = None
+            job.replace_status = None
+            job.replace_stage = None
+            job.replace_progress = None
+            job.replace_message = None
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={"success": False, "message": "当前人声替换任务过多，请稍后重试。"},
+            )
+        except asyncio.CancelledError:
+            job.replace_song = None
+            job.replace_status = None
+            job.replace_stage = None
+            job.replace_progress = None
+            job.replace_message = None
+            raise
+
+        def publish() -> None:
+            for queue in request.app.state.job_subscribers.get(job_id, ()):
+                if queue.empty():
+                    queue.put_nowait(None)
+
+        async def execute() -> None:
+            try:
+                job.replace_status = "running"
+                publish()
+                result_path = output_dir / replacement_filename(vocal_path.name)
+                with tempfile.TemporaryDirectory(prefix=".rvc-", dir=output_dir) as temp_dir:
+                    output_path = Path(temp_dir) / "converted.wav"
+                    if job.replace_cancel_requested:
+                        raise asyncio.CancelledError
+                    await request.app.state.voice_engine.convert(vocal_path, output_path)
+                    if job.replace_cancel_requested:
+                        raise asyncio.CancelledError
+                    output_path.replace(result_path)
+                result["replacedVocal"] = result_path.relative_to(
+                    application_settings.output_dir.resolve()
+                ).as_posix()
+                job.save(application_settings.output_dir)
+                job.replace_status = "succeeded"
+                job.replace_stage = "completed"
+                job.replace_progress = REPLACE_COMPLETE_PROGRESS
+                job.replace_message = "人声替换完成"
+            except asyncio.CancelledError:
+                job.replace_status = "cancelled"
+                job.replace_stage = "cancelled"
+                job.replace_progress = None
+                job.replace_message = "人声替换已取消"
+            except Exception:
+                logger.exception("vocal replacement failed job_id=%s song=%s", job_id, song)
+                job.replace_status = "failed"
+                job.replace_stage = "failed"
+                job.replace_progress = None
+                job.replace_message = "人声替换失败"
+                job.replace_error = "人声替换失败，请检查 RVC 配置后重试。"
+            finally:
+                await active_orchestrator.capacity.release()
+                publish()
+
+        job.replace_task = asyncio.create_task(execute(), name=f"replace-{job_id}-{song}")
+        return _job_response(job, request, application_settings)
+
     @application.patch(
         "/api/jobs/{job_id}",
         response_model=GenerationJobResponse,
@@ -841,6 +1012,14 @@ def create_app(
             job.split_stage = "cancelled"
             job.split_progress = None
             job.split_message = "音轨分离已取消"
+        if job.replace_task is not None and not job.replace_task.done():
+            # ponytail: RVC runs in a worker thread and has no safe stop API; mark cancellation
+            # now, keep capacity reserved, then discard its output when inference returns.
+            job.replace_cancel_requested = True
+            job.replace_status = "cancelled"
+            job.replace_stage = "cancelled"
+            job.replace_progress = None
+            job.replace_message = "人声替换已取消"
         if job.task is not None and not job.task.done():
             job.task.cancel()
             job.status = "cancelled"
@@ -1050,21 +1229,30 @@ def _job_response(
     settings: Settings,
     *,
     include_split: bool = True,
-    include_waveforms: bool = True,
 ) -> dict[str, Any]:
     response = job.response()
-    split_status = _split_status_override(job)
-    if include_split and split_status is not None:
+    if include_split and job.split_status in {"pending", "running"}:
         response.update(
             status=split_status,
             stage=job.split_stage,
             progress=job.split_progress,
             message=job.split_message,
         )
-    if include_split and job.split_status is not None:
+    if include_operations and job.split_status is not None:
         response["splitStatus"] = job.split_status
         response["splitSong"] = job.split_song
         response["splitError"] = job.split_error
+    if include_operations and job.replace_status in {"pending", "running"}:
+        response.update(
+            status=job.replace_status,
+            stage=job.replace_stage,
+            progress=job.replace_progress,
+            message=job.replace_message,
+        )
+    if include_operations and job.replace_status is not None:
+        response["replaceStatus"] = job.replace_status
+        response["replaceSong"] = job.replace_song
+        response["replaceError"] = job.replace_error
     if job.result is not None:
         response["result"] = _render_result_urls(
             job.result,
@@ -1097,6 +1285,9 @@ def _render_result_urls(
                 if isinstance(url, str)
             }
             output["stemUrls"] = list(output["stems"].values())
+        replaced_vocal = output.get("replacedVocal")
+        if isinstance(replaced_vocal, str):
+            output["replacedVocal"] = _public_audio_url(replaced_vocal, base_url, settings)
     return rendered
 
 

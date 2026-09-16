@@ -109,6 +109,20 @@ RVC 默认自动查找 `assets/rvc` 中的模型、索引和 HuBERT/RMVPE 基础
 `RVC_MODEL_PATH`、`RVC_INDEX_PATH` 和 `RVC_BASE_MODEL_DIR` 显式指定。RVC 推理在
 第一次转换时懒加载到 `cuda:0`；默认 `rms_mix_rate=1`，使替换人声沿用原人声的音量包络：
 
+已完成拆轨的生成任务可直接启动后台人声替换，无需重新上传 vocal 文件：
+
+```bash
+curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/replace?song=0'
+```
+
+首次启动返回 `202`；重复启动同一任务返回当前状态，已有可读结果时返回 `200`。
+`GET /api/jobs/<jobId>` 和任务 SSE 会返回 `replaceStatus`、`replaceSong`、`replaceError`，
+运行时顶层 `status/stage/progress/message` 与拆轨任务一致地反映当前操作。完成后歌曲结果增加
+`replacedVocal` 音频 URL。`PATCH /api/jobs/<jobId>` 可取消：由于 RVC 推理线程不能安全强停，
+接口会立即标记取消，并在当前推理安全退出后丢弃产物、释放并发额度。
+
+保留上传文件的同步转换接口供独立调用：
+
 ```bash
 curl -X POST http://127.0.0.1:8010/api/voice/convert \
   -F 'job_id=<jobId>' \

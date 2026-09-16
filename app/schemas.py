@@ -21,6 +21,7 @@ class ErrorResponse(BaseModel):
 
 class MusicOutput(BaseModel):
     fullTrack: str
+    replacedVocal: str | None = Field(default=None, exclude_if=lambda value: value is None)
     durationSeconds: float | None = None
     stems: dict[str, str]
     stemUrls: list[str]
@@ -76,3 +77,6 @@ class GenerationJobResponse(BaseModel):
     splitStatus: Literal["pending", "running", "succeeded", "failed", "cancelled"] | None = None
     splitSong: int | None = None
     splitError: str | None = None
+    replaceStatus: Literal["pending", "running", "succeeded", "failed", "cancelled"] | None = None
+    replaceSong: int | None = None
+    replaceError: str | None = None

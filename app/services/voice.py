@@ -58,13 +58,13 @@ class RVCEngine:
         input_path: Path,
         output_path: Path,
         *,
-        f0_up_key: int,
-        f0_method: str,
-        index_rate: float,
-        filter_radius: int,
-        resample_sr: int,
-        rms_mix_rate: float,
-        protect: float,
+        f0_up_key: int = 0,
+        f0_method: str = "rmvpe",
+        index_rate: float = 0.75,
+        filter_radius: int = 3,
+        resample_sr: int = 0,
+        rms_mix_rate: float = 1.0,
+        protect: float = 0.33,
     ) -> None:
         async with self._lock:
             await asyncio.to_thread(
@@ -281,7 +281,7 @@ def install_voice_api(
             raise HTTPException(status_code=400, detail="Upload an audio file in 'file'")
 
         suffix = _safe_audio_suffix(upload.filename)
-        output_name = f"{_source_song_name(upload.filename, song_name)}_rvc_vocal.wav"
+        output_name = replacement_filename(upload.filename, song_name)
         result_path = _result_path(settings, output_name, job_id, song)
         _job_song_result(request, job_id, song)
         output_dir = result_path.parent
@@ -403,6 +403,10 @@ def _source_song_name(filename: str | None, fallback: str) -> str:
     source = Path(filename).stem if filename else fallback
     source = re.sub(r"_(?:rvc_)?(?:vocal|vocals|voice)$", "", source, flags=re.IGNORECASE)
     return _safe_song_name(source)
+
+
+def replacement_filename(filename: str | None, fallback: str = "converted") -> str:
+    return f"{_source_song_name(filename, fallback)}_rvc_vocal.wav"
 
 
 def _result_path(
