@@ -35,8 +35,8 @@ WORKDIR /app
 
 COPY --from=builder --chown=${APP_UID}:${APP_GID} /app/.venv /app/.venv
 COPY --chown=${APP_UID}:${APP_GID} app ./app
-RUN mkdir -p output assets/rvc/weights assets/rvc/indices assets/rvc/base_model \
-    && chown -R "${APP_UID}:${APP_GID}" output assets
+RUN mkdir -p output .torch-cache assets/rvc/weights assets/rvc/indices assets/rvc/base_model \
+    && chown -R "${APP_UID}:${APP_GID}" output .torch-cache assets
 
 USER app
 EXPOSE 8010
