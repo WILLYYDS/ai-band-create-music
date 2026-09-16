@@ -54,6 +54,10 @@ async def test_health_preserves_legacy_contract(tmp_path: Path) -> None:
     assert body["splitting"]["enabled"] is True
     assert body["splitting"]["mode"] == "on_demand"
     assert body["splitting"]["device"] == "auto"
+    assert body["replacement"] == {
+        "conversionTimeoutSeconds": 1800,
+        "workersHoldingCapacityAfterTerminal": 0,
+    }
     assert body["infrastructure"] == {
         "taskBackend": "inline",
         "cacheBackend": "none",

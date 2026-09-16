@@ -12,6 +12,7 @@ def test_default_port_and_prompt_limit(tmp_path: Path) -> None:
     assert settings.port == 8010
     assert settings.prompt_max_chars == 2000
     assert settings.llm_timeout_seconds == 120
+    assert settings.rvc_conversion_timeout_seconds == 1800
     assert settings.llm_disable_thinking is True
     assert settings.task_backend == "inline"
     assert settings.cache_backend == "none"

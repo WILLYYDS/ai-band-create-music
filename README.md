@@ -115,43 +115,26 @@ RVC 默认自动查找 `assets/rvc` 中的模型、索引和 HuBERT/RMVPE 基础
 curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/replace?song=0'
 ```
 
-首次启动返回 `202`；重复启动同一任务返回当前状态，已有可读结果时返回 `200`。
-`GET /api/jobs/<jobId>` 和任务 SSE 会返回 `replaceStatus`、`replaceSong`、`replaceError`，
-运行时顶层 `status/stage/progress/message` 与拆轨任务一致地反映当前操作。完成后歌曲结果增加
-`replacedVocal` 音频 URL。`PATCH /api/jobs/<jobId>` 可取消：由于 RVC 推理线程不能安全强停，
-接口会立即标记取消，并在当前推理安全退出后丢弃产物、释放并发额度。
+首次启动返回 `202`；重复启动同一任务返回当前状态，已有可读结果时返回 `200`；上一次替换恰好
+超时或取消、推理线程仍在安全收尾时返回 `409`。`GET /api/jobs/<jobId>` 和任务 SSE 会返回
+`replaceStatus`、`replaceSong`、`replaceError`，运行时顶层 `status/stage/progress/message`
+与拆轨任务一致地反映当前操作。完成后歌曲结果增加 `replacedVocal` 音频 URL。转换超过
+`RVC_CONVERSION_TIMEOUT_SECONDS`（默认 1800 秒）会立即标记失败；由于 RVC 推理线程不能安全
+强停，锁和并发额度会保留到线程实际退出，期间产物不会发布。这种"已经终态但线程还没退出"的
+替换数量可以从 `GET /api/health` 的 `replacement.workersHoldingCapacityAfterTerminal` 读到，
+日志里也会在进入收尾和线程退出时各记一条 warning。`PATCH /api/jobs/<jobId>` 可取消：
+接口会立即把 `replaceStatus` 标记为 `cancelled`，但保留已完成生成任务的顶层
+`status=succeeded`；当前推理安全退出后会丢弃产物、释放并发额度。
 
-保留上传文件的同步转换接口供独立调用：
+替换结果与 RVC 模型绑定：`RVC_MODEL_PATH`/`RVC_INDEX_PATH` 内容或 `RVC_MODEL_VERSION` 变化后，
+已缓存的结果会被判定为失效并自动重新推理。失效到新产物落位之间旧文件仍保留在磁盘上（不再
+被 `replacedVocal` 引用），因为新旧产物同名、成功时会被原子覆盖；这样即使重跑失败、超时或
+被取消，上一版可用的替换人声也不会被一并删除。删除该歌曲的 vocal 分轨会同时作废替换结果。
 
-```bash
-curl -X POST http://127.0.0.1:8010/api/voice/convert \
-  -F 'job_id=<jobId>' \
-  -F 'file=@vocal.wav' \
-  -F 'song_name=歌曲名称'
-```
-
-输出保存在 `output/jobs/<jobId>/song_1/<原音乐文件名>_rvc_vocal.wav`。多首生成时以
-从 0 开始的 `song` 表单字段选择歌曲。前端直接使用 `/output/jobs/...wav` URL
-播放或下载；转换接口的 JSON 响应会返回该 URL。`DELETE /api/voice/result`
-软删除结果，`PUT` 恢复结果；
-请求均传 `job_id`、`filename` 和可选的 `song`。
-
-完成创作时直接提交服务端已有的替换人声文件名和三条伴奏 URL；后端使用不衰减音轨的
-FFmpeg 混音，增强人声清晰度，并以分轨前的完整歌曲为基准自适应匹配响度，最后在 -1 dBFS 限峰。
-返回与母带采样率、声道数和 PCM 位深匹配的 WAV。整个混音流程默认 300 秒超时，可通过
-`RVC_MIX_TIMEOUT_SECONDS` 调整：
-
-```bash
-curl -X POST http://127.0.0.1:8010/api/voice/mix \
-  -F 'job_id=<jobId>' \
-  -F 'vocal_filename=歌曲_rvc_vocal.wav' \
-  -F 'drums=/output/jobs/<jobId>/song_1/歌曲_drums.mp3' \
-  -F 'bass=/output/jobs/<jobId>/song_1/歌曲_bass.mp3' \
-  -F 'other=/output/jobs/<jobId>/song_1/歌曲_other.mp3'
-```
-
-转换和混音接口均返回 `{"success":true,"filename":"...wav","url":"/output/jobs/...wav"}`，
-音频由 `/output` 接口以 Range 流式传输。
+替换结果由 `/output/jobs/<jobId>/song_<n>/<原音轨名>_rvc_vocal.wav` 提供，接口返回的
+`replacedVocal` 就是该 URL，前端直接播放或下载。`DELETE /api/voice/result` 软删除替换产物，
+`PUT /api/voice/result` 恢复；两者均传 `job_id`、`filename` 和可选的 `song`，删除后可恢复，
+重新替换则会覆盖同一路径。
 
 生成音乐。`provider` 可传 `minimax_music` 或 `elevenlabs_music`，不传时使用
 `MUSIC_PROVIDER`：

@@ -293,6 +293,15 @@ async def test_split_failure_and_cancel_preserve_completed_generation(tmp_path, 
         assert app.state.jobs[job_id].split_status == "cancelled"
         await asyncio.sleep(0)
         cancelled = (await http.get(f"/api/jobs/{job_id}")).json()
+        cancelled_task = app.state.jobs[job_id].split_task
+        # cancelled 是操作状态；song=0 明确重试刚才取消的同一首歌。
+        retry = await http.post(f"/api/jobs/{job_id}/split?song=0")
+        assert retry.status_code == 202
+        assert retry.json()["splitStatus"] == "pending"
+        assert app.state.jobs[job_id].split_task is not cancelled_task
+        assert not app.state.jobs[job_id].split_task.done()
+        await http.patch(f"/api/jobs/{job_id}", json={"status": "cancelled"})
+        await asyncio.sleep(0)
 
     assert cancelled["status"] == "succeeded"
     assert cancelled["splitStatus"] == "cancelled"

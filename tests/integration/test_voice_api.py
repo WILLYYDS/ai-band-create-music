@@ -5,20 +5,8 @@ from types import SimpleNamespace
 
 import httpx
 
-from app.core.errors import GenerationError
 from app.main import create_app
 from tests.helpers import make_orchestrator, make_settings
-
-
-class FakeVoiceEngine:
-    loaded = True
-
-    async def convert(self, input_path: Path, output_path: Path, **params) -> None:
-        assert input_path.is_file()
-        assert params["f0_method"] == "rmvpe"
-        assert params["index_rate"] == 0.5
-        assert params["rms_mix_rate"] == 1.0
-        output_path.write_bytes(b"RIFF-converted-wav")
 
 
 def seed_job(app, settings, job_id: str) -> Path:
@@ -35,21 +23,21 @@ def seed_job(app, settings, job_id: str) -> Path:
     return song_dir
 
 
-async def test_voice_conversion_download_delete_and_restore(tmp_path: Path) -> None:
+async def test_voice_result_download_delete_and_restore(tmp_path: Path) -> None:
+    """替换结果的下载 / 删除 / 恢复生命周期（前端 replace-complete 正在用这条路径）。"""
     settings = make_settings(tmp_path)
     job_id = "job-1"
-    app = create_app(settings, make_orchestrator(settings), FakeVoiceEngine())
-    seed_job(app, settings, job_id)
+    app = create_app(settings, make_orchestrator(settings))
+    song_dir = seed_job(app, settings, job_id)
+    result_path = song_dir / "real_song_rvc_vocal.wav"
+    result_path.write_bytes(b"RIFF-converted-wav")
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://testserver",
     ) as client:
-        converted = await client.post(
-            "/api/voice/convert",
-            files={"file": ("real_song_vocal.mp3", b"ID3" + b"0" * 20_000, "audio/mpeg")},
-            data={"job_id": job_id, "index_rate": "0.5", "song_name": "AI 生成曲目"},
+        direct_download = await client.get(
+            f"/output/jobs/{job_id}/song_1/real_song_rvc_vocal.wav"
         )
-        direct_download = await client.get(converted.json()["url"])
         deleted = await client.request(
             "DELETE",
             "/api/voice/result",
@@ -62,23 +50,16 @@ async def test_voice_conversion_download_delete_and_restore(tmp_path: Path) -> N
             data={"job_id": job_id, "filename": "real_song_rvc_vocal.wav"},
         )
 
-    assert converted.status_code == 200
-    assert converted.headers["x-rvc-output"] == "real_song_rvc_vocal.wav"
-    assert converted.json() == {
-        "success": True,
-        "filename": "real_song_rvc_vocal.wav",
-        "url": f"/output/jobs/{job_id}/song_1/real_song_rvc_vocal.wav",
-    }
     assert direct_download.content == b"RIFF-converted-wav"
     assert deleted.status_code == 200
     assert missing.status_code == 404
     assert restored.status_code == 200
-    assert (settings.output_dir / "jobs" / job_id / "song_1" / "real_song_rvc_vocal.wav").is_file()
+    assert result_path.is_file()
 
 
 async def test_voice_result_rejects_path_traversal(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    app = create_app(settings, make_orchestrator(settings), FakeVoiceEngine())
+    app = create_app(settings, make_orchestrator(settings))
     seed_job(app, settings, "job-1")
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -101,132 +82,43 @@ async def test_voice_result_rejects_path_traversal(tmp_path: Path) -> None:
         )
     assert response.status_code == 400
 
-    missing_job_dir = settings.output_dir / "jobs" / "job-does-not-exist"
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
-    ) as client:
-        response = await client.post(
-            "/api/voice/convert",
-            files={"file": ("voice.wav", b"RIFF-audio", "audio/wav")},
-            data={"job_id": "job-does-not-exist"},
-        )
-    assert response.status_code == 404
-    assert not missing_job_dir.exists()
 
-    app = create_app(settings, make_orchestrator(settings), FakeVoiceEngine())
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
-    ) as client:
-        response = await client.post(
-            "/api/voice/convert",
-            files={"file": ("voice.wav", b"RIFF-audio", "audio/wav")},
-            data={"job_id": ".."},
-        )
-    assert response.status_code == 400
+async def test_voice_result_accepts_url_shaped_filenames(tmp_path: Path) -> None:
+    """前端会原样回传结果 URL，DELETE/PUT 必须容忍它（历史上前端代理层做过这层归一化）。
 
-
-async def test_voice_mix_uses_server_side_stems(tmp_path: Path, monkeypatch) -> None:
+    只接受裸文件名会让"删除替换人声 → 撤回"在代理层不再归一化时直接 400，
+    进而连撤回后的重新替换也一起失败。
+    """
     settings = make_settings(tmp_path)
     job_id = "job-1"
-    app = create_app(settings, make_orchestrator(settings), FakeVoiceEngine())
+    app = create_app(settings, make_orchestrator(settings))
     song_dir = seed_job(app, settings, job_id)
-    vocal = song_dir / "real_song_rvc_vocal.wav"
-    vocal.write_bytes(b"RIFF-vocal")
-    stems = {}
-    for name in ("drums", "bass", "other"):
-        path = song_dir / f"real_song_{name}.mp3"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"ID3-stem")
-        stems[name] = f"/output/jobs/{job_id}/song_1/{path.name}"
-
-    async def fake_mix(
-        inputs: list[Path],
-        reference_path: Path,
-        output_path: Path,
-        timeout_seconds: float,
-    ) -> None:
-        assert inputs == [
-            vocal,
-            song_dir / "real_song_drums.mp3",
-            song_dir / "real_song_bass.mp3",
-            song_dir / "real_song_other.mp3",
-        ]
-        assert reference_path == song_dir / "full_song.wav"
-        assert timeout_seconds == settings.rvc_mix_timeout_seconds
-        output_path.write_bytes(b"RIFF-mixed")
-
-    monkeypatch.setattr("app.services.voice._mix_tracks", fake_mix)
+    result_path = song_dir / "song_rvc_vocal.wav"
+    result_path.write_bytes(b"RIFF-converted-wav")
+    forms = (
+        "song_rvc_vocal.wav",
+        f"/api/music/output/jobs/{job_id}/song_1/song_rvc_vocal.wav",
+        f"http://127.0.0.1:8010/output/jobs/{job_id}/song_1/song_rvc_vocal.wav",
+        f"http://localhost:3000/api/music/output/jobs/{job_id}/song_1/song_rvc_vocal.wav",
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://testserver"
     ) as client:
-        response = await client.post(
-            "/api/voice/mix",
-            data={"job_id": job_id, "vocal_filename": vocal.name, **stems},
-            headers={"Origin": "https://frontend.example"},
-        )
-        direct_download = await client.get(response.json()["url"])
-
-        (song_dir / "real_song_drums.mp3").unlink()
-        missing = await client.post(
-            "/api/voice/mix",
-            data={"job_id": job_id, "vocal_filename": vocal.name, **stems},
-        )
-        (song_dir / "real_song_drums.mp3").write_bytes(b"ID3-stem")
-
-        async def unavailable(*_args, **_kwargs):
-            raise GenerationError("音频处理需要 ffmpeg 和 ffprobe")
-
-        monkeypatch.setattr("app.services.voice._mix_tracks", unavailable)
-        unavailable_response = await client.post(
-            "/api/voice/mix",
-            data={"job_id": job_id, "vocal_filename": vocal.name, **stems},
-        )
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "success": True,
-        "filename": "real_song_rvc_mix.wav",
-        "url": f"/output/jobs/{job_id}/song_1/real_song_rvc_mix.wav",
-    }
-    assert response.headers["x-mix-output"] == "real_song_rvc_mix.wav"
-    exposed_headers = {
-        value.strip().lower()
-        for value in response.headers["access-control-expose-headers"].split(",")
-    }
-    assert {"content-disposition", "x-mix-output", "x-rvc-model", "x-rvc-output"} <= (
-        exposed_headers
-    )
-    assert direct_download.content == b"RIFF-mixed"
-    assert missing.status_code == 404
-    assert missing.json()["detail"] == "混音输入文件不可读"
-    assert str(song_dir) not in missing.text
-    assert unavailable_response.status_code == 503
-    assert unavailable_response.json()["detail"] == "音频处理需要 ffmpeg 和 ffprobe"
-    assert (song_dir / "real_song_rvc_mix.wav").read_bytes() == b"RIFF-mixed"
-
-
-async def test_voice_mix_respects_shared_capacity(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path)
-    orchestrator = make_orchestrator(settings)
-    app = create_app(settings, orchestrator, FakeVoiceEngine())
-    song_dir = seed_job(app, settings, "job-1")
-    vocal = song_dir / "voice_rvc_vocal.wav"
-    vocal.write_bytes(b"RIFF-vocal")
-    stems = {}
-    for name in ("drums", "bass", "other"):
-        path = song_dir / f"song_{name}.mp3"
-        path.write_bytes(b"ID3-stem")
-        stems[name] = f"/output/jobs/job-1/song_1/{path.name}"
-    await orchestrator.capacity.acquire()
-    try:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
-        ) as client:
-            response = await client.post(
-                "/api/voice/mix",
-                data={"job_id": "job-1", "vocal_filename": vocal.name, **stems},
+        for value in forms:
+            result_path.write_bytes(b"RIFF-converted-wav")
+            deleted = await client.request(
+                "DELETE", "/api/voice/result", data={"job_id": job_id, "filename": value}
             )
-        assert orchestrator.capacity.active == 1
-    finally:
-        await orchestrator.capacity.release()
-    assert response.status_code == 429
+            assert deleted.status_code == 200, value
+            assert not result_path.exists(), value
+            restored = await client.request(
+                "PUT", "/api/voice/result", data={"job_id": job_id, "filename": value}
+            )
+            assert restored.status_code == 200, value
+            assert result_path.is_file(), value
+
+        # 归一化之后仍然禁止路径穿越
+        escaped = await client.request(
+            "DELETE", "/api/voice/result", data={"job_id": job_id, "filename": "../secret.wav"}
+        )
+        assert escaped.status_code == 400
