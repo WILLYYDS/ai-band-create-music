@@ -29,7 +29,7 @@ def summarize_waveform(samples: np.ndarray, bin_count: int = 64) -> list[float]:
     return [round(float(value / maximum), 4) for value in rms]
 
 
-async def extract_waveform(path: Path, bin_count: int = 64) -> list[float]:
+async def extract_waveform(path: Path, bin_count: int = 640) -> list[float]:
     if path.stat().st_size < 128:
         raise RuntimeError(f"音频文件过小，无法提取波形：{path.name}")
     environment = prepare_ffmpeg_environment()
