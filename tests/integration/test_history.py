@@ -14,6 +14,33 @@ def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://testserver")
 
 
+def events_request(app, path: str = "/api/jobs/active/events") -> Request:
+    return Request(
+        {
+            "type": "http",
+            "app": app,
+            "headers": [],
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "path": path,
+            "root_path": "",
+            "query_string": b"",
+            "method": "GET",
+        }
+    )
+
+
+async def time_out(awaitable, *_args, **_kwargs):
+    """让 SSE 循环立刻走一次 15 秒保活超时分支，测试不必真的等待。"""
+    awaitable.close()
+    raise asyncio.TimeoutError
+
+
+def split_waveforms() -> dict[str, list[float]]:
+    """拆轨会连同 "full" 一起重新提取波形，桩函数必须返回同样的音轨集合。"""
+    return {"full": [0.25], **{name: [0.5] for name in ("vocal", "drums", "bass", "other")}}
+
+
 async def test_direct_history_restart(tmp_path):
     settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
@@ -41,6 +68,81 @@ async def test_direct_history_restart(tmp_path):
         assert (await http.get(result["fullTrack"])).content == b"ID3-full-audio"
 
 
+async def test_history_listing_omits_waveform_bins(tmp_path):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
+    bins = [0.5] * 640
+
+    async with client(app) as http:
+        job_id = (await http.post("/api/generate", json={"prompt": "rock", "count": 2})).json()[
+            "jobId"
+        ]
+
+    # 改写落盘记录，模拟带波形的历史任务；重启后按 job.json 重新加载。
+    record = settings.output_dir / "jobs" / job_id / "job.json"
+    stored = json.loads(record.read_text(encoding="utf-8"))
+    stored["result"]["waveforms"] = {"full": bins}
+    stored["result"]["alternatives"][0]["waveforms"] = {"full": bins}
+    record.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+
+    restarted = create_app(settings, orchestrator)
+    async with client(restarted) as http:
+        history = (await http.get("/api/jobs")).json()["jobs"][0]
+        detail = (await http.get(f"/api/jobs/{job_id}")).json()
+
+    # 历史列表只做投影，不携带波形数据；单任务详情仍然返回真实波形。
+    assert history["result"]["waveforms"] == {}
+    assert history["result"]["alternatives"][0]["waveforms"] == {}
+    assert detail["result"]["waveforms"]["full"] == bins
+    assert detail["result"]["alternatives"][0]["waveforms"]["full"] == bins
+    # 投影只是响应层裁剪，落盘的波形不能被改写。
+    assert json.loads(record.read_text(encoding="utf-8"))["result"]["waveforms"]["full"] == bins
+
+
+async def test_split_refreshes_legacy_64_bin_full_waveform(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
+    extract = AsyncMock(
+        return_value={
+            "full": [0.25] * 640,
+            **{name: [0.5] * 640 for name in ("vocal", "drums", "bass", "other")},
+        }
+    )
+    monkeypatch.setattr("app.main.extract_waveforms", extract)
+
+    async with client(app) as http:
+        job_id = (await http.post("/api/generate", json={"prompt": "rock"})).json()["jobId"]
+        # 旧版本持久化的任务：只有 64 个 bin 的完整混音波形。
+        app.state.jobs[job_id].result["waveforms"] = {"full": [0.25] * 64}
+        assert (await http.post(f"/api/jobs/{job_id}/split?song=0")).status_code == 202
+        await app.state.jobs[job_id].split_task
+        completed = (await http.get(f"/api/jobs/{job_id}")).json()
+
+    waveforms = completed["result"]["waveforms"]
+    assert set(waveforms) == {"full", "vocal", "drums", "bass", "other"}
+    # 所有车道必须共享同一个 bin 数量，否则客户端的 x 轴会错位。
+    assert {len(values) for values in waveforms.values()} == {640}
+
+
+async def test_split_keeps_stored_waveforms_when_extraction_fails(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
+    monkeypatch.setattr("app.main.extract_waveforms", AsyncMock(return_value={}))
+
+    async with client(app) as http:
+        job_id = (await http.post("/api/generate", json={"prompt": "rock"})).json()["jobId"]
+        app.state.jobs[job_id].result["waveforms"] = {"full": [0.25] * 64}
+        assert (await http.post(f"/api/jobs/{job_id}/split?song=0")).status_code == 202
+        await app.state.jobs[job_id].split_task
+        completed = (await http.get(f"/api/jobs/{job_id}")).json()
+
+    assert completed["result"]["splitEnabled"] is True
+    assert completed["result"]["waveforms"] == {"full": [0.25] * 64}
+
+
 async def test_history_song_starts_async_split_and_updates_result(tmp_path, monkeypatch):
     settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
@@ -58,13 +160,12 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
             return await original_split(*args, **kwargs)
 
         monkeypatch.setattr(orchestrator.stem_separator, "split", split)
-        monkeypatch.setattr(
-            "app.main.extract_waveforms",
-            AsyncMock(return_value={name: [0.5] for name in ("vocal", "drums", "bass", "other")}),
-        )
+        extract = AsyncMock(return_value=split_waveforms())
+        monkeypatch.setattr("app.main.extract_waveforms", extract)
         accepted = await http.post(f"/api/jobs/{job_id}/split?song=0")
         await asyncio.wait_for(started.wait(), 2)
         running = (await http.get(f"/api/jobs/{job_id}")).json()
+        history_running = (await http.get("/api/jobs")).json()["jobs"][0]
         duplicate = await http.post(f"/api/jobs/{job_id}/split?song=0")
         release.set()
         await app.state.jobs[job_id].split_task
@@ -87,10 +188,18 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
         "splitting",
         76,
     )
+    assert running["splitSong"] == 0
+    assert running["message"] == "Demucs 正在分离音轨"
+    assert history_running["status"] == "succeeded"
+    assert "splitStatus" not in history_running
+    assert history_running["result"]["waveforms"] == {}
     assert completed["status"] == "succeeded"
     assert completed["result"]["splitEnabled"] is True
     assert sorted(completed["result"]["stems"]) == ["bass", "drums", "other", "vocal"]
     assert completed["result"]["waveforms"]["vocal"] == [0.5]
+    # 拆轨必须重新提取 "full"，否则客户端会拿到长度不一致的波形车道。
+    assert set(extract.await_args.args[0]) == {"full", "vocal", "drums", "bass", "other"}
+    assert set(completed["result"]["waveforms"]) == {"full", "vocal", "drums", "bass", "other"}
     assert cached.status_code == 200
     assert cached.json()["status"] == "succeeded"
     cache_guard.assert_not_called()
@@ -117,7 +226,7 @@ async def test_split_reserves_job_before_capacity_await(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "app.main.extract_waveforms",
-        AsyncMock(return_value={name: [0.5] for name in ("vocal", "drums", "bass", "other")}),
+        AsyncMock(return_value=split_waveforms()),
     )
     async with client(app) as http:
         job_id = (await http.post("/api/generate", json={"prompt": "rock", "count": 2})).json()[
@@ -137,6 +246,8 @@ async def test_split_reserves_job_before_capacity_await(tmp_path, monkeypatch):
     assert other_song.status_code == 409
     assert "第 1 首" in other_song.json()["message"]
     assert app.state.jobs[job_id].status == "succeeded"
+    assert app.state.jobs[job_id].result["stems"]
+    assert app.state.jobs[job_id].result["alternatives"][0]["stems"] == {}
 
 
 async def test_split_failure_and_cancel_preserve_completed_generation(tmp_path, monkeypatch):
@@ -157,10 +268,14 @@ async def test_split_failure_and_cancel_preserve_completed_generation(tmp_path, 
 
     assert failed["status"] == "succeeded"
     assert failed["splitStatus"] == "failed"
+    assert failed["splitSong"] == 0
     assert failed["splitError"] == "音轨分离失败，请检查服务配置后重试。"
     assert "secret" not in json.dumps(failed)
     assert app.state.jobs[job_id].status == "succeeded"
     assert load_jobs(settings.output_dir)[job_id].status == "succeeded"
+    async with client(app) as http:
+        history_job = (await http.get("/api/jobs")).json()["jobs"][0]
+    assert "splitError" not in history_job
     async with client(create_app(settings, orchestrator)) as http:
         assert (await http.get(f"/api/jobs/{job_id}")).json()["status"] == "succeeded"
 
@@ -341,29 +456,79 @@ async def test_job_events_keep_alive_after_timeout(tmp_path, monkeypatch):
     endpoint = next(
         route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
     )
-    request = Request(
-        {
-            "type": "http",
-            "app": app,
-            "headers": [],
-            "scheme": "http",
-            "server": ("testserver", 80),
-            "path": "/api/jobs/active/events",
-            "root_path": "",
-            "query_string": b"",
-            "method": "GET",
-        }
-    )
-
-    async def time_out(awaitable, *_args, **_kwargs):
-        awaitable.close()
-        raise asyncio.TimeoutError
-
     monkeypatch.setattr(asyncio, "wait_for", time_out)
-    response = await endpoint("active", request)
+    response = await endpoint("active", events_request(app))
     assert (await anext(response.body_iterator)).startswith("data: ")
     assert await anext(response.body_iterator) == ": keep-alive\n\n"
     await response.body_iterator.aclose()
+
+
+async def test_job_events_send_waveforms_only_in_done_frame(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    bins = [0.5] * 640
+    job = GenerationJob(job_id="active", prompt="rock", status="running", stage="music")
+    job.result = {"fullTrack": "song_1/full.mp3", "waveforms": {"full": bins}}
+    app.state.jobs[job.job_id] = job
+    endpoint = next(
+        route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
+    )
+    monkeypatch.setattr(asyncio, "wait_for", time_out)
+    response = await endpoint("active", events_request(app))
+
+    progress = await anext(response.body_iterator)
+    assert await anext(response.body_iterator) == ": keep-alive\n\n"
+    job.status = "succeeded"
+    job.stage = "completed"
+    done = await anext(response.body_iterator)
+    await response.body_iterator.aclose()
+
+    payload = json.loads(progress.removeprefix("data: "))
+    assert payload["status"] == "running"
+    # 中间帧只推阶段进度：每 15 秒一次的保活不该重发整份 640-bin 波形。
+    assert payload["result"]["waveforms"] == {}
+    assert done.startswith("event: done\ndata: ")
+    completed = json.loads(done.split("data: ", 1)[1])
+    assert completed["status"] == "succeeded"
+    assert completed["result"]["waveforms"] == {"full": bins}
+
+
+async def test_job_events_omit_waveforms_while_split_runs(tmp_path, monkeypatch):
+    """分轨会把 status 覆盖成 running，所以 SSE 要一直推流到分轨收尾为止。"""
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    bins = [0.5] * 640
+    job = GenerationJob(job_id="active", prompt="rock", status="succeeded", stage="completed")
+    job.result = {"fullTrack": "song_1/full.mp3", "waveforms": {"full": bins}}
+    job.split_status = "running"
+    job.split_stage = "waveform"
+    job.split_progress = 90
+    job.split_message = "正在提取真实波形"
+    app.state.jobs[job.job_id] = job
+    endpoint = next(
+        route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
+    )
+    monkeypatch.setattr(asyncio, "wait_for", time_out)
+    response = await endpoint("active", events_request(app))
+
+    splitting = await anext(response.body_iterator)
+    assert await anext(response.body_iterator) == ": keep-alive\n\n"
+    job.split_status = "succeeded"
+    job.split_stage = "completed"
+    job.split_progress = 100
+    done = await anext(response.body_iterator)
+    await response.body_iterator.aclose()
+
+    payload = json.loads(splitting.removeprefix("data: "))
+    assert payload["status"] == "running"
+    assert (payload["stage"], payload["progress"]) == ("waveform", 90)
+    assert payload["message"] == "正在提取真实波形"
+    assert payload["splitStatus"] == "running"
+    # 分轨期间 result 不会变化，波形只随 done 帧下发。
+    assert payload["result"]["waveforms"] == {}
+    completed = json.loads(done.split("data: ", 1)[1])
+    assert completed["status"] == "succeeded"
+    assert completed["result"]["waveforms"] == {"full": bins}
 
 
 async def test_direct_failure_is_persisted(tmp_path):

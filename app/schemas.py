@@ -74,4 +74,5 @@ class GenerationJobResponse(BaseModel):
     result: GenerateResponse | None = None
     error: str | None = None
     splitStatus: Literal["pending", "running", "succeeded", "failed", "cancelled"] | None = None
+    splitSong: int | None = None
     splitError: str | None = None

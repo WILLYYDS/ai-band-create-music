@@ -46,7 +46,7 @@ from app.services.prompt import OpenAICompatiblePromptExpander, effective_llm_ou
 from app.services.providers import create_music_provider
 from app.services.stems import DemucsStemSeparator
 from app.services.voice import RVCEngine, install_voice_api
-from app.services.waveforms import extract_waveforms
+from app.services.waveforms import extract_waveforms, merge_waveform_sets
 
 logger = logging.getLogger(__name__)
 SPLIT_PROGRESS = 76
@@ -589,7 +589,13 @@ def create_app(
     async def generation_history(request: Request):
         return {
             "jobs": [
-                _job_response(job, request, application_settings)
+                _job_response(
+                    job,
+                    request,
+                    application_settings,
+                    include_split=False,
+                    include_waveforms=False,
+                )
                 for job in sorted(
                     request.app.state.jobs.values(), key=lambda job: job.created_at, reverse=True
                 )
@@ -611,8 +617,16 @@ def create_app(
             subscribers.add(queue)
             try:
                 while True:
-                    payload = _job_response(job, request, application_settings)
-                    if payload["status"] not in {"pending", "running"}:
+                    # 判据是"即将推送给客户端的状态"：分轨进行中时会覆盖 job.status。
+                    status = _split_status_override(job) or job.status
+                    final = status not in {"pending", "running"}
+                    # 任务结束前 result 不会变：分轨只在收尾那一刻一次性写入 stems 和波形，
+                    # 紧接着 status 就变成终态。所以中间帧只推阶段进度，真实波形留给 done
+                    # 帧——否则每次 15 秒保活超时都会重推一整份 640-bin 波形。
+                    payload = _job_response(
+                        job, request, application_settings, include_waveforms=final
+                    )
+                    if final:
                         yield f"event: done\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
                         return
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -705,7 +719,7 @@ def create_app(
         job.split_status = "pending"
         job.split_stage = "splitting"
         job.split_progress = SPLIT_PROGRESS
-        job.split_message = f"Demucs 正在分离第 {song + 1} 首"
+        job.split_message = "Demucs 正在分离音轨"
         job.split_error = None
         try:
             await active_orchestrator.capacity.acquire()
@@ -745,21 +759,22 @@ def create_app(
                 }
                 job.split_stage = "waveform"
                 job.split_progress = WAVEFORM_PROGRESS
-                job.split_message = f"正在提取第 {song + 1} 首真实波形"
+                job.split_message = "正在提取真实波形"
                 publish()
-                stem_waveforms = await extract_waveforms(
+                # 连同完整混音一起重新提取：本 PR 之前的任务把 "full" 存成 64 个 bin，
+                # 直接与 640 个 bin 的分轨合并会让客户端拿到长度不一致的波形。
+                fresh_waveforms = await extract_waveforms(
                     {
-                        name: application_settings.output_dir / relative_output / file_name
-                        for name, file_name in split_result.files.items()
+                        "full": full_path,
+                        **{
+                            name: application_settings.output_dir / relative_output / file_name
+                            for name, file_name in split_result.files.items()
+                        },
                     }
                 )
-                waveforms = result.get("waveforms")
                 result["stems"] = stems
                 result["stemUrls"] = list(stems.values())
-                result["waveforms"] = {
-                    **(waveforms if isinstance(waveforms, dict) else {}),
-                    **stem_waveforms,
-                }
+                result["waveforms"] = merge_waveform_sets(result.get("waveforms"), fresh_waveforms)
                 result["splitEnabled"] = bool(stems)
                 debug = result.get("debug")
                 if not isinstance(debug, dict):
@@ -1016,29 +1031,58 @@ def _public_base_url(request: Request, settings: Settings) -> str:
     return settings.public_base_url or str(request.base_url).rstrip("/")
 
 
-def _job_response(job: GenerationJob, request: Request, settings: Settings) -> dict[str, Any]:
-    response = job.response()
+def _split_status_override(job: GenerationJob) -> str | None:
+    """返回进行中的分轨强加给任务响应的状态；没有分轨在跑时返回 None。
+
+    分轨接口（`POST /api/jobs/{job_id}/split`）只在任务结束后才允许调用，所以 Demucs
+    工作期间任务自身早已是终态（"succeeded"），客户端——包括必须在整个分轨期间保持
+    打开的 SSE 流——要看到的是分轨的 "pending"/"running"。规则集中放在这里，避免各个
+    调用点各自推导。
+    """
     if job.split_status in {"pending", "running"}:
+        return job.split_status
+    return None
+
+
+def _job_response(
+    job: GenerationJob,
+    request: Request,
+    settings: Settings,
+    *,
+    include_split: bool = True,
+    include_waveforms: bool = True,
+) -> dict[str, Any]:
+    response = job.response()
+    split_status = _split_status_override(job)
+    if include_split and split_status is not None:
         response.update(
-            status=job.split_status,
+            status=split_status,
             stage=job.split_stage,
             progress=job.split_progress,
             message=job.split_message,
         )
-    if job.split_status is not None:
+    if include_split and job.split_status is not None:
         response["splitStatus"] = job.split_status
+        response["splitSong"] = job.split_song
         response["splitError"] = job.split_error
     if job.result is not None:
         response["result"] = _render_result_urls(
-            job.result, _public_base_url(request, settings), settings
+            job.result,
+            _public_base_url(request, settings),
+            settings,
+            include_waveforms=include_waveforms,
         )
     return response
 
 
 def _render_result_urls(
-    result: dict[str, Any], base_url: str, settings: Settings
+    result: dict[str, Any],
+    base_url: str,
+    settings: Settings,
+    *,
+    include_waveforms: bool = True,
 ) -> dict[str, Any]:
-    rendered = copy.deepcopy(result)
+    rendered = copy.deepcopy(result if include_waveforms else _without_waveforms(result))
     for output in [rendered, *rendered.get("alternatives", [])]:
         if not isinstance(output, dict):
             continue
@@ -1054,6 +1098,25 @@ def _render_result_urls(
             }
             output["stemUrls"] = list(output["stems"].values())
     return rendered
+
+
+def _without_waveforms(result: dict[str, Any]) -> dict[str, Any]:
+    """浅拷贝一份任务结果，把波形包络清空。
+
+    两个调用方都只需要拿一次波形：`GET /api/jobs` 会投影每个已存任务（每个最多两首
+    歌），且不绘制分轨编辑器车道；SSE 流则因为任务进入终态前 result 不会变化，却在
+    整个分轨期间每 15 秒保活一次就重发一帧。这两处带上波形只会放大响应体和上面的
+    深拷贝。这里清空键而不是删除，是为了保持文档化的响应结构稳定；需要真实波形请走
+    `GET /api/jobs/{job_id}` 或终态 done 帧。拷贝是浅拷贝，不会改动任务自己存的波形。
+    """
+    projected = {key: value for key, value in result.items() if key != "waveforms"}
+    projected["waveforms"] = {}
+    alternatives = result.get("alternatives")
+    if isinstance(alternatives, list):
+        projected["alternatives"] = [
+            _without_waveforms(item) if isinstance(item, dict) else item for item in alternatives
+        ]
+    return projected
 
 
 def _public_audio_url(audio_url: str, base_url: str, settings: Settings) -> str:

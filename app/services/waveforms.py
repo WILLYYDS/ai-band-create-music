@@ -10,9 +10,19 @@ from app.services.stems import prepare_ffmpeg_environment
 
 logger = logging.getLogger(__name__)
 
+# 多轨编辑器按车道满宽绘制波形包络：64 个 bin 只画出几个色块，640 个才像波形。
+# 该值必须同时作为 summarize_waveform 与 extract_waveform 的默认值，否则同一次拆轨
+# 里 "full" 与各分轨的 bin 数量不一致，客户端的公共 x 轴会错位。
+WAVEFORM_BIN_COUNT = 640
 
-def summarize_waveform(samples: np.ndarray, bin_count: int = 64) -> list[float]:
-    """Reduce mono PCM samples to normalized RMS bins for compact UI rendering."""
+
+def summarize_waveform(samples: np.ndarray, bin_count: int = WAVEFORM_BIN_COUNT) -> list[float]:
+    """Reduce mono PCM samples to normalized RMS bins for the multitrack editor.
+
+    640 bins is what the editor lanes draw at full width; at 64 the envelope reads as
+    a few blobs instead of a waveform. The default is shared with
+    :func:`extract_waveform` so every lane of one song carries the same bin count.
+    """
     if samples.size == 0 or bin_count <= 0:
         return []
     edges = np.linspace(0, samples.size, min(bin_count, samples.size) + 1, dtype=int)
@@ -29,7 +39,7 @@ def summarize_waveform(samples: np.ndarray, bin_count: int = 64) -> list[float]:
     return [round(float(value / maximum), 4) for value in rms]
 
 
-async def extract_waveform(path: Path, bin_count: int = 64) -> list[float]:
+async def extract_waveform(path: Path, bin_count: int = WAVEFORM_BIN_COUNT) -> list[float]:
     if path.stat().st_size < 128:
         raise RuntimeError(f"音频文件过小，无法提取波形：{path.name}")
     environment = prepare_ffmpeg_environment()
@@ -77,3 +87,19 @@ async def extract_waveforms(paths: dict[str, Path]) -> dict[str, list[float]]:
 
     results = await asyncio.gather(*(extract(name, path) for name, path in paths.items()))
     return {result[0]: result[1] for result in results if result is not None and result[1]}
+
+
+def merge_waveform_sets(previous: object, fresh: dict[str, list[float]]) -> dict[str, list[float]]:
+    """Return the waveform map to store for a freshly split song.
+
+    A split re-extracts and rewrites every lane, so the fresh bins replace the stored
+    map rather than merging into it: jobs persisted before the 640-bin change hold a
+    64-bin ``"full"`` envelope, and merging 640-bin stems into it would hand clients
+    lanes of different lengths on one shared x-axis. A stale lane we could not
+    re-extract is dropped instead of shipped mismatched, and the stored map is only
+    kept when extraction produced nothing at all, so an ffmpeg failure cannot drop
+    waveforms that were already persisted.
+    """
+    if fresh:
+        return dict(fresh)
+    return dict(previous) if isinstance(previous, dict) else {}
