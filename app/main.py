@@ -589,7 +589,7 @@ def create_app(
     async def generation_history(request: Request):
         return {
             "jobs": [
-                _job_response(job, request, application_settings)
+                _job_response(job, request, application_settings, include_split=False)
                 for job in sorted(
                     request.app.state.jobs.values(), key=lambda job: job.created_at, reverse=True
                 )
@@ -705,7 +705,7 @@ def create_app(
         job.split_status = "pending"
         job.split_stage = "splitting"
         job.split_progress = SPLIT_PROGRESS
-        job.split_message = f"Demucs 正在分离第 {song + 1} 首"
+        job.split_message = "Demucs 正在分离音轨"
         job.split_error = None
         try:
             await active_orchestrator.capacity.acquire()
@@ -745,7 +745,7 @@ def create_app(
                 }
                 job.split_stage = "waveform"
                 job.split_progress = WAVEFORM_PROGRESS
-                job.split_message = f"正在提取第 {song + 1} 首真实波形"
+                job.split_message = "正在提取真实波形"
                 publish()
                 stem_waveforms = await extract_waveforms(
                     {
@@ -1016,17 +1016,24 @@ def _public_base_url(request: Request, settings: Settings) -> str:
     return settings.public_base_url or str(request.base_url).rstrip("/")
 
 
-def _job_response(job: GenerationJob, request: Request, settings: Settings) -> dict[str, Any]:
+def _job_response(
+    job: GenerationJob,
+    request: Request,
+    settings: Settings,
+    *,
+    include_split: bool = True,
+) -> dict[str, Any]:
     response = job.response()
-    if job.split_status in {"pending", "running"}:
+    if include_split and job.split_status in {"pending", "running"}:
         response.update(
             status=job.split_status,
             stage=job.split_stage,
             progress=job.split_progress,
             message=job.split_message,
         )
-    if job.split_status is not None:
+    if include_split and job.split_status is not None:
         response["splitStatus"] = job.split_status
+        response["splitSong"] = job.split_song
         response["splitError"] = job.split_error
     if job.result is not None:
         response["result"] = _render_result_urls(
