@@ -14,6 +14,11 @@ def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://testserver")
 
 
+def split_waveforms() -> dict[str, list[float]]:
+    """拆轨会连同 "full" 一起重新提取波形，桩函数必须返回同样的音轨集合。"""
+    return {"full": [0.25], **{name: [0.5] for name in ("vocal", "drums", "bass", "other")}}
+
+
 async def test_direct_history_restart(tmp_path):
     settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
@@ -41,6 +46,81 @@ async def test_direct_history_restart(tmp_path):
         assert (await http.get(result["fullTrack"])).content == b"ID3-full-audio"
 
 
+async def test_history_listing_omits_waveform_bins(tmp_path):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
+    bins = [0.5] * 640
+
+    async with client(app) as http:
+        job_id = (await http.post("/api/generate", json={"prompt": "rock", "count": 2})).json()[
+            "jobId"
+        ]
+
+    # 改写落盘记录，模拟带波形的历史任务；重启后按 job.json 重新加载。
+    record = settings.output_dir / "jobs" / job_id / "job.json"
+    stored = json.loads(record.read_text(encoding="utf-8"))
+    stored["result"]["waveforms"] = {"full": bins}
+    stored["result"]["alternatives"][0]["waveforms"] = {"full": bins}
+    record.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+
+    restarted = create_app(settings, orchestrator)
+    async with client(restarted) as http:
+        history = (await http.get("/api/jobs")).json()["jobs"][0]
+        detail = (await http.get(f"/api/jobs/{job_id}")).json()
+
+    # 历史列表只做投影，不携带波形数据；单任务详情仍然返回真实波形。
+    assert history["result"]["waveforms"] == {}
+    assert history["result"]["alternatives"][0]["waveforms"] == {}
+    assert detail["result"]["waveforms"]["full"] == bins
+    assert detail["result"]["alternatives"][0]["waveforms"]["full"] == bins
+    # 投影只是响应层裁剪，落盘的波形不能被改写。
+    assert json.loads(record.read_text(encoding="utf-8"))["result"]["waveforms"]["full"] == bins
+
+
+async def test_split_refreshes_legacy_64_bin_full_waveform(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
+    extract = AsyncMock(
+        return_value={
+            "full": [0.25] * 640,
+            **{name: [0.5] * 640 for name in ("vocal", "drums", "bass", "other")},
+        }
+    )
+    monkeypatch.setattr("app.main.extract_waveforms", extract)
+
+    async with client(app) as http:
+        job_id = (await http.post("/api/generate", json={"prompt": "rock"})).json()["jobId"]
+        # 旧版本持久化的任务：只有 64 个 bin 的完整混音波形。
+        app.state.jobs[job_id].result["waveforms"] = {"full": [0.25] * 64}
+        assert (await http.post(f"/api/jobs/{job_id}/split?song=0")).status_code == 202
+        await app.state.jobs[job_id].split_task
+        completed = (await http.get(f"/api/jobs/{job_id}")).json()
+
+    waveforms = completed["result"]["waveforms"]
+    assert set(waveforms) == {"full", "vocal", "drums", "bass", "other"}
+    # 所有车道必须共享同一个 bin 数量，否则客户端的 x 轴会错位。
+    assert {len(values) for values in waveforms.values()} == {640}
+
+
+async def test_split_keeps_stored_waveforms_when_extraction_fails(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
+    monkeypatch.setattr("app.main.extract_waveforms", AsyncMock(return_value={}))
+
+    async with client(app) as http:
+        job_id = (await http.post("/api/generate", json={"prompt": "rock"})).json()["jobId"]
+        app.state.jobs[job_id].result["waveforms"] = {"full": [0.25] * 64}
+        assert (await http.post(f"/api/jobs/{job_id}/split?song=0")).status_code == 202
+        await app.state.jobs[job_id].split_task
+        completed = (await http.get(f"/api/jobs/{job_id}")).json()
+
+    assert completed["result"]["splitEnabled"] is True
+    assert completed["result"]["waveforms"] == {"full": [0.25] * 64}
+
+
 async def test_history_song_starts_async_split_and_updates_result(tmp_path, monkeypatch):
     settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
@@ -58,10 +138,8 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
             return await original_split(*args, **kwargs)
 
         monkeypatch.setattr(orchestrator.stem_separator, "split", split)
-        monkeypatch.setattr(
-            "app.main.extract_waveforms",
-            AsyncMock(return_value={name: [0.5] for name in ("vocal", "drums", "bass", "other")}),
-        )
+        extract = AsyncMock(return_value=split_waveforms())
+        monkeypatch.setattr("app.main.extract_waveforms", extract)
         accepted = await http.post(f"/api/jobs/{job_id}/split?song=0")
         await asyncio.wait_for(started.wait(), 2)
         running = (await http.get(f"/api/jobs/{job_id}")).json()
@@ -92,10 +170,14 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
     assert running["message"] == "Demucs 正在分离音轨"
     assert history_running["status"] == "succeeded"
     assert "splitStatus" not in history_running
+    assert history_running["result"]["waveforms"] == {}
     assert completed["status"] == "succeeded"
     assert completed["result"]["splitEnabled"] is True
     assert sorted(completed["result"]["stems"]) == ["bass", "drums", "other", "vocal"]
     assert completed["result"]["waveforms"]["vocal"] == [0.5]
+    # 拆轨必须重新提取 "full"，否则客户端会拿到长度不一致的波形车道。
+    assert set(extract.await_args.args[0]) == {"full", "vocal", "drums", "bass", "other"}
+    assert set(completed["result"]["waveforms"]) == {"full", "vocal", "drums", "bass", "other"}
     assert cached.status_code == 200
     assert cached.json()["status"] == "succeeded"
     cache_guard.assert_not_called()
@@ -122,7 +204,7 @@ async def test_split_reserves_job_before_capacity_await(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "app.main.extract_waveforms",
-        AsyncMock(return_value={name: [0.5] for name in ("vocal", "drums", "bass", "other")}),
+        AsyncMock(return_value=split_waveforms()),
     )
     async with client(app) as http:
         job_id = (await http.post("/api/generate", json={"prompt": "rock", "count": 2})).json()[

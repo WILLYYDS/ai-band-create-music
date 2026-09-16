@@ -46,7 +46,7 @@ from app.services.prompt import OpenAICompatiblePromptExpander, effective_llm_ou
 from app.services.providers import create_music_provider
 from app.services.stems import DemucsStemSeparator
 from app.services.voice import RVCEngine, install_voice_api
-from app.services.waveforms import extract_waveforms
+from app.services.waveforms import extract_waveforms, merge_waveform_sets
 
 logger = logging.getLogger(__name__)
 SPLIT_PROGRESS = 76
@@ -589,7 +589,13 @@ def create_app(
     async def generation_history(request: Request):
         return {
             "jobs": [
-                _job_response(job, request, application_settings, include_split=False)
+                _job_response(
+                    job,
+                    request,
+                    application_settings,
+                    include_split=False,
+                    include_waveforms=False,
+                )
                 for job in sorted(
                     request.app.state.jobs.values(), key=lambda job: job.created_at, reverse=True
                 )
@@ -747,19 +753,20 @@ def create_app(
                 job.split_progress = WAVEFORM_PROGRESS
                 job.split_message = "正在提取真实波形"
                 publish()
-                stem_waveforms = await extract_waveforms(
+                # 连同完整混音一起重新提取：本 PR 之前的任务把 "full" 存成 64 个 bin，
+                # 直接与 640 个 bin 的分轨合并会让客户端拿到长度不一致的波形。
+                fresh_waveforms = await extract_waveforms(
                     {
-                        name: application_settings.output_dir / relative_output / file_name
-                        for name, file_name in split_result.files.items()
+                        "full": full_path,
+                        **{
+                            name: application_settings.output_dir / relative_output / file_name
+                            for name, file_name in split_result.files.items()
+                        },
                     }
                 )
-                waveforms = result.get("waveforms")
                 result["stems"] = stems
                 result["stemUrls"] = list(stems.values())
-                result["waveforms"] = {
-                    **(waveforms if isinstance(waveforms, dict) else {}),
-                    **stem_waveforms,
-                }
+                result["waveforms"] = merge_waveform_sets(result.get("waveforms"), fresh_waveforms)
                 result["splitEnabled"] = bool(stems)
                 debug = result.get("debug")
                 if not isinstance(debug, dict):
@@ -1022,6 +1029,7 @@ def _job_response(
     settings: Settings,
     *,
     include_split: bool = True,
+    include_waveforms: bool = True,
 ) -> dict[str, Any]:
     response = job.response()
     if include_split and job.split_status in {"pending", "running"}:
@@ -1037,15 +1045,22 @@ def _job_response(
         response["splitError"] = job.split_error
     if job.result is not None:
         response["result"] = _render_result_urls(
-            job.result, _public_base_url(request, settings), settings
+            job.result,
+            _public_base_url(request, settings),
+            settings,
+            include_waveforms=include_waveforms,
         )
     return response
 
 
 def _render_result_urls(
-    result: dict[str, Any], base_url: str, settings: Settings
+    result: dict[str, Any],
+    base_url: str,
+    settings: Settings,
+    *,
+    include_waveforms: bool = True,
 ) -> dict[str, Any]:
-    rendered = copy.deepcopy(result)
+    rendered = copy.deepcopy(result if include_waveforms else _without_waveforms(result))
     for output in [rendered, *rendered.get("alternatives", [])]:
         if not isinstance(output, dict):
             continue
@@ -1061,6 +1076,25 @@ def _render_result_urls(
             }
             output["stemUrls"] = list(output["stems"].values())
     return rendered
+
+
+def _without_waveforms(result: dict[str, Any]) -> dict[str, Any]:
+    """Shallow-copy a job result with the waveform bins blanked out.
+
+    ``GET /api/jobs`` projects every stored task (each with up to two songs) and never
+    draws the split editor lanes, so shipping the bins there only inflates the payload
+    and the deep copy above. The key is emptied rather than dropped so the documented
+    response shape stays stable; use ``GET /api/jobs/{job_id}`` for the real bins. The
+    copy is shallow, so the job's own stored waveforms are never touched.
+    """
+    projected = {key: value for key, value in result.items() if key != "waveforms"}
+    projected["waveforms"] = {}
+    alternatives = result.get("alternatives")
+    if isinstance(alternatives, list):
+        projected["alternatives"] = [
+            _without_waveforms(item) if isinstance(item, dict) else item for item in alternatives
+        ]
+    return projected
 
 
 def _public_audio_url(audio_url: str, base_url: str, settings: Settings) -> str:
