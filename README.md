@@ -209,6 +209,10 @@ stems, stemUrls, waveforms, splitEnabled, debug
 
 - `GET /api/jobs/{jobId}` 返回真实包络；`GET /api/jobs` 是历史列表投影，其中的
   `waveforms` 一律为空对象 `{}`（列表不绘制编辑器车道，避免按任务数放大响应体积）。
+- `GET /api/jobs/{jobId}/events` 只在终态 `done` 帧里带真实波形，中间帧的 `waveforms`
+  同样是 `{}`：任务结束前 `result` 不会变化（分轨也在收尾那一刻才写入波形），而分轨
+  期间的中间帧每 15 秒就会被保活超时重推一次，带上波形等于把同一份 640-bin 包络重复
+  发送二十多次。需要随时拿真实包络时走 `GET /api/jobs/{jobId}`。
 - 拆轨时会连同 `full` 一起重新提取波形：早期版本把 `full` 存成 64 个 bin，重新提取后
   同一首歌的所有车道都统一为 640 个 bin，不会出现长短不一的车道。
 

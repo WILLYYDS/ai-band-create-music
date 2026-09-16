@@ -617,8 +617,16 @@ def create_app(
             subscribers.add(queue)
             try:
                 while True:
-                    payload = _job_response(job, request, application_settings)
-                    if payload["status"] not in {"pending", "running"}:
+                    # 判据是"即将推送给客户端的状态"：分轨进行中时会覆盖 job.status。
+                    status = _split_status_override(job) or job.status
+                    final = status not in {"pending", "running"}
+                    # 任务结束前 result 不会变：分轨只在收尾那一刻一次性写入 stems 和波形，
+                    # 紧接着 status 就变成终态。所以中间帧只推阶段进度，真实波形留给 done
+                    # 帧——否则每次 15 秒保活超时都会重推一整份 640-bin 波形。
+                    payload = _job_response(
+                        job, request, application_settings, include_waveforms=final
+                    )
+                    if final:
                         yield f"event: done\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
                         return
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -1023,6 +1031,19 @@ def _public_base_url(request: Request, settings: Settings) -> str:
     return settings.public_base_url or str(request.base_url).rstrip("/")
 
 
+def _split_status_override(job: GenerationJob) -> str | None:
+    """返回进行中的分轨强加给任务响应的状态；没有分轨在跑时返回 None。
+
+    分轨接口（`POST /api/jobs/{job_id}/split`）只在任务结束后才允许调用，所以 Demucs
+    工作期间任务自身早已是终态（"succeeded"），客户端——包括必须在整个分轨期间保持
+    打开的 SSE 流——要看到的是分轨的 "pending"/"running"。规则集中放在这里，避免各个
+    调用点各自推导。
+    """
+    if job.split_status in {"pending", "running"}:
+        return job.split_status
+    return None
+
+
 def _job_response(
     job: GenerationJob,
     request: Request,
@@ -1032,9 +1053,10 @@ def _job_response(
     include_waveforms: bool = True,
 ) -> dict[str, Any]:
     response = job.response()
-    if include_split and job.split_status in {"pending", "running"}:
+    split_status = _split_status_override(job)
+    if include_split and split_status is not None:
         response.update(
-            status=job.split_status,
+            status=split_status,
             stage=job.split_stage,
             progress=job.split_progress,
             message=job.split_message,
@@ -1079,13 +1101,13 @@ def _render_result_urls(
 
 
 def _without_waveforms(result: dict[str, Any]) -> dict[str, Any]:
-    """Shallow-copy a job result with the waveform bins blanked out.
+    """浅拷贝一份任务结果，把波形包络清空。
 
-    ``GET /api/jobs`` projects every stored task (each with up to two songs) and never
-    draws the split editor lanes, so shipping the bins there only inflates the payload
-    and the deep copy above. The key is emptied rather than dropped so the documented
-    response shape stays stable; use ``GET /api/jobs/{job_id}`` for the real bins. The
-    copy is shallow, so the job's own stored waveforms are never touched.
+    两个调用方都只需要拿一次波形：`GET /api/jobs` 会投影每个已存任务（每个最多两首
+    歌），且不绘制分轨编辑器车道；SSE 流则因为任务进入终态前 result 不会变化，却在
+    整个分轨期间每 15 秒保活一次就重发一帧。这两处带上波形只会放大响应体和上面的
+    深拷贝。这里清空键而不是删除，是为了保持文档化的响应结构稳定；需要真实波形请走
+    `GET /api/jobs/{job_id}` 或终态 done 帧。拷贝是浅拷贝，不会改动任务自己存的波形。
     """
     projected = {key: value for key, value in result.items() if key != "waveforms"}
     projected["waveforms"] = {}

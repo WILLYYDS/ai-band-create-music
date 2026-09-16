@@ -14,6 +14,28 @@ def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://testserver")
 
 
+def events_request(app, path: str = "/api/jobs/active/events") -> Request:
+    return Request(
+        {
+            "type": "http",
+            "app": app,
+            "headers": [],
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "path": path,
+            "root_path": "",
+            "query_string": b"",
+            "method": "GET",
+        }
+    )
+
+
+async def time_out(awaitable, *_args, **_kwargs):
+    """让 SSE 循环立刻走一次 15 秒保活超时分支，测试不必真的等待。"""
+    awaitable.close()
+    raise asyncio.TimeoutError
+
+
 def split_waveforms() -> dict[str, list[float]]:
     """拆轨会连同 "full" 一起重新提取波形，桩函数必须返回同样的音轨集合。"""
     return {"full": [0.25], **{name: [0.5] for name in ("vocal", "drums", "bass", "other")}}
@@ -434,29 +456,79 @@ async def test_job_events_keep_alive_after_timeout(tmp_path, monkeypatch):
     endpoint = next(
         route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
     )
-    request = Request(
-        {
-            "type": "http",
-            "app": app,
-            "headers": [],
-            "scheme": "http",
-            "server": ("testserver", 80),
-            "path": "/api/jobs/active/events",
-            "root_path": "",
-            "query_string": b"",
-            "method": "GET",
-        }
-    )
-
-    async def time_out(awaitable, *_args, **_kwargs):
-        awaitable.close()
-        raise asyncio.TimeoutError
-
     monkeypatch.setattr(asyncio, "wait_for", time_out)
-    response = await endpoint("active", request)
+    response = await endpoint("active", events_request(app))
     assert (await anext(response.body_iterator)).startswith("data: ")
     assert await anext(response.body_iterator) == ": keep-alive\n\n"
     await response.body_iterator.aclose()
+
+
+async def test_job_events_send_waveforms_only_in_done_frame(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    bins = [0.5] * 640
+    job = GenerationJob(job_id="active", prompt="rock", status="running", stage="music")
+    job.result = {"fullTrack": "song_1/full.mp3", "waveforms": {"full": bins}}
+    app.state.jobs[job.job_id] = job
+    endpoint = next(
+        route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
+    )
+    monkeypatch.setattr(asyncio, "wait_for", time_out)
+    response = await endpoint("active", events_request(app))
+
+    progress = await anext(response.body_iterator)
+    assert await anext(response.body_iterator) == ": keep-alive\n\n"
+    job.status = "succeeded"
+    job.stage = "completed"
+    done = await anext(response.body_iterator)
+    await response.body_iterator.aclose()
+
+    payload = json.loads(progress.removeprefix("data: "))
+    assert payload["status"] == "running"
+    # 中间帧只推阶段进度：每 15 秒一次的保活不该重发整份 640-bin 波形。
+    assert payload["result"]["waveforms"] == {}
+    assert done.startswith("event: done\ndata: ")
+    completed = json.loads(done.split("data: ", 1)[1])
+    assert completed["status"] == "succeeded"
+    assert completed["result"]["waveforms"] == {"full": bins}
+
+
+async def test_job_events_omit_waveforms_while_split_runs(tmp_path, monkeypatch):
+    """分轨会把 status 覆盖成 running，所以 SSE 要一直推流到分轨收尾为止。"""
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    bins = [0.5] * 640
+    job = GenerationJob(job_id="active", prompt="rock", status="succeeded", stage="completed")
+    job.result = {"fullTrack": "song_1/full.mp3", "waveforms": {"full": bins}}
+    job.split_status = "running"
+    job.split_stage = "waveform"
+    job.split_progress = 90
+    job.split_message = "正在提取真实波形"
+    app.state.jobs[job.job_id] = job
+    endpoint = next(
+        route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
+    )
+    monkeypatch.setattr(asyncio, "wait_for", time_out)
+    response = await endpoint("active", events_request(app))
+
+    splitting = await anext(response.body_iterator)
+    assert await anext(response.body_iterator) == ": keep-alive\n\n"
+    job.split_status = "succeeded"
+    job.split_stage = "completed"
+    job.split_progress = 100
+    done = await anext(response.body_iterator)
+    await response.body_iterator.aclose()
+
+    payload = json.loads(splitting.removeprefix("data: "))
+    assert payload["status"] == "running"
+    assert (payload["stage"], payload["progress"]) == ("waveform", 90)
+    assert payload["message"] == "正在提取真实波形"
+    assert payload["splitStatus"] == "running"
+    # 分轨期间 result 不会变化，波形只随 done 帧下发。
+    assert payload["result"]["waveforms"] == {}
+    completed = json.loads(done.split("data: ", 1)[1])
+    assert completed["status"] == "succeeded"
+    assert completed["result"]["waveforms"] == {"full": bins}
 
 
 async def test_direct_failure_is_persisted(tmp_path):
