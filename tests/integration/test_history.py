@@ -65,6 +65,7 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
         accepted = await http.post(f"/api/jobs/{job_id}/split?song=0")
         await asyncio.wait_for(started.wait(), 2)
         running = (await http.get(f"/api/jobs/{job_id}")).json()
+        history_running = (await http.get("/api/jobs")).json()["jobs"][0]
         duplicate = await http.post(f"/api/jobs/{job_id}/split?song=0")
         release.set()
         await app.state.jobs[job_id].split_task
@@ -87,6 +88,10 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
         "splitting",
         76,
     )
+    assert running["splitSong"] == 0
+    assert running["message"] == "Demucs 正在分离音轨"
+    assert history_running["status"] == "succeeded"
+    assert "splitStatus" not in history_running
     assert completed["status"] == "succeeded"
     assert completed["result"]["splitEnabled"] is True
     assert sorted(completed["result"]["stems"]) == ["bass", "drums", "other", "vocal"]
@@ -137,6 +142,8 @@ async def test_split_reserves_job_before_capacity_await(tmp_path, monkeypatch):
     assert other_song.status_code == 409
     assert "第 1 首" in other_song.json()["message"]
     assert app.state.jobs[job_id].status == "succeeded"
+    assert app.state.jobs[job_id].result["stems"]
+    assert app.state.jobs[job_id].result["alternatives"][0]["stems"] == {}
 
 
 async def test_split_failure_and_cancel_preserve_completed_generation(tmp_path, monkeypatch):
@@ -157,10 +164,14 @@ async def test_split_failure_and_cancel_preserve_completed_generation(tmp_path, 
 
     assert failed["status"] == "succeeded"
     assert failed["splitStatus"] == "failed"
+    assert failed["splitSong"] == 0
     assert failed["splitError"] == "音轨分离失败，请检查服务配置后重试。"
     assert "secret" not in json.dumps(failed)
     assert app.state.jobs[job_id].status == "succeeded"
     assert load_jobs(settings.output_dir)[job_id].status == "succeeded"
+    async with client(app) as http:
+        history_job = (await http.get("/api/jobs")).json()["jobs"][0]
+    assert "splitError" not in history_job
     async with client(create_app(settings, orchestrator)) as http:
         assert (await http.get(f"/api/jobs/{job_id}")).json()["status"] == "succeeded"
 
