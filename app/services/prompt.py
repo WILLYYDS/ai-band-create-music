@@ -673,7 +673,11 @@ class OpenAICompatiblePromptExpander:
                         or prepared.get("style")
                     )
                     if isinstance(style_tags, list):
-                        style_tags = ", ".join(str(tag) for tag in style_tags)
+                        # Qwen often returns bare "Category: value" items without brackets.
+                        style_tags = ", ".join(
+                            tag if tag.startswith("[") else f"[{tag}]"
+                            for tag in (str(item).strip() for item in style_tags)
+                        )
                     elif isinstance(style_tags, dict):
                         style_tags = json.dumps(style_tags, ensure_ascii=False)
                     structured = extract_structured_music_tags(style_tags) or normalize_llm_output(
