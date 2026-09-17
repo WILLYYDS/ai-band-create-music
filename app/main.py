@@ -49,7 +49,12 @@ from app.services.orchestrator import GenerationOrchestrator
 from app.services.prompt import OpenAICompatiblePromptExpander, effective_llm_output_tokens
 from app.services.providers import create_music_provider
 from app.services.stems import DemucsStemSeparator
-from app.services.voice import RVCEngine, install_voice_api, replacement_filename
+from app.services.voice import (
+    RVCEngine,
+    install_voice_api,
+    replacement_filename,
+    trash_result_path,
+)
 from app.services.waveforms import extract_waveforms, merge_waveform_sets
 
 logger = logging.getLogger(__name__)
@@ -339,6 +344,9 @@ def create_app(
     application.state.settings = application_settings
     application.state.jobs = load_jobs(application_settings.output_dir)
     application.state.job_subscribers = {}
+    # Startup runs before this app's event loop serves requests. Hash the large RVC assets
+    # once here so request/SSE paths only read the cached value.
+    application.state.rvc_model_fingerprint = _rvc_model_fingerprint(application_settings)
     install_voice_api(application, application_settings, voice_engine)
     if orchestrator is not None:
         application.state.orchestrator = orchestrator
@@ -639,6 +647,8 @@ def create_app(
                 content={"success": False, "message": "生成任务不存在。"},
             )
 
+        fingerprint = request.app.state.rvc_model_fingerprint
+
         async def events() -> AsyncIterator[str]:
             queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
             subscribers = request.app.state.job_subscribers.setdefault(job_id, set())
@@ -658,7 +668,8 @@ def create_app(
                 # 紧接着 status 就变成终态。所以中间帧只推阶段进度，真实波形留给 done
                 # 帧——否则每次 15 秒保活超时都会重推一整份 640-bin 波形。
                 payload = _job_response(
-                    job, request, application_settings, include_waveforms=final
+                    job, request, application_settings, include_waveforms=final,
+                    fingerprint=fingerprint,
                 )
                 return final, json.dumps(payload, ensure_ascii=False)
 
@@ -696,7 +707,7 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "生成任务不存在。"},
             )
-        return _job_response(job, request, application_settings)
+        return await _async_job_response(job, request, application_settings)
 
     @application.post(
         "/api/jobs/{job_id}/split",
@@ -739,7 +750,7 @@ def create_app(
             )
         if job.split_status in {"pending", "running"}:
             if job.split_song == song:
-                return _job_response(job, request, application_settings)
+                return await _async_job_response(job, request, application_settings)
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={
@@ -750,7 +761,7 @@ def create_app(
         stems = result.get("stems")
         if isinstance(stems, dict) and stems:
             response.status_code = status.HTTP_200_OK
-            return _job_response(job, request, application_settings)
+            return await _async_job_response(job, request, application_settings)
         try:
             full_path = _output_path_from_url(result["fullTrack"], application_settings)
             if not full_path.is_file():
@@ -864,7 +875,7 @@ def create_app(
                 publish()
 
         job.split_task = asyncio.create_task(execute(), name=f"split-{job_id}-{song}")
-        return _job_response(job, request, application_settings)
+        return await _async_job_response(job, request, application_settings)
 
     @application.post(
         "/api/jobs/{job_id}/replace",
@@ -916,7 +927,7 @@ def create_app(
                     },
                 )
             if job.replace_song == song:
-                return _job_response(job, request, application_settings)
+                return await _async_job_response(job, request, application_settings)
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={
@@ -955,18 +966,19 @@ def create_app(
                 content={"success": False, "message": "人声音轨文件过大，无法替换。"},
             )
 
+        fingerprint = request.app.state.rvc_model_fingerprint
         cached_url = result.get("replacedVocal")
         if isinstance(cached_url, str):
             try:
                 cached_path = _output_path_from_url(cached_url, application_settings)
                 if (
                     result.get("_replacedVocalModel")
-                    == _rvc_model_fingerprint(application_settings)
+                    == fingerprint
                     and cached_path.parent == output_dir.resolve()
                     and cached_path.is_file()
                 ):
                     response.status_code = status.HTTP_200_OK
-                    return _job_response(job, request, application_settings)
+                    return await _async_job_response(job, request, application_settings)
             except ValueError:
                 pass
 
@@ -1073,7 +1085,7 @@ def create_app(
                 result["replacedVocal"] = result_path.relative_to(
                     application_settings.output_dir.resolve()
                 ).as_posix()
-                result["_replacedVocalModel"] = _rvc_model_fingerprint(application_settings)
+                result["_replacedVocalModel"] = fingerprint
                 job.deleted_replaced_vocals.pop(str(song), None)
                 job.save(application_settings.output_dir)
                 job.replace_status = "succeeded"
@@ -1098,7 +1110,7 @@ def create_app(
                 publish()
 
         job.replace_task = asyncio.create_task(execute(), name=f"replace-{job_id}-{song}")
-        return _job_response(job, request, application_settings)
+        return await _async_job_response(job, request, application_settings)
 
     @application.patch(
         "/api/jobs/{job_id}",
@@ -1130,6 +1142,9 @@ def create_app(
             # ponytail: RVC runs in a worker thread and has no safe stop API; mark cancellation
             # now, keep capacity reserved, then discard its output when inference returns.
             _mark_replace_cancelled(job)
+            for queue in request.app.state.job_subscribers.get(job_id, ()):
+                if queue.empty():
+                    queue.put_nowait(None)
         if job.task is not None and not job.task.done():
             job.task.cancel()
             job.status = "cancelled"
@@ -1140,7 +1155,7 @@ def create_app(
             for queue in request.app.state.job_subscribers.get(job_id, ()):
                 if queue.empty():
                     queue.put_nowait(None)
-        return _job_response(job, request, application_settings)
+        return await _async_job_response(job, request, application_settings)
 
     @application.delete(
         "/api/jobs/{job_id}/stems/{stem_name}",
@@ -1173,14 +1188,35 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "音轨不存在或已被删除。"},
             )
+        is_vocal = stem_name.lower() in {"vocal", "vocals", "voice"}
+        replaced_url = result.get("replacedVocal") if is_vocal else None
+        replaced_model = result.get("_replacedVocalModel") if is_vocal else None
+        replaced_path = None
         try:
             target = _output_path_from_url(stem_url, application_settings)
             if not target.is_file():
                 raise OSError("stem file is missing")
+            if isinstance(replaced_url, str):
+                candidate = _output_path_from_url(replaced_url, application_settings)
+                if candidate.parent == target.parent and candidate.is_file():
+                    replaced_path = candidate
             trash = _stem_trash_path(target, application_settings, job_id, song)
             trash.parent.mkdir(parents=True, exist_ok=True)
             trash.unlink(missing_ok=True)
+            replaced_trash = None
+            if replaced_path is not None:
+                replaced_trash = trash_result_path(
+                    application_settings, replaced_path.name, job_id, song
+                )
+                replaced_trash.parent.mkdir(parents=True, exist_ok=True)
+                replaced_trash.unlink(missing_ok=True)
             target.replace(trash)
+            if replaced_path is not None and replaced_trash is not None:
+                try:
+                    replaced_path.replace(replaced_trash)
+                except OSError:
+                    trash.replace(target)
+                    raise
         except (OSError, ValueError):
             logger.exception("failed to delete stem job_id=%s stem=%s", job_id, stem_name)
             return JSONResponse(
@@ -1199,7 +1235,7 @@ def create_app(
         result["stemUrls"] = list(stems.values())
         if isinstance(waveforms, dict):
             waveforms.pop(stem_name, None)
-        if stem_name.lower() in {"vocal", "vocals", "voice"}:
+        if is_vocal:
             if (
                 job.replace_song == song
                 and job.replace_status in {"pending", "running"}
@@ -1207,6 +1243,9 @@ def create_app(
                 and not job.replace_task.done()
             ):
                 _mark_replace_cancelled(job)
+                for queue in request.app.state.job_subscribers.get(job_id, ()):
+                    if queue.empty():
+                        queue.put_nowait(None)
             elif job.replace_song == song and (
                 job.replace_task is None or job.replace_task.done()
             ):
@@ -1216,16 +1255,15 @@ def create_app(
                 job.replace_progress = None
                 job.replace_message = None
                 job.replace_error = None
-            replaced_url = result.pop("replacedVocal", None)
+            result.pop("replacedVocal", None)
             result.pop("_replacedVocalModel", None)
-            job.deleted_replaced_vocals.pop(str(song), None)
-            if isinstance(replaced_url, str):
-                try:
-                    replaced_path = _output_path_from_url(replaced_url, application_settings)
-                    if replaced_path.parent == target.parent:
-                        replaced_path.unlink(missing_ok=True)
-                except ValueError:
-                    pass
+            if replaced_path is None:
+                job.deleted_replaced_vocals.pop(str(song), None)
+            else:
+                deleted_replacement = {"url": replaced_url}
+                if isinstance(replaced_model, str):
+                    deleted_replacement["model"] = replaced_model
+                job.deleted_replaced_vocals[str(song)] = deleted_replacement
         job.message = f"音轨 {stem_name} 已删除"
         job.save(application_settings.output_dir)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -1251,7 +1289,7 @@ def create_app(
 
         stems = result.get("stems", {})
         if stem_name in stems:
-            return _job_response(job, request, application_settings)
+            return await _async_job_response(job, request, application_settings)
         deleted_key = f"{song}:{stem_name}"
         deleted = job.deleted_stems.get(deleted_key)
         if deleted is None:
@@ -1269,8 +1307,38 @@ def create_app(
                     status_code=status.HTTP_404_NOT_FOUND,
                     content={"success": False, "message": "删除的音轨文件已不存在，无法恢复。"},
                 )
+            deleted_replacement = (
+                job.deleted_replaced_vocals.get(str(song))
+                if stem_name.lower() in {"vocal", "vocals", "voice"}
+                else None
+            )
+            replaced_path = replaced_trash = None
+            if isinstance(deleted_replacement, dict) and isinstance(
+                deleted_replacement.get("url"), str
+            ):
+                replaced_path = _output_path_from_url(
+                    deleted_replacement["url"], application_settings
+                )
+                replaced_trash = trash_result_path(
+                    application_settings, replaced_path.name, job_id, song
+                )
+                if not replaced_trash.is_file():
+                    return JSONResponse(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        content={
+                            "success": False,
+                            "message": "删除的替换人声文件已不存在，无法恢复。",
+                        },
+                    )
             target.parent.mkdir(parents=True, exist_ok=True)
             trash.replace(target)
+            if replaced_path is not None and replaced_trash is not None:
+                replaced_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    replaced_trash.replace(replaced_path)
+                except OSError:
+                    target.replace(trash)
+                    raise
         except (OSError, ValueError):
             logger.exception("failed to restore stem job_id=%s stem=%s", job_id, stem_name)
             return JSONResponse(
@@ -1285,10 +1353,15 @@ def create_app(
         waveforms = result.get("waveforms")
         if isinstance(waveforms, dict) and deleted["waveform"] is not None:
             waveforms[stem_name] = deleted["waveform"]
+        if isinstance(deleted_replacement, dict):
+            result["replacedVocal"] = deleted_replacement["url"]
+            if isinstance(deleted_replacement.get("model"), str):
+                result["_replacedVocalModel"] = deleted_replacement["model"]
+            job.deleted_replaced_vocals.pop(str(song), None)
         del job.deleted_stems[deleted_key]
         job.message = f"音轨 {stem_name} 已恢复"
         job.save(application_settings.output_dir)
-        return _job_response(job, request, application_settings)
+        return await _async_job_response(job, request, application_settings)
 
     @application.get("/output/{file_path:path}")
     async def audio_file(file_path: str, request: Request) -> StreamingResponse:
@@ -1395,8 +1468,6 @@ def _reported_replace_status(
         return None
     recorded = result.get("_replacedVocalModel")
     if isinstance(recorded, str):
-        if fingerprint is None:
-            fingerprint = _rvc_model_fingerprint(settings)
         if recorded != fingerprint:
             return None
     return "succeeded"
@@ -1459,6 +1530,21 @@ def _rvc_model_fingerprint(settings: Settings) -> str:
     return f"v1:{hashlib.sha256(chr(0).join(parts).encode()).hexdigest()}"
 
 
+async def _async_job_response(
+    job: GenerationJob, request: Request, settings: Settings
+) -> dict[str, Any]:
+    result = job.result
+    fingerprint = (
+        request.app.state.rvc_model_fingerprint
+        if job.replace_status is None
+        and isinstance(result, dict)
+        and isinstance(result.get("replacedVocal"), str)
+        and isinstance(result.get("_replacedVocalModel"), str)
+        else None
+    )
+    return _job_response(job, request, settings, fingerprint=fingerprint)
+
+
 def _job_response(
     job: GenerationJob,
     request: Request,
@@ -1467,32 +1553,9 @@ def _job_response(
     include_split: bool = True,
     include_operations: bool = True,
     include_waveforms: bool = True,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     response = job.response()
-    split_status = _split_status_override(job)
-    if include_operations and include_split and split_status is not None:
-        response.update(
-            status=split_status,
-            stage=job.split_stage,
-            progress=job.split_progress,
-            message=job.split_message,
-        )
-    if include_operations and job.split_status is not None:
-        response["splitStatus"] = job.split_status
-        response["splitSong"] = job.split_song
-        response["splitError"] = job.split_error
-    replace_status = _reported_replace_status(job, settings)
-    if include_operations and replace_status in {"pending", "running"}:
-        response.update(
-            status=replace_status,
-            stage=job.replace_stage,
-            progress=job.replace_progress,
-            message=job.replace_message,
-        )
-    if include_operations and replace_status is not None:
-        response["replaceStatus"] = replace_status
-        response["replaceSong"] = job.replace_song
-        response["replaceError"] = job.replace_error
     if job.result is not None:
         response["result"] = _render_result_urls(
             job.result,
@@ -1500,6 +1563,33 @@ def _job_response(
             settings,
             include_waveforms=include_waveforms,
         )
+    if not include_operations:
+        return response
+
+    split_status = _split_status_override(job)
+    if include_split and split_status is not None:
+        response.update(
+            status=split_status,
+            stage=job.split_stage,
+            progress=job.split_progress,
+            message=job.split_message,
+        )
+    if job.split_status is not None:
+        response["splitStatus"] = job.split_status
+        response["splitSong"] = job.split_song
+        response["splitError"] = job.split_error
+    replace_status = _reported_replace_status(job, settings, fingerprint=fingerprint)
+    if replace_status in {"pending", "running"}:
+        response.update(
+            status=replace_status,
+            stage=job.replace_stage,
+            progress=job.replace_progress,
+            message=job.replace_message,
+        )
+    if replace_status is not None:
+        response["replaceStatus"] = replace_status
+        response["replaceSong"] = job.replace_song
+        response["replaceError"] = job.replace_error
     return response
 
 

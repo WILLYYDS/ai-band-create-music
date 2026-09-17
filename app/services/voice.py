@@ -152,7 +152,7 @@ def install_voice_api(
         result_path = _result_path(settings, filename, job_id, song)
         if not result_path.is_file():
             raise HTTPException(status_code=404, detail="Converted audio not found")
-        trash_path = _trash_result_path(settings, filename, job_id, song)
+        trash_path = trash_result_path(settings, filename, job_id, song)
         trash_path.parent.mkdir(parents=True, exist_ok=True)
         trash_path.unlink(missing_ok=True)
         result_path.replace(trash_path)
@@ -191,7 +191,7 @@ def install_voice_api(
         job_result = _job_song_result(request, job_id, song)
         result_path = _result_path(settings, filename, job_id, song)
         if not result_path.is_file():
-            trash_path = _trash_result_path(settings, filename, job_id, song)
+            trash_path = trash_result_path(settings, filename, job_id, song)
             if not trash_path.is_file():
                 raise HTTPException(status_code=404, detail="Deleted audio not found")
             result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -302,7 +302,7 @@ def _result_path(
     return root / _result_filename(filename)
 
 
-def _trash_result_path(
+def trash_result_path(
     settings: Settings,
     filename: str,
     job_id: str,

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import httpx
+from starlette.requests import Request
 
 from app.main import GenerationJob, create_app
 from tests.helpers import make_orchestrator, make_settings
@@ -30,6 +31,22 @@ class SlowVoiceEngine:
 
 def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://testserver")
+
+
+def events_request(app, job_id: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "app": app,
+            "headers": [],
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "path": f"/api/jobs/{job_id}/events",
+            "root_path": "",
+            "query_string": b"",
+            "method": "GET",
+        }
+    )
 
 
 def seed_job(app, settings, job_id: str = "job-replace") -> tuple[GenerationJob, Path]:
@@ -168,12 +185,16 @@ async def test_replace_runs_as_job_operation_and_caches_result(tmp_path: Path) -
         deleted_vocal = await http.delete(f"/api/jobs/{job.job_id}/stems/vocal")
         after_delete = (await http.get(f"/api/jobs/{job.job_id}")).json()
         deleted_replacement = await http.get(replaced_url)
+        restored_vocal = await http.put(f"/api/jobs/{job.job_id}/stems/vocal")
+        restored_replacement = await http.get(replaced_url)
     assert restored["result"]["replacedVocal"].endswith("/demo_rvc_vocal.wav")
     assert cached_after_restart.status_code == 200
     assert engine.calls == 1
     assert deleted_vocal.status_code == 204
     assert "replacedVocal" not in after_delete["result"]
     assert deleted_replacement.status_code == 404
+    assert restored_vocal.json()["result"]["replacedVocal"] == replaced_url
+    assert restored_replacement.content == b"RIFF-replaced"
 
 
 async def test_deleting_vocal_cancels_active_replace(tmp_path: Path) -> None:
@@ -459,6 +480,32 @@ async def test_replace_failure_and_cancel_preserve_generation(tmp_path: Path) ->
     assert job.status == "succeeded"
     assert job.replace_cancel_requested is False
     assert orchestrator.capacity.active == 0
+
+
+async def test_replace_cancel_wakes_sse_before_worker_exits(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    engine = BlockingVoiceEngine()
+    app = create_app(settings, make_orchestrator(settings), engine)
+    job, _ = seed_job(app, settings)
+    endpoint = next(
+        route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
+    )
+
+    async with client(app) as http:
+        await http.post(f"/api/jobs/{job.job_id}/replace")
+        await asyncio.wait_for(engine.started.wait(), 1)
+        response = await endpoint(job.job_id, events_request(app, job.job_id))
+        assert (await anext(response.body_iterator)).startswith("data: ")
+        next_frame = asyncio.create_task(anext(response.body_iterator))
+        await asyncio.sleep(0)
+        await http.patch(f"/api/jobs/{job.job_id}", json={"status": "cancelled"})
+        done = await asyncio.wait_for(next_frame, 1)
+
+    assert done.startswith("event: done\ndata: ")
+    assert json.loads(done.split("data: ", 1)[1])["replaceStatus"] == "cancelled"
+    assert not job.replace_task.done()
+    engine.release.set()
+    await job.replace_task
 
 
 async def test_replace_rejects_missing_inputs_and_capacity(tmp_path: Path) -> None:

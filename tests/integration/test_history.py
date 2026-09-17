@@ -100,6 +100,64 @@ async def test_history_listing_omits_waveform_bins(tmp_path):
     assert json.loads(record.read_text(encoding="utf-8"))["result"]["waveforms"]["full"] == bins
 
 
+async def test_history_listing_skips_rvc_fingerprint(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    job = GenerationJob(job_id="cached", prompt="rock", status="succeeded", stage="completed")
+    job.result = {
+        "replacedVocal": "jobs/cached/song_1/vocal_rvc_vocal.wav",
+        "_replacedVocalModel": "v1:old",
+    }
+    app.state.jobs[job.job_id] = job
+
+    def fail(_settings):
+        raise AssertionError("history listing must not hash RVC assets")
+
+    monkeypatch.setattr("app.main._rvc_model_fingerprint", fail)
+    async with client(app) as http:
+        response = await http.get("/api/jobs")
+
+    assert response.status_code == 200
+
+
+async def test_job_detail_reuses_startup_rvc_fingerprint(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    calls = []
+
+    def fingerprint(_settings):
+        calls.append(_settings)
+        return "fingerprint"
+
+    monkeypatch.setattr("app.main._rvc_model_fingerprint", fingerprint)
+    app = create_app(settings, make_orchestrator(settings))
+    job = GenerationJob(job_id="cached", prompt="rock", status="succeeded", stage="completed")
+    job.result = {
+        "success": True,
+        "jobId": job.job_id,
+        "prompt": job.prompt,
+        "durationMinutes": "auto",
+        "structuredPrompt": "rock",
+        "lyrics": "test",
+        "fullTrack": "jobs/cached/song_1/full.wav",
+        "stems": {},
+        "stemUrls": [],
+        "waveforms": {},
+        "splitEnabled": False,
+        "debug": {},
+        "count": 1,
+        "alternatives": [],
+        "replacedVocal": "jobs/cached/song_1/vocal_rvc_vocal.wav",
+        "_replacedVocalModel": "fingerprint",
+    }
+    app.state.jobs[job.job_id] = job
+    async with client(app) as http:
+        first = await http.get(f"/api/jobs/{job.job_id}")
+        second = await http.get(f"/api/jobs/{job.job_id}")
+
+    assert first.json()["replaceStatus"] == second.json()["replaceStatus"] == "succeeded"
+    assert calls == [settings]
+
+
 async def test_split_refreshes_legacy_64_bin_full_waveform(tmp_path, monkeypatch):
     settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
