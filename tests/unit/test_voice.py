@@ -1,22 +1,11 @@
 from __future__ import annotations
 
-import asyncio
-import os
-import sys
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from app.services.voice import (
-    LIMIT_FILTER,
-    MIX_FILTER,
-    RVCConversionError,
     RVCEngine,
-    _mix_tracks,
     _reuse_base_models,
-    _run_ffmpeg,
     _source_song_name,
 )
 from tests.helpers import make_settings
@@ -80,71 +69,3 @@ def test_reuses_base_models_without_copying(tmp_path: Path) -> None:
 def test_rvc_output_uses_source_music_name() -> None:
     assert _source_song_name("真实歌名_vocal.mp3", "AI 生成曲目") == "真实歌名"
     assert _source_song_name("真实歌名_rvc_vocal.wav", "AI 生成曲目") == "真实歌名"
-
-
-def test_mix_filter_preserves_stem_levels_and_limits_clipping() -> None:
-    assert "normalize=0" in MIX_FILTER
-    assert "equalizer=f=3000" in MIX_FILTER
-    assert "volume=3dB[vocal]" in MIX_FILTER
-    assert "volume=2.5dB" not in MIX_FILTER
-    assert "level=false" in LIMIT_FILTER
-    assert "limit=0.891251" in LIMIT_FILTER
-
-
-async def test_ffmpeg_process_does_not_block_event_loop() -> None:
-    started = time.perf_counter()
-    process = asyncio.create_task(
-        _run_ffmpeg(
-            [sys.executable, "-c", "import time; time.sleep(0.1)"],
-            dict(os.environ),
-            1,
-        )
-    )
-    await asyncio.sleep(0.02)
-    assert time.perf_counter() - started < 0.08
-    await process
-
-
-async def test_ffmpeg_process_is_killed_on_timeout() -> None:
-    with pytest.raises(RVCConversionError, match="timed out"):
-        await _run_ffmpeg(
-            [sys.executable, "-c", "import time; time.sleep(10)"],
-            dict(os.environ),
-            0.02,
-        )
-
-
-async def test_mix_gain_matches_original_loudness(tmp_path: Path, monkeypatch) -> None:
-    reference = tmp_path / "full.wav"
-    output = tmp_path / "mix.wav"
-    calls = []
-
-    timeouts = []
-
-    async def run_ffmpeg(command, _environment, timeout, *, capture_stdout=False):
-        calls.append(command)
-        timeouts.append(timeout)
-        if capture_stdout:
-            return (
-                '{"streams":[{"sample_rate":"44100","channels":1,'
-                '"codec_name":"flac","bits_per_raw_sample":"24"}]}'
-            )
-        target = Path(command[-1])
-        if target.suffix == ".wav":
-            target.write_bytes(b"RIFF-audio")
-        return ""
-
-    async def loudness(path, _environment, _timeout):
-        return -10.0 if path == reference else -12.5
-
-    monkeypatch.setattr("app.services.voice._run_ffmpeg", run_ffmpeg)
-    monkeypatch.setattr("app.services.voice._integrated_loudness", loudness)
-
-    await _mix_tracks([tmp_path / f"stem-{index}.wav" for index in range(4)], reference, output, 3)
-
-    final_filter = calls[-1][calls[-1].index("-af") + 1]
-    assert "volume=2.500dB" in final_filter
-    assert calls[-1][calls[-1].index("-ar") + 1] == "44100"
-    assert calls[-1][calls[-1].index("-ac") + 1] == "1"
-    assert calls[-1][calls[-1].index("-c:a") + 1] == "pcm_s24le"
-    assert timeouts[-1] <= timeouts[0]

@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
+import shutil
+import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -45,27 +49,36 @@ from app.services.orchestrator import GenerationOrchestrator
 from app.services.prompt import OpenAICompatiblePromptExpander, effective_llm_output_tokens
 from app.services.providers import create_music_provider
 from app.services.stems import DemucsStemSeparator
-from app.services.voice import RVCEngine, install_voice_api
+from app.services.voice import (
+    RVCEngine,
+    install_voice_api,
+    replacement_filename,
+    trash_result_path,
+)
 from app.services.waveforms import extract_waveforms, merge_waveform_sets
 
 logger = logging.getLogger(__name__)
 SPLIT_PROGRESS = 76
 WAVEFORM_PROGRESS = 90
 SPLIT_COMPLETE_PROGRESS = 100
+REPLACE_PROGRESS = 90
+REPLACE_COMPLETE_PROGRESS = 100
+# 替换已经进入终态（超时/取消），但 RVC 推理线程还没退出、因而仍占着一个生成并发额度的数量。
+# 额度按设计等到线程真正退出才释放，这里只把它暴露出来，让 /api/health 与日志能发现卡住的替换。
+_replacement_wind_down_active = 0
 
 
 class RequestSizeLimitMiddleware:
-    def __init__(self, app: ASGIApp, default_limit: int, voice_limit: int) -> None:
+    def __init__(self, app: ASGIApp, default_limit: int) -> None:
         self.app = app
         self.default_limit = default_limit
-        self.voice_limit = voice_limit
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        limit = self.voice_limit if scope["path"] == "/api/voice/convert" else self.default_limit
+        limit = self.default_limit
         content_length = Headers(scope=scope).get("content-length")
         if content_length is not None:
             try:
@@ -134,6 +147,7 @@ class GenerationJob:
     error: str | None = None
     task: asyncio.Task[None] | None = None
     deleted_stems: dict[str, dict[str, Any]] = field(default_factory=dict)
+    deleted_replaced_vocals: dict[str, dict[str, str]] = field(default_factory=dict)
     split_task: asyncio.Task[None] | None = field(default=None, repr=False)
     split_song: int | None = field(default=None, repr=False)
     split_status: str | None = field(default=None, repr=False)
@@ -141,6 +155,14 @@ class GenerationJob:
     split_progress: int | None = field(default=None, repr=False)
     split_message: str | None = field(default=None, repr=False)
     split_error: str | None = field(default=None, repr=False)
+    replace_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    replace_song: int | None = field(default=None, repr=False)
+    replace_status: str | None = field(default=None, repr=False)
+    replace_stage: str | None = field(default=None, repr=False)
+    replace_progress: int | None = field(default=None, repr=False)
+    replace_message: str | None = field(default=None, repr=False)
+    replace_error: str | None = field(default=None, repr=False)
+    replace_cancel_requested: bool = field(default=False, repr=False)
 
     def response(self) -> dict[str, Any]:
         return {
@@ -166,7 +188,12 @@ class GenerationJob:
         temporary = target.with_name(f"job.{uuid4().hex}.tmp")
         try:
             with temporary.open("w", encoding="utf-8") as stream:
-                payload = {**self.response(), "deletedStems": self.deleted_stems}
+                payload = {
+                    **self.response(),
+                    "deletedStems": self.deleted_stems,
+                }
+                if self.deleted_replaced_vocals:
+                    payload["deletedReplacedVocals"] = self.deleted_replaced_vocals
                 diagnostics = read_job_diagnostics(output_dir, self.job_id)
                 if diagnostics:
                     payload["diagnostics"] = diagnostics
@@ -202,6 +229,7 @@ def load_jobs(output_dir: Path) -> dict[str, GenerationJob]:
                 error=validated.error,
                 result=data.get("result"),
                 deleted_stems=data.get("deletedStems", {}),
+                deleted_replaced_vocals=data.get("deletedReplacedVocals", {}),
             )
             if job.status in {"pending", "running"}:
                 job.status = job.stage = "failed"
@@ -316,6 +344,9 @@ def create_app(
     application.state.settings = application_settings
     application.state.jobs = load_jobs(application_settings.output_dir)
     application.state.job_subscribers = {}
+    # Startup runs before this app's event loop serves requests. Hash the large RVC assets
+    # once here so request/SSE paths only read the cached value.
+    application.state.rvc_model_fingerprint = _rvc_model_fingerprint(application_settings)
     install_voice_api(application, application_settings, voice_engine)
     if orchestrator is not None:
         application.state.orchestrator = orchestrator
@@ -337,7 +368,6 @@ def create_app(
     application.add_middleware(
         RequestSizeLimitMiddleware,
         default_limit=application_settings.request_max_bytes,
-        voice_limit=application_settings.rvc_max_upload_bytes + 1024 * 1024,
     )
 
     @application.get("/api/health")
@@ -381,6 +411,11 @@ def create_app(
                 "device": application_settings.demucs_device or "auto",
                 "jobs": application_settings.demucs_jobs or None,
                 "segment": application_settings.demucs_segment or None,
+            },
+            "replacement": {
+                "conversionTimeoutSeconds": application_settings.rvc_conversion_timeout_seconds,
+                # 已进入终态但 RVC 线程仍未退出的替换数量；这些替换按设计继续占着生成并发额度。
+                "workersHoldingCapacityAfterTerminal": _replacement_wind_down_active,
             },
             "infrastructure": {
                 "taskBackend": application_settings.task_backend,
@@ -594,6 +629,7 @@ def create_app(
                     request,
                     application_settings,
                     include_split=False,
+                    include_operations=False,
                     include_waveforms=False,
                 )
                 for job in sorted(
@@ -611,25 +647,39 @@ def create_app(
                 content={"success": False, "message": "生成任务不存在。"},
             )
 
+        fingerprint = request.app.state.rvc_model_fingerprint
+
         async def events() -> AsyncIterator[str]:
             queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
             subscribers = request.app.state.job_subscribers.setdefault(job_id, set())
             subscribers.add(queue)
+
+            def frame() -> tuple[bool, str]:
+                """按"即将推送给客户端的状态"生成一帧，并返回它是否为终态。
+
+                判据与帧体必须在同一次同步读取里定下来：分轨/换声会覆盖 job.status，若先判终态
+                再取帧体，操作恰好在本帧之前收尾时（例如 /replace 在客户端连上 SSE 前就跑完了）
+                就会推出 status="running" 与 replaceStatus="succeeded" 自相矛盾的 done 帧，
+                客户端要么误判失败、要么永远等不到终态。
+                """
+                status = _operation_status_override(job) or job.status
+                final = status not in {"pending", "running"}
+                # 任务结束前 result 不会变：分轨只在收尾那一刻一次性写入 stems 和波形，
+                # 紧接着 status 就变成终态。所以中间帧只推阶段进度，真实波形留给 done
+                # 帧——否则每次 15 秒保活超时都会重推一整份 640-bin 波形。
+                payload = _job_response(
+                    job, request, application_settings, include_waveforms=final,
+                    fingerprint=fingerprint,
+                )
+                return final, json.dumps(payload, ensure_ascii=False)
+
             try:
                 while True:
-                    # 判据是"即将推送给客户端的状态"：分轨进行中时会覆盖 job.status。
-                    status = _split_status_override(job) or job.status
-                    final = status not in {"pending", "running"}
-                    # 任务结束前 result 不会变：分轨只在收尾那一刻一次性写入 stems 和波形，
-                    # 紧接着 status 就变成终态。所以中间帧只推阶段进度，真实波形留给 done
-                    # 帧——否则每次 15 秒保活超时都会重推一整份 640-bin 波形。
-                    payload = _job_response(
-                        job, request, application_settings, include_waveforms=final
-                    )
+                    final, body = frame()
                     if final:
-                        yield f"event: done\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                        yield f"event: done\ndata: {body}\n\n"
                         return
-                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    yield f"data: {body}\n\n"
                     try:
                         await asyncio.wait_for(queue.get(), timeout=15)
                     except asyncio.TimeoutError:
@@ -657,7 +707,7 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "生成任务不存在。"},
             )
-        return _job_response(job, request, application_settings)
+        return await _async_job_response(job, request, application_settings)
 
     @application.post(
         "/api/jobs/{job_id}/split",
@@ -690,9 +740,17 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"success": False, "message": "该歌曲没有可供拆轨的完整音频。"},
             )
+        if job.replace_task is not None and not job.replace_task.done():
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "success": False,
+                    "message": f"第 {(job.replace_song or 0) + 1} 首歌曲正在替换人声。",
+                },
+            )
         if job.split_status in {"pending", "running"}:
             if job.split_song == song:
-                return _job_response(job, request, application_settings)
+                return await _async_job_response(job, request, application_settings)
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={
@@ -703,7 +761,7 @@ def create_app(
         stems = result.get("stems")
         if isinstance(stems, dict) and stems:
             response.status_code = status.HTTP_200_OK
-            return _job_response(job, request, application_settings)
+            return await _async_job_response(job, request, application_settings)
         try:
             full_path = _output_path_from_url(result["fullTrack"], application_settings)
             if not full_path.is_file():
@@ -817,7 +875,242 @@ def create_app(
                 publish()
 
         job.split_task = asyncio.create_task(execute(), name=f"split-{job_id}-{song}")
-        return _job_response(job, request, application_settings)
+        return await _async_job_response(job, request, application_settings)
+
+    @application.post(
+        "/api/jobs/{job_id}/replace",
+        response_model=GenerationJobResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+        responses={
+            200: {"model": GenerationJobResponse},
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            413: {"model": ErrorResponse},
+            429: {"model": ErrorResponse},
+        },
+    )
+    async def replace_generation_vocal(
+        job_id: str, request: Request, response: Response, song: int = 0
+    ):
+        job = request.app.state.jobs.get(job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"success": False, "message": "生成任务不存在。"},
+            )
+        if job.status != "succeeded":
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "生成任务尚未完成，无法替换人声。"},
+            )
+        result = _song_result(job, song)
+        if result is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"success": False, "message": "歌曲不存在。"},
+            )
+        if job.split_status in {"pending", "running"}:
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "success": False,
+                    "message": f"第 {(job.split_song or 0) + 1} 首歌曲正在拆轨。",
+                },
+            )
+        if job.replace_task is not None and not job.replace_task.done():
+            if job.replace_status in {"failed", "cancelled"}:
+                return JSONResponse(
+                    status_code=status.HTTP_409_CONFLICT,
+                    content={
+                        "success": False,
+                        "message": "上一次人声替换仍在安全收尾，请稍后重试。",
+                    },
+                )
+            if job.replace_song == song:
+                return await _async_job_response(job, request, application_settings)
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "success": False,
+                    "message": f"第 {(job.replace_song or 0) + 1} 首歌曲正在替换人声。",
+                },
+            )
+
+        stems = result.get("stems")
+        vocal_url = next(
+            (
+                value
+                for name, value in (stems.items() if isinstance(stems, dict) else ())
+                if name.lower() in {"vocal", "vocals", "voice"} and isinstance(value, str)
+            ),
+            None,
+        )
+        if vocal_url is None:
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "该歌曲没有人声音轨，请先完成拆轨。"},
+            )
+        try:
+            output_dir = job_song_dir(application_settings.output_dir, job_id, song)
+            vocal_path = _output_path_from_url(vocal_url, application_settings)
+            if vocal_path.parent != output_dir.resolve() or not vocal_path.is_file():
+                raise OSError("missing vocal stem")
+        except (OSError, ValueError):
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "人声音轨文件不存在，无法替换。"},
+            )
+        if vocal_path.stat().st_size > application_settings.rvc_max_upload_bytes:
+            return JSONResponse(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                content={"success": False, "message": "人声音轨文件过大，无法替换。"},
+            )
+
+        fingerprint = request.app.state.rvc_model_fingerprint
+        cached_url = result.get("replacedVocal")
+        if isinstance(cached_url, str):
+            try:
+                cached_path = _output_path_from_url(cached_url, application_settings)
+                if (
+                    result.get("_replacedVocalModel")
+                    == fingerprint
+                    and cached_path.parent == output_dir.resolve()
+                    and cached_path.is_file()
+                ):
+                    response.status_code = status.HTTP_200_OK
+                    return await _async_job_response(job, request, application_settings)
+            except ValueError:
+                pass
+
+        active_orchestrator = _orchestrator(request)
+        job.replace_song = song
+        job.replace_status = "pending"
+        job.replace_stage = "replacing_vocal"
+        job.replace_progress = REPLACE_PROGRESS
+        job.replace_message = "RVC 正在替换人声"
+        job.replace_error = None
+        job.replace_cancel_requested = False
+        try:
+            await active_orchestrator.capacity.acquire()
+        except CapacityExceededError:
+            job.replace_song = None
+            job.replace_status = None
+            job.replace_stage = None
+            job.replace_progress = None
+            job.replace_message = None
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={"success": False, "message": "当前人声替换任务过多，请稍后重试。"},
+            )
+        except asyncio.CancelledError:
+            job.replace_song = None
+            job.replace_status = None
+            job.replace_stage = None
+            job.replace_progress = None
+            job.replace_message = None
+            raise
+
+        if isinstance(cached_url, str):
+            # 缓存失效（模型指纹/文件/路径任一不符）：只把引用从结果里摘掉以触发重新推理，
+            # 磁盘上的旧文件保持不动。它与新产物同名，重跑成功时 output_path.replace 会原子
+            # 覆盖它；重跑失败/超时/取消时它则是"上一版还能听"的唯一退路——留着只是不再被任何
+            # 结果引用、也不会对外暴露，同曲最多一份，不会堆积。
+            result.pop("replacedVocal", None)
+            result.pop("_replacedVocalModel", None)
+            job.save(application_settings.output_dir)
+
+        def publish() -> None:
+            for queue in request.app.state.job_subscribers.get(job_id, ()):
+                if queue.empty():
+                    queue.put_nowait(None)
+
+        async def execute() -> None:
+            try:
+                job.replace_status = "running"
+                publish()
+                result_path = output_dir / replacement_filename(vocal_path.name)
+                # 这里刻意不用 TemporaryDirectory 上下文：它在 await 被取消时会立刻 rmtree，
+                # 而 RVC 推理线程无法强停、仍在写这个目录，清理与写文件会互相打架（真实 RVC 还会
+                # 在推理中途读取输入/写入输出）。改成手动创建、等线程确认退出后再删。
+                temp_dir = Path(tempfile.mkdtemp(prefix=".rvc-", dir=output_dir))
+                try:
+                    output_path = temp_dir / "converted.wav"
+                    if job.replace_cancel_requested:
+                        raise asyncio.CancelledError
+                    conversion_task = asyncio.create_task(
+                        request.app.state.voice_engine.convert(vocal_path, output_path)
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(conversion_task),
+                            timeout=application_settings.rvc_conversion_timeout_seconds,
+                        )
+                    except asyncio.CancelledError:
+                        # 外层被取消（PATCH 取消任务或进程收尾）时不能直接返回：RVC 推理线程无法
+                        # 强停，这里必须等它真正退出，否则临时目录会被提前删除、线程后续写文件失败，
+                        # 引擎锁也会在推理仍占用 GPU 时被释放。conversion_task 用 shield 保护，
+                        # 所以拿到的异常只反映线程自身的失败，可以安全折叠。
+                        await _await_stuck_replacement_worker(
+                            conversion_task, job_id=job_id, song=song, reason="cancelled"
+                        )
+                        raise
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            "vocal replacement timed out job_id=%s song=%s timeout_seconds=%s",
+                            job_id,
+                            song,
+                            application_settings.rvc_conversion_timeout_seconds,
+                        )
+                        job.replace_status = "failed"
+                        job.replace_stage = "failed"
+                        job.replace_progress = None
+                        job.replace_message = "人声替换超时"
+                        job.replace_error = "人声替换超时，请重试。"
+                        publish()
+                        # 失败状态已经对客户端生效，但线程仍在跑：这里继续等它退出，只为了让锁和
+                        # 临时目录与线程寿命对齐。等待时长不受超时约束，若线程永不返回，这个替换
+                        # 会一直占着并发额度——保持与 README 记载的语义一致，不做强制释放，
+                        # 只通过日志和 /api/health 把"卡住的收尾"暴露出来。
+                        await _await_stuck_replacement_worker(
+                            conversion_task, job_id=job_id, song=song, reason="timed out"
+                        )
+                        return
+                    if job.replace_cancel_requested:
+                        raise asyncio.CancelledError
+                    output_path.replace(result_path)
+                finally:
+                    # 走到这里 conversion_task 一定已经结束（成功/失败/两条收尾分支都等过它），
+                    # 所以删除临时目录不会再和推理线程抢文件。
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                result["replacedVocal"] = result_path.relative_to(
+                    application_settings.output_dir.resolve()
+                ).as_posix()
+                result["_replacedVocalModel"] = fingerprint
+                job.deleted_replaced_vocals.pop(str(song), None)
+                job.save(application_settings.output_dir)
+                job.replace_status = "succeeded"
+                job.replace_stage = "completed"
+                job.replace_progress = REPLACE_COMPLETE_PROGRESS
+                job.replace_message = "人声替换完成"
+            except asyncio.CancelledError:
+                job.replace_status = "cancelled"
+                job.replace_stage = "cancelled"
+                job.replace_progress = None
+                job.replace_message = "人声替换已取消"
+            except Exception:
+                logger.exception("vocal replacement failed job_id=%s song=%s", job_id, song)
+                job.replace_status = "failed"
+                job.replace_stage = "failed"
+                job.replace_progress = None
+                job.replace_message = "人声替换失败"
+                job.replace_error = "人声替换失败，请检查 RVC 配置后重试。"
+            finally:
+                job.replace_cancel_requested = False
+                await active_orchestrator.capacity.release()
+                publish()
+
+        job.replace_task = asyncio.create_task(execute(), name=f"replace-{job_id}-{song}")
+        return await _async_job_response(job, request, application_settings)
 
     @application.patch(
         "/api/jobs/{job_id}",
@@ -841,6 +1134,17 @@ def create_app(
             job.split_stage = "cancelled"
             job.split_progress = None
             job.split_message = "音轨分离已取消"
+        if (
+            job.replace_status in {"pending", "running"}
+            and job.replace_task is not None
+            and not job.replace_task.done()
+        ):
+            # ponytail: RVC runs in a worker thread and has no safe stop API; mark cancellation
+            # now, keep capacity reserved, then discard its output when inference returns.
+            _mark_replace_cancelled(job)
+            for queue in request.app.state.job_subscribers.get(job_id, ()):
+                if queue.empty():
+                    queue.put_nowait(None)
         if job.task is not None and not job.task.done():
             job.task.cancel()
             job.status = "cancelled"
@@ -851,7 +1155,7 @@ def create_app(
             for queue in request.app.state.job_subscribers.get(job_id, ()):
                 if queue.empty():
                     queue.put_nowait(None)
-        return _job_response(job, request, application_settings)
+        return await _async_job_response(job, request, application_settings)
 
     @application.delete(
         "/api/jobs/{job_id}/stems/{stem_name}",
@@ -884,14 +1188,35 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "音轨不存在或已被删除。"},
             )
+        is_vocal = stem_name.lower() in {"vocal", "vocals", "voice"}
+        replaced_url = result.get("replacedVocal") if is_vocal else None
+        replaced_model = result.get("_replacedVocalModel") if is_vocal else None
+        replaced_path = None
         try:
             target = _output_path_from_url(stem_url, application_settings)
             if not target.is_file():
                 raise OSError("stem file is missing")
+            if isinstance(replaced_url, str):
+                candidate = _output_path_from_url(replaced_url, application_settings)
+                if candidate.parent == target.parent and candidate.is_file():
+                    replaced_path = candidate
             trash = _stem_trash_path(target, application_settings, job_id, song)
             trash.parent.mkdir(parents=True, exist_ok=True)
             trash.unlink(missing_ok=True)
+            replaced_trash = None
+            if replaced_path is not None:
+                replaced_trash = trash_result_path(
+                    application_settings, replaced_path.name, job_id, song
+                )
+                replaced_trash.parent.mkdir(parents=True, exist_ok=True)
+                replaced_trash.unlink(missing_ok=True)
             target.replace(trash)
+            if replaced_path is not None and replaced_trash is not None:
+                try:
+                    replaced_path.replace(replaced_trash)
+                except OSError:
+                    trash.replace(target)
+                    raise
         except (OSError, ValueError):
             logger.exception("failed to delete stem job_id=%s stem=%s", job_id, stem_name)
             return JSONResponse(
@@ -910,6 +1235,35 @@ def create_app(
         result["stemUrls"] = list(stems.values())
         if isinstance(waveforms, dict):
             waveforms.pop(stem_name, None)
+        if is_vocal:
+            if (
+                job.replace_song == song
+                and job.replace_status in {"pending", "running"}
+                and job.replace_task is not None
+                and not job.replace_task.done()
+            ):
+                _mark_replace_cancelled(job)
+                for queue in request.app.state.job_subscribers.get(job_id, ()):
+                    if queue.empty():
+                        queue.put_nowait(None)
+            elif job.replace_song == song and (
+                job.replace_task is None or job.replace_task.done()
+            ):
+                job.replace_song = None
+                job.replace_status = None
+                job.replace_stage = None
+                job.replace_progress = None
+                job.replace_message = None
+                job.replace_error = None
+            result.pop("replacedVocal", None)
+            result.pop("_replacedVocalModel", None)
+            if replaced_path is None:
+                job.deleted_replaced_vocals.pop(str(song), None)
+            else:
+                deleted_replacement = {"url": replaced_url}
+                if isinstance(replaced_model, str):
+                    deleted_replacement["model"] = replaced_model
+                job.deleted_replaced_vocals[str(song)] = deleted_replacement
         job.message = f"音轨 {stem_name} 已删除"
         job.save(application_settings.output_dir)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -935,7 +1289,7 @@ def create_app(
 
         stems = result.get("stems", {})
         if stem_name in stems:
-            return _job_response(job, request, application_settings)
+            return await _async_job_response(job, request, application_settings)
         deleted_key = f"{song}:{stem_name}"
         deleted = job.deleted_stems.get(deleted_key)
         if deleted is None:
@@ -953,8 +1307,38 @@ def create_app(
                     status_code=status.HTTP_404_NOT_FOUND,
                     content={"success": False, "message": "删除的音轨文件已不存在，无法恢复。"},
                 )
+            deleted_replacement = (
+                job.deleted_replaced_vocals.get(str(song))
+                if stem_name.lower() in {"vocal", "vocals", "voice"}
+                else None
+            )
+            replaced_path = replaced_trash = None
+            if isinstance(deleted_replacement, dict) and isinstance(
+                deleted_replacement.get("url"), str
+            ):
+                replaced_path = _output_path_from_url(
+                    deleted_replacement["url"], application_settings
+                )
+                replaced_trash = trash_result_path(
+                    application_settings, replaced_path.name, job_id, song
+                )
+                if not replaced_trash.is_file():
+                    return JSONResponse(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        content={
+                            "success": False,
+                            "message": "删除的替换人声文件已不存在，无法恢复。",
+                        },
+                    )
             target.parent.mkdir(parents=True, exist_ok=True)
             trash.replace(target)
+            if replaced_path is not None and replaced_trash is not None:
+                replaced_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    replaced_trash.replace(replaced_path)
+                except OSError:
+                    target.replace(trash)
+                    raise
         except (OSError, ValueError):
             logger.exception("failed to restore stem job_id=%s stem=%s", job_id, stem_name)
             return JSONResponse(
@@ -969,10 +1353,15 @@ def create_app(
         waveforms = result.get("waveforms")
         if isinstance(waveforms, dict) and deleted["waveform"] is not None:
             waveforms[stem_name] = deleted["waveform"]
+        if isinstance(deleted_replacement, dict):
+            result["replacedVocal"] = deleted_replacement["url"]
+            if isinstance(deleted_replacement.get("model"), str):
+                result["_replacedVocalModel"] = deleted_replacement["model"]
+            job.deleted_replaced_vocals.pop(str(song), None)
         del job.deleted_stems[deleted_key]
         job.message = f"音轨 {stem_name} 已恢复"
         job.save(application_settings.output_dir)
-        return _job_response(job, request, application_settings)
+        return await _async_job_response(job, request, application_settings)
 
     @application.get("/output/{file_path:path}")
     async def audio_file(file_path: str, request: Request) -> StreamingResponse:
@@ -1044,15 +1433,139 @@ def _split_status_override(job: GenerationJob) -> str | None:
     return None
 
 
+def _operation_status_override(job: GenerationJob) -> str | None:
+    if job.replace_status in {"pending", "running"}:
+        return job.replace_status
+    return _split_status_override(job)
+
+
+def _mark_replace_cancelled(job: GenerationJob) -> None:
+    job.replace_cancel_requested = True
+    job.replace_status = "cancelled"
+    job.replace_stage = "cancelled"
+    job.replace_progress = None
+    job.replace_message = "人声替换已取消"
+    job.replace_error = None
+
+
+def _reported_replace_status(
+    job: GenerationJob, settings: Settings, *, fingerprint: str | None = None
+) -> str | None:
+    """对外汇报的替换状态：有在途操作就报它，否则从结果里推导。
+
+    只依赖 job.replace_status 会有两个洞：它不落盘（重启后回到 None），也不被"恢复被删除的
+    替换结果"这条路径重新赋值。于是客户端会收到"result 里有 replacedVocal、replaceStatus 却
+    是 null"的矛盾响应，前端的替换状态机会直接判失败（"生成服务未返回人声替换状态"），
+    撤回删除后再点替换就再也走不通。这里以结果为准补齐终态：
+
+    - 有 replacedVocal、且模型指纹与当前模型一致（或这条旧数据没有指纹）→ succeeded；
+    - 指纹不一致说明缓存已失效，交给 /replace 重新推理，不在这里谎报成功。
+    """
+    if job.replace_status is not None:
+        return job.replace_status
+    result = job.result
+    if not isinstance(result, dict) or not isinstance(result.get("replacedVocal"), str):
+        return None
+    recorded = result.get("_replacedVocalModel")
+    if isinstance(recorded, str):
+        if recorded != fingerprint:
+            return None
+    return "succeeded"
+
+
+async def _await_stuck_replacement_worker(
+    conversion_task: asyncio.Task[None], *, job_id: str, song: int, reason: str
+) -> None:
+    """等待已经进入终态、但 RVC 线程仍在跑的替换收尾。
+
+    额度按设计保留到线程真正退出（详见 README），所以这里的等待没有上限；为了让运维能发现
+    "线程不返回、额度一直被占"的情况，等待期间计数并写日志，线程退出后再撤销。
+    """
+    global _replacement_wind_down_active
+    _replacement_wind_down_active += 1
+    logger.warning(
+        "vocal replacement worker still running after %s; holding capacity until it exits "
+        "job_id=%s song=%s",
+        reason,
+        job_id,
+        song,
+    )
+    try:
+        await conversion_task
+    except Exception:
+        logger.warning(
+            "vocal replacement worker failed while winding down job_id=%s song=%s",
+            job_id,
+            song,
+            exc_info=True,
+        )
+    finally:
+        _replacement_wind_down_active = max(0, _replacement_wind_down_active - 1)
+        logger.warning(
+            "vocal replacement worker exited job_id=%s song=%s", job_id, song
+        )
+
+
+@lru_cache(maxsize=8)
+def _file_sha256(path: str, _size: int, _mtime_ns: int) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _rvc_model_fingerprint(settings: Settings) -> str:
+    paths = [settings.rvc_model_path, settings.rvc_index_path]
+    parts = [settings.rvc_model_version]
+    for path in paths:
+        if path is None:
+            parts.append("")
+            continue
+        try:
+            stat = path.stat()
+            parts.append(_file_sha256(str(path.resolve()), stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            parts.append("missing")
+    return f"v1:{hashlib.sha256(chr(0).join(parts).encode()).hexdigest()}"
+
+
+async def _async_job_response(
+    job: GenerationJob, request: Request, settings: Settings
+) -> dict[str, Any]:
+    result = job.result
+    fingerprint = (
+        request.app.state.rvc_model_fingerprint
+        if job.replace_status is None
+        and isinstance(result, dict)
+        and isinstance(result.get("replacedVocal"), str)
+        and isinstance(result.get("_replacedVocalModel"), str)
+        else None
+    )
+    return _job_response(job, request, settings, fingerprint=fingerprint)
+
+
 def _job_response(
     job: GenerationJob,
     request: Request,
     settings: Settings,
     *,
     include_split: bool = True,
+    include_operations: bool = True,
     include_waveforms: bool = True,
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     response = job.response()
+    if job.result is not None:
+        response["result"] = _render_result_urls(
+            job.result,
+            _public_base_url(request, settings),
+            settings,
+            include_waveforms=include_waveforms,
+        )
+    if not include_operations:
+        return response
+
     split_status = _split_status_override(job)
     if include_split and split_status is not None:
         response.update(
@@ -1061,17 +1574,22 @@ def _job_response(
             progress=job.split_progress,
             message=job.split_message,
         )
-    if include_split and job.split_status is not None:
+    if job.split_status is not None:
         response["splitStatus"] = job.split_status
         response["splitSong"] = job.split_song
         response["splitError"] = job.split_error
-    if job.result is not None:
-        response["result"] = _render_result_urls(
-            job.result,
-            _public_base_url(request, settings),
-            settings,
-            include_waveforms=include_waveforms,
+    replace_status = _reported_replace_status(job, settings, fingerprint=fingerprint)
+    if replace_status in {"pending", "running"}:
+        response.update(
+            status=replace_status,
+            stage=job.replace_stage,
+            progress=job.replace_progress,
+            message=job.replace_message,
         )
+    if replace_status is not None:
+        response["replaceStatus"] = replace_status
+        response["replaceSong"] = job.replace_song
+        response["replaceError"] = job.replace_error
     return response
 
 
@@ -1097,6 +1615,11 @@ def _render_result_urls(
                 if isinstance(url, str)
             }
             output["stemUrls"] = list(output["stems"].values())
+        replaced_vocal = output.get("replacedVocal")
+        if isinstance(replaced_vocal, str):
+            output["replacedVocal"] = _public_audio_url(replaced_vocal, base_url, settings)
+        for key in [key for key in output if isinstance(key, str) and key.startswith("_")]:
+            del output[key]
     return rendered
 
 
