@@ -114,6 +114,7 @@ class Settings(BaseSettings):
     rvc_cpu_threads: int = Field(default_factory=lambda: min(6, os.cpu_count() or 1), ge=1)
     rvc_max_upload_mb: int = Field(default=50, ge=1)
     rvc_conversion_timeout_seconds: float = Field(default=1800, gt=0)
+    rvc_mix_timeout_seconds: float = Field(default=180, gt=0, allow_inf_nan=False)
 
     task_backend: Literal["inline"] = "inline"
     cache_backend: Literal["none"] = "none"

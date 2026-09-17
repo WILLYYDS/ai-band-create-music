@@ -608,3 +608,28 @@ async def test_direct_failure_is_persisted(tmp_path):
     row = next(iter(load_jobs(settings.output_dir).values()))
     assert row.status == "failed"
     assert row.error == "provider died"
+
+
+async def test_resplit_keeps_the_mix_lane_of_an_untouched_artifact(tmp_path, monkeypatch):
+    """重拆轨只重建 full 与四条分轨，不能把合轨成品的车道一起抹掉。
+
+    否则客户端会拿到"有 mixedTrack、却没有 mix 车道"的歌曲：编辑器少一条车道，
+    而成品本身并没有被重拆轨改变。
+    """
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
+    monkeypatch.setattr("app.main.extract_waveforms", AsyncMock(return_value=split_waveforms()))
+    async with client(app) as http:
+        job_id = (await http.post("/api/generate", json={"prompt": "rock"})).json()["jobId"]
+        result = app.state.jobs[job_id].result
+        result["mixedTrack"] = f"jobs/{job_id}/song_1/demo_rvc_mix.wav"
+        result["waveforms"] = {"full": [0.25], "mix": [0.75] * 640}
+
+        assert (await http.post(f"/api/jobs/{job_id}/split?song=0")).status_code == 202
+        await app.state.jobs[job_id].split_task
+        completed = (await http.get(f"/api/jobs/{job_id}")).json()["result"]
+
+    assert completed["mixedTrack"].endswith("/song_1/demo_rvc_mix.wav")
+    assert completed["waveforms"]["mix"] == [0.75] * 640
+    assert set(completed["waveforms"]) == {"full", "mix", "vocal", "drums", "bass", "other"}
