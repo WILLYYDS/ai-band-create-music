@@ -153,6 +153,7 @@ class RequestSizeLimitMiddleware:
 class GenerationJob:
     job_id: str
     prompt: str
+    title: str | None = None
     structured_prompt: str | None = None
     lyrics: str | None = None
     status: str = "pending"
@@ -198,6 +199,7 @@ class GenerationJob:
         return {
             "jobId": self.job_id,
             "createdAt": self.created_at,
+            "title": self.title,
             "step": self.step,
             "totalSteps": self.total_steps,
             "prompt": self.prompt,
@@ -246,6 +248,7 @@ def load_jobs(output_dir: Path) -> dict[str, GenerationJob]:
             job = GenerationJob(
                 job_id=validated.jobId,
                 prompt=validated.prompt,
+                title=validated.title,
                 created_at=validated.createdAt,
                 structured_prompt=validated.structuredPrompt,
                 lyrics=validated.lyrics,
@@ -607,7 +610,12 @@ def create_app(
             if payload.count == 2 and selected_provider == "elevenlabs_music"
             else None
         )
-        job = GenerationJob(job_id=job_id, prompt=prompt, warning=warning)
+        job = GenerationJob(
+            job_id=job_id,
+            prompt=prompt,
+            title=(payload.title or "").strip() or None,
+            warning=warning,
+        )
 
         def publish() -> None:
             for queue in request.app.state.job_subscribers.get(job_id, ()):
@@ -1878,12 +1886,16 @@ def _orchestrator(request: Request) -> GenerationOrchestrator:
     return active
 
 
-def _generation_parameters(payload: GenerateRequest, settings: Settings) -> tuple[str, int | None]:
+def _generation_parameters(
+    payload: GenerateRequest, settings: Settings
+) -> tuple[str, int | float | None]:
     prompt = payload.prompt.strip()
     if not prompt:
         raise ValueError("prompt 不能为空，请输入歌曲风格描述。")
     if len(prompt) > settings.prompt_max_chars:
         raise ValueError(f"prompt 不能超过 {settings.prompt_max_chars} 个字符。")
+    if payload.durationSeconds is not None:
+        return prompt, payload.durationSeconds / 60
     if payload.durationMinutes is None or (
         isinstance(payload.durationMinutes, str)
         and payload.durationMinutes.strip().lower() == "auto"

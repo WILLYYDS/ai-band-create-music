@@ -675,6 +675,36 @@ async def test_prepare_accepts_style_tags_as_json_array(tmp_path: Path) -> None:
     assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
 
 
+async def test_prepare_accepts_unbracketed_style_tag_array(tmp_path: Path) -> None:
+    # Real Qwen3.5 response shape: JSON array items without square brackets.
+    tags = [
+        "Genre: Hardcore Hip-Hop",
+        "Tempo: 140 BPM",
+        "Mood: Aggressive, Furious, Defiant",
+        "Vocals: Raw, Distorted, High-Energy Rap",
+        "Instrumentation: Heavy Distorted 808 Bass, Aggressive Drums, Fuzz Guitar",
+        "Arrangement: Minimalist, Fast-Paced, Chaotic Energy",
+        "Production: Lo-Fi Texture, Overdriven Mix, Punchy Transients",
+        "Mixing: Front-Loaded Vocals, Wide Stereo Bass, Aggressive EQ",
+        "Mastering: Loudness Maximized, Distorted Clipping, Hard Limiting",
+        "Structure: Compact, No Filler, Immediate Impact",
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        content = json.dumps({"taggedLyrics": "[Verse]\n第一句\n第二句", "styleTags": tags})
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
+            "[歌词与创作内容]\n第一句\n第二句\n\n[风格要求]\n硬核说唱", 0.5
+        )
+
+    assert prepared.structured_prompt.startswith("[Genre: Hardcore Hip-Hop]")
+    assert prepared.structured_prompt.count("[") == len(tags)
+    assert prepared.duration_seconds == 30
+
+
 async def test_lyrics_writer_handles_partitioned_content(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

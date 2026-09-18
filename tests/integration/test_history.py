@@ -633,3 +633,16 @@ async def test_resplit_keeps_the_mix_lane_of_an_untouched_artifact(tmp_path, mon
     assert completed["mixedTrack"].endswith("/song_1/demo_rvc_mix.wav")
     assert completed["waveforms"]["mix"] == [0.75] * 640
     assert set(completed["waveforms"]) == {"full", "mix", "vocal", "drums", "bass", "other"}
+    
+    
+async def test_job_title_is_listed_and_survives_restart(tmp_path):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    async with client(app) as http:
+        job_id = (
+            await http.post("/api/jobs", json={"prompt": "rock", "title": " 毕业后的狂响 "})
+        ).json()["jobId"]
+        await app.state.jobs[job_id].task
+        history = (await http.get("/api/jobs")).json()["jobs"]
+    assert history[0]["title"] == "毕业后的狂响"
+    assert load_jobs(settings.output_dir)[job_id].title == "毕业后的狂响"
