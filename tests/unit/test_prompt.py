@@ -801,3 +801,66 @@ def test_composition_plan_enhancement_is_non_mutating_and_limits_lines() -> None
     assert enhanced["sections"][0]["lines"] == ["一", "二"]
     assert "clear vocal articulation" in enhanced["positive_global_styles"]
     assert "mumbled vocals" in enhanced["negative_global_styles"]
+
+
+#: What the group chat's 带入创作 hands over: the lyrics the members wrote,
+#: plus the genre the user confirmed with the phase button.
+CHAT_HANDOFF_PROMPT = "[歌词与创作内容]\n雨夜的便利店\n灯还亮着\n\n[风格要求]\nrap，trap，90 BPM"
+
+
+def test_the_chat_handoff_splits_the_confirmed_genre_back_out() -> None:
+    assert split_generation_prompt(CHAT_HANDOFF_PROMPT) == (
+        "雨夜的便利店\n灯还亮着",
+        "rap，trap，90 BPM",
+    )
+
+
+async def test_prepare_asks_the_model_to_keep_the_requested_genre(
+    tmp_path: Path,
+) -> None:
+    """The music model only ever sees the expansion, never the raw style.
+
+    `build_elevenlabs_planning_prompt` is built from `structured_prompt`
+    alone, so a rewrite here is the whole song — and nothing downstream can
+    tell that the genre changed: `is_expanded_music_prompt` only checks that
+    a genre category exists, not which genre it names.
+    """
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "taggedLyrics": "[Verse]\n雨夜的便利店\n灯还亮着",
+                                    "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    settings = make_settings(
+        tmp_path,
+        llm_api_key="secret",
+        llm_base_url="https://llm.test/v1",
+        llm_model="doubao-seed-evolving",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await OpenAICompatiblePromptExpander(settings, client).prepare(
+            CHAT_HANDOFF_PROMPT
+        )
+
+    body = json.loads(requests[0].content)
+    assert "rap，trap，90 BPM" in body["messages"][1]["content"]
+    system_prompt = body["messages"][0]["content"]
+    assert "保留用户指定的曲风" in system_prompt
+    assert "不得换成你认为更合适的曲风" in system_prompt
