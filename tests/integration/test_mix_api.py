@@ -433,7 +433,15 @@ async def test_admission_rules(tmp_path, install_stubs):
     assert len(mixer.calls) == 1 and orchestrator.capacity.active == 0
 
 
-async def test_running_song_operations_block_mix(tmp_path, install_stubs):
+@pytest.mark.parametrize("status", ["running", "cancelled"])
+async def test_song_operations_block_mix_until_their_task_really_ends(
+    tmp_path, install_stubs, status
+):
+    """拆轨/替换在跑时拒绝合轨；已进入终态但线程还在收尾（task 未结束）时同样拒绝。
+
+    后者是替换超时/取消后的真实状态：状态字段已是 failed/cancelled，`replace_task` 仍在
+    `_await_stuck_replacement_worker` 里等 RVC 线程退出——此时放行合轨就会去读那份人声。
+    """
     mixer = install_stubs()
     settings = make_settings(tmp_path)
     app = build_app(settings)
@@ -442,7 +450,7 @@ async def test_running_song_operations_block_mix(tmp_path, install_stubs):
     for operation in ("split", "replace"):
         task = asyncio.create_task(release.wait())
         setattr(job, f"{operation}_task", task)
-        setattr(job, f"{operation}_status", "running")
+        setattr(job, f"{operation}_status", status)
         setattr(job, f"{operation}_song", 0)
         async with client(app) as http:
             assert_error(await http.post(mix_url(job)), 409)
@@ -844,6 +852,17 @@ async def test_deleting_an_input_invalidates_and_restore_brings_the_mix_back(
     assert undone.status_code in {200, 204}
     assert restored["mixStatus"] == "succeeded"
     assert restored["result"]["waveforms"]["mix"] == MIX_WAVEFORM
+
+    # 还原自带防护：已有更新的成品时不得覆盖（这条路径目前经 API 不可达——分轨被删时
+    # /mix 必然 409——但准入规则一旦放宽就会立刻暴露，所以把语义钉住）。
+    from app.services.job_files import restore_mix_artifact
+
+    fresh = {"mixedTrack": "jobs/x/song_1/new_rvc_mix.wav", "waveforms": {"mix": [0.9] * 640}}
+    stale = {"mixTrack": "jobs/x/song_1/old_rvc_mix.wav", "mixWaveform": [0.5] * 640}
+    assert restore_mix_artifact(fresh, stale) is False
+    assert fresh["mixedTrack"].endswith("new_rvc_mix.wav")
+    assert fresh["waveforms"]["mix"][0] == 0.9
+    assert restore_mix_artifact({}, {}) is False
 
 
 async def test_voice_result_manages_only_derived_audio(tmp_path, install_stubs):

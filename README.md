@@ -140,8 +140,9 @@ curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/replace?song=0'
 
 ## 合轨导出
 
-四轨分离并替换人声后，把替换后的人声与 drums/bass/other 合成一首成品。音频处理与原版
-实现逐字一致：人声先做 `equalizer f=3000 t=q w=1 g=2.5` + `volume=3dB`，再四路
+四轨分离并替换人声后，把替换后的人声与 drums/bass/other 合成一首成品。音频处理步骤与原
+实现一致——滤镜图、响度补偿与限幅参数逐字相同，执行器改用仓库统一的 async 子进程写法。
+人声先做 `equalizer f=3000 t=q w=1 g=2.5` + `volume=3dB`，再四路
 `amix=inputs=4:duration=longest:dropout_transition=0:normalize=0`；随后用 `loudnorm`
 测出成品与原曲的响度差、按最大 ±12 dB 补偿，最后过一次
 `alimiter=limit=0.891251`（−1 dBFS 真峰、latency 补偿）。输出沿用原曲的采样率与声道数
@@ -160,7 +161,8 @@ curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/mix?song=0'
 - 成品写入 `output/jobs/<jobId>/song_<n>/<人声名>_rvc_mix.wav`（与 `fullTrack`、各分轨
   同一目录），以 `mixedTrack` 暴露，并写入该歌曲 `waveforms` 的 `mix` 车道（640 bin）。
   元数据先落盘、成品文件后原子替换；若进程恰好死在两步之间，重启时会摘掉指向不存在文件的
-  引用（不会对外报"有成品"却 404）。
+  引用（不会对外报"有成品"却 404）。重启时还会清理被硬杀留下的 `.mix-*` 中间目录；隐藏目录
+  （`.trash`、`.mix-*`）一律不通过 `/output` 对外提供。
   `GET /api/jobs` 的 history 投影里同样带 `mixedTrack`，可直接播放；历史列表按既有约定
   不返回波形，也不返回合轨运行态。
 - 文件名固定、同名覆盖：混音在临时目录完成后才原子替换成品，因此**失败、超时、取消都不会
@@ -174,7 +176,8 @@ curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/mix?song=0'
 - 入参不合法时返回 400（路径形状/任务 id）、404（输入文件不存在/不可读、歌曲不存在）、
   409（任务未完成、缺音轨、模型已变更、已有音频操作在跑）、429（额度用满）。超时阈值为
   `RVC_MIX_TIMEOUT_SECONDS`（默认 180 秒），也可从 `GET /api/health` 的
-  `mixing.timeoutSeconds` 读取。混音本身的失败或超时（含静音输入）不改变 HTTP
+  `mixing.timeoutSeconds` 读取；同处还有 `mixing.modelGuardEnforced`，用于判断当前实例的
+  模型指纹守卫是否真的生效（缺资产时为 false）。混音本身的失败或超时（含静音输入）不改变 HTTP
   状态：任务级入口已经返回 202，结果通过 `mixStatus=failed` 与 `mixError` 暴露，
   错误只返回通用文案，细节写日志。`PATCH /api/jobs/<jobId>` 可取消：立即标记
   `mixStatus=cancelled`，回收 FFmpeg 进程并丢弃半成品后再释放并发额度。
@@ -197,6 +200,9 @@ curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/mix?song=0'
 - `mixedTrack` 与 `mix` 车道成对出现，但有两个例外要按字面理解：波形提取失败时成品照常发布
   而没有 `mix` 车道（见下）；`GET /api/jobs` 的 history 投影按约定不返回波形。客户端不要用
   `waveforms["mix"]` 的存在与否判断"有没有成品"，请直接看 `mixedTrack`。
+- 替换执行期间若进程重启：准入阶段已把 `replacedVocal` 与 `mixedTrack` 的引用摘掉并落盘，
+  重启后保持"没有有效替换人声"（两份文件都还在盘上），需要重新替换。这是刻意的安全默认：
+  不复活一份无法验证的替换人声。
 - 替换人声的模型指纹（`RVC_MODEL_PATH`/`RVC_INDEX_PATH`/`RVC_MODEL_VERSION` 变了）与结果里
   记录的不符时，合轨返回 409 并提示先重新替换：否则会用旧模型的人声渲染出一个看起来正常的
   成品。这一点与 `/replace` 判定缓存失效的判据一致。

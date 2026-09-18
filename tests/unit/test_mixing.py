@@ -10,6 +10,7 @@ import asyncio
 import json
 import math
 import re
+import shutil
 import struct
 import subprocess
 import wave
@@ -171,10 +172,13 @@ async def test_mix_timeout_kills_ffmpeg_and_reports_failure(tmp_path, tracks):
         await mix_tracks(inputs, master, output, 0.001)
 
     assert not output.exists()
-    # No stray ffmpeg/ffprobe process may outlive the timed-out mix.
-    await asyncio.sleep(0.2)
-    leftover = subprocess.run(["pgrep", "-fa", "ffmpeg"], capture_output=True, text=True).stdout
-    assert "mix.wav" not in leftover
+    # No stray ffmpeg/ffprobe process may outlive the timed-out mix. pgrep 不是到处都有
+    # （精简镜像、macOS 默认没有），缺了就跳过这项检查，而不是让断言崩掉。
+    pgrep = shutil.which("pgrep")
+    if pgrep is not None:
+        await asyncio.sleep(0.2)
+        leftover = subprocess.run([pgrep, "-fa", "ffmpeg"], capture_output=True, text=True).stdout
+        assert "mix.wav" not in leftover
 
 
 def loudness(path: Path) -> float:

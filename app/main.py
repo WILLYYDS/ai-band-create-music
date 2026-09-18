@@ -304,6 +304,11 @@ def load_jobs(output_dir: Path) -> dict[str, GenerationJob]:
             jobs[job.job_id] = job
         except (OSError, ValueError, TypeError):
             logger.exception("Unable to load job metadata: %s", target)
+    for leftover in sorted((output_dir / "jobs").glob("*/song_*/.mix-*")):
+        # 进程被硬杀时，混音用的临时目录（内含体积不小的 premix.wav）会留在歌曲目录下；
+        # 启动时没有任何合轨在跑，直接清掉，避免长期堆积。
+        logger.warning("removing stale mix workdir left by an interrupted mix: %s", leftover)
+        shutil.rmtree(leftover, ignore_errors=True)
     return jobs
 
 
@@ -479,8 +484,9 @@ def create_app(
             },
             "mixing": {
                 "timeoutSeconds": application_settings.rvc_mix_timeout_seconds,
-                # 合轨必须基于已替换的人声；没有 replacedVocal 时返回 409。
-                "requiresReplacedVocal": True,
+                # 模型指纹守卫只在资产确实在场时才生效；缺挂载的实例会放行合轨（见 README），
+                # 这里显式暴露，运维不必去翻日志里那条 warning。
+                "modelGuardEnforced": _rvc_assets_present(application_settings),
             },
             "replacement": {
                 "conversionTimeoutSeconds": application_settings.rvc_conversion_timeout_seconds,
@@ -1138,8 +1144,9 @@ def create_app(
             job.replace_previous = capture_mix_artifact(result) or None
             result.pop("replacedVocal", None)
             result.pop("_replacedVocalModel", None)
-            # 判定失效的正是"合轨成品所依据的那份人声"，所以成品引用必须在同一次落盘里一起
-            # 摘掉：否则替换重跑失败时，job.json 会留下"没有替换人声、却有成品"的矛盾记录。
+            # 判定失效的正是"合轨成品所依据的那份人声"，所以成品引用也在同一次落盘里摘掉：
+            # 替换**成功**时成品就此过期（不会继续被当成最新）。替换失败/超时/取消时，由
+            # _restore_stashed_mix 把这个成品引用还回来——文件没被动过，用户仍应能试听。
             invalidate_mix_artifact(job, result)
             job.save(application_settings.output_dir)
 
@@ -1835,13 +1842,11 @@ def create_app(
             if isinstance(deleted_replacement.get("model"), str):
                 result["_replacedVocalModel"] = deleted_replacement["model"]
             job.deleted_replaced_vocals.pop(str(song), None)
-        if "mixTrack" not in result and stored_path_exists(
-            application_settings.output_dir, deleted.get("mixTrack")
-        ):
+        if stored_path_exists(application_settings.output_dir, deleted.get("mixTrack")):
             # 删除分轨时作废的成品：文件还在（同名覆盖只会由下一次合轨写），恢复引用与车道。
-            result["mixedTrack"] = deleted["mixTrack"]
-            if isinstance(waveforms, dict) and isinstance(deleted.get("mixWaveform"), list):
-                waveforms["mix"] = deleted["mixWaveform"]
+            # 用 helper 而不是裸写：它自带"已有更新的成品就不覆盖"的防护，并会一并写回 mix
+            # 车道（裸写只判断暂存键，会拿过期车道覆盖掉更新的成品）。
+            restore_mix_artifact(result, deleted)
         del job.deleted_stems[deleted_key]
         job.message = f"音轨 {stem_name} 已恢复"
         job.save(application_settings.output_dir)
@@ -1855,7 +1860,8 @@ def create_app(
             relative = target.relative_to(root)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="Audio file not found") from exc
-        if ".trash" in relative.parts or relative.parts[:1] == ("rvc",):
+        # 隐藏目录一律不对外：.trash 是软删除区，.mix-* 是合轨的中间产物。
+        if any(part.startswith(".") for part in relative.parts) or relative.parts[:1] == ("rvc",):
             raise HTTPException(status_code=404, detail="Audio file not found")
         if not target.is_file():
             raise HTTPException(status_code=404, detail="Audio file not found")

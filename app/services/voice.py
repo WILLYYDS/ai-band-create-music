@@ -5,7 +5,6 @@ import json
 import logging
 import math
 import re
-import subprocess
 import tempfile
 from contextlib import suppress
 from pathlib import Path
@@ -39,6 +38,14 @@ LIMIT_FILTER = (
 
 class RVCConversionError(RuntimeError):
     """Raised when the local RVC inference engine cannot convert an input file."""
+
+
+class MixTimeoutError(RVCConversionError):
+    """内部信号：某个 ffmpeg 步骤用光了剩余预算。
+
+    对外统一由 :func:`mix_tracks` 报成配置的总超时，避免日志与持久化错误里出现
+    "剩余 12.3 秒"这种与 RVC_MIX_TIMEOUT_SECONDS 对不上的数字。
+    """
 
 
 def mix_busy(job) -> bool:
@@ -395,11 +402,26 @@ async def mix_tracks(
     output_path: Path,
     timeout_seconds: float,
 ) -> None:
-    """原 `_mix_tracks`，逻辑逐字保留。
+    """合轨入口：把内部超时统一报成配置的总超时。
 
-    改名为公开函数只是因为路由按仓库约定挪到了 `app/main.py`（replace/split 同构），
-    需要跨模块调用；函数体、滤镜图、响度补偿与限幅参数都没有改动。
+    原 `_mix_tracks` 的步骤序列原封不动地留在 :func:`_mix_steps`（滤镜图、响度补偿、
+    限幅参数与执行顺序都没有改动）；改名为公开函数只是因为路由按仓库约定挪到了
+    `app/main.py`（replace/split 同构），需要跨模块调用。
     """
+    try:
+        await _mix_steps(inputs, reference_path, output_path, timeout_seconds)
+    except MixTimeoutError as exc:
+        raise RVCConversionError(
+            f"FFmpeg mixing timed out after {timeout_seconds:g} seconds"
+        ) from exc
+
+
+async def _mix_steps(
+    inputs: list[Path],
+    reference_path: Path,
+    output_path: Path,
+    timeout_seconds: float,
+) -> None:
     environment = prepare_ffmpeg_environment()
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
@@ -407,7 +429,7 @@ async def mix_tracks(
     def remaining() -> float:
         value = deadline - loop.time()
         if value <= 0:
-            raise RVCConversionError(f"FFmpeg mixing timed out after {timeout_seconds:g} seconds")
+            raise MixTimeoutError("mix budget exhausted")
         return value
 
     sample_rate, channels, codec = await _master_audio_format(
@@ -540,32 +562,32 @@ async def _run_ffmpeg(
     *,
     capture_stdout: bool = False,
 ) -> str:
-    started = asyncio.get_running_loop().time()
+    """跑一个 ffmpeg/ffprobe 步骤；用法与 stems.py 的 Demucs 执行器保持一致。
+
+    与旧实现（Popen + 50ms 轮询 + 在事件循环上阻塞 wait）相比，命令、参数与超时预算语义
+    都没有变化，但不再阻塞事件循环，并显式关闭子进程 stdin（ffprobe 命令没带 `-nostdin`）。
+    输出仍写临时文件而不是管道：既不占内存，也不会因为调用方取消而留下未读的管道。
+    """
     with tempfile.TemporaryFile() as output_stream, tempfile.TemporaryFile() as error_stream:
         try:
-            process = subprocess.Popen(
-                command,
+            process = await asyncio.create_subprocess_exec(
+                *command,
                 env=environment,
-                stdout=output_stream if capture_stdout else subprocess.DEVNULL,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=output_stream if capture_stdout else asyncio.subprocess.DEVNULL,
                 stderr=error_stream,
             )
         except OSError as exc:
             raise RVCConversionError(f"Unable to start FFmpeg: {exc}") from exc
         try:
-            while process.poll() is None:
-                if asyncio.get_running_loop().time() - started >= timeout_seconds:
-                    with suppress(ProcessLookupError):
-                        process.kill()
-                    process.wait()
-                    raise RVCConversionError(
-                        f"FFmpeg mixing timed out after {timeout_seconds:g} seconds"
-                    )
-                await asyncio.sleep(0.05)
-        except asyncio.CancelledError:
+            await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
             with suppress(ProcessLookupError):
                 process.kill()
-            process.wait()
-            raise
+            await process.wait()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise MixTimeoutError("ffmpeg step timed out") from exc
         error_stream.seek(0)
         detail = error_stream.read().decode("utf-8", errors="replace")
         output_stream.seek(0)
