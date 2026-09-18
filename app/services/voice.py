@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import re
+import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import unquote, urlsplit
@@ -11,13 +15,52 @@ from fastapi import FastAPI, Form, HTTPException, Request
 
 from app.core.config import Settings
 from app.services.audio_files import output_path_from_url
-from app.services.job_files import job_song_dir
+from app.services.job_files import (
+    capture_mix_artifact,
+    invalidate_mix_artifact,
+    job_song_dir,
+    restore_mix_artifact,
+    stored_path_exists,
+)
+from app.services.stems import prepare_ffmpeg_environment
 
 logger = logging.getLogger(__name__)
+
+MIX_FILTER = (
+    "[0:a]equalizer=f=3000:t=q:w=1:g=2.5,volume=3dB[vocal];"
+    "[vocal][1:a][2:a][3:a]"
+    "amix=inputs=4:duration=longest:dropout_transition=0:normalize=0[premix]"
+)
+LIMIT_FILTER = (
+    "volume={gain_db:.3f}dB,alimiter=limit=0.891251:attack=5:release=50:level=false:latency=true"
+)
 
 
 class RVCConversionError(RuntimeError):
     """Raised when the local RVC inference engine cannot convert an input file."""
+
+
+class MixTimeoutError(RVCConversionError):
+    """内部信号：某个 ffmpeg 步骤用光了剩余预算。
+
+    对外统一由 :func:`mix_tracks` 报成配置的总超时，避免日志与持久化错误里出现
+    "剩余 12.3 秒"这种与 RVC_MIX_TIMEOUT_SECONDS 对不上的数字。
+    """
+
+
+def mix_busy(job) -> bool:
+    """True while a mix of this job is queued or running.
+
+    Lives here, rather than in the mix endpoint module, because every voice and job
+    endpoint has to refuse work that would race the mix's input files, and this module
+    is the one both of them already import (importing the mix module from here would be
+    a cycle).
+    """
+    if job is None:
+        return False
+    return getattr(job, "mix_status", None) in {"pending", "running"} or (
+        getattr(job, "mix_task", None) is not None and not job.mix_task.done()
+    )
 
 
 class RVCEngine:
@@ -149,35 +192,49 @@ def install_voice_api(
     ) -> dict[str, bool]:
         job = request.app.state.jobs.get(job_id)
         job_result = _job_song_result(request, job_id, song)
+        if mix_busy(job):
+            raise HTTPException(status_code=409, detail="正在合轨，请稍后重试。")
         result_path = _result_path(settings, filename, job_id, song)
+        # 这个入口只管理"派生音频"的软删除。母带删掉整首歌就没法播放了，所以明确拒绝
+        # （与"完整混音不能作为分轨删除"同一考虑）。
+        if _resolves_to(settings, job_result.get("fullTrack"), result_path):
+            raise HTTPException(status_code=409, detail="完整音频不能作为替换产物删除。")
         if not result_path.is_file():
             raise HTTPException(status_code=404, detail="Converted audio not found")
         trash_path = trash_result_path(settings, filename, job_id, song)
         trash_path.parent.mkdir(parents=True, exist_ok=True)
         trash_path.unlink(missing_ok=True)
         result_path.replace(trash_path)
-        replaced_vocal = job_result.get("replacedVocal")
-        if isinstance(replaced_vocal, str):
-            try:
-                advertised_path = output_path_from_url(replaced_vocal, settings.output_dir)
-            except ValueError:
-                advertised_path = None
-            if advertised_path == result_path:
-                deleted = {"url": job_result.pop("replacedVocal")}
-                model = job_result.pop("_replacedVocalModel", None)
-                if isinstance(model, str):
-                    deleted["model"] = model
-                job.deleted_replaced_vocals[str(song)] = deleted
-                if job.replace_song == song and (
-                    job.replace_task is None or job.replace_task.done()
-                ):
-                    job.replace_song = None
-                    job.replace_status = None
-                    job.replace_stage = None
-                    job.replace_progress = None
-                    job.replace_message = None
-                    job.replace_error = None
-                job.save(settings.output_dir)
+        deleted = dict(getattr(job, "deleted_replaced_vocals", {}).get(str(song)) or {})
+        # 删的可能是替换人声本身，也可能是当初合出来的成品；两者都会让"当前状态"失效，
+        # 而且都可能被 PUT 还原，所以按被删的文件决定要记什么、要作废什么。
+        target_is_replacement = _resolves_to(settings, job_result.get("replacedVocal"), result_path)
+        target_is_mix = _resolves_to(settings, job_result.get("mixedTrack"), result_path)
+        if target_is_replacement:
+            deleted["url"] = job_result.pop("replacedVocal")
+            model = job_result.pop("_replacedVocalModel", None)
+            if isinstance(model, str):
+                deleted["model"] = model
+        if (target_is_replacement or target_is_mix) and isinstance(
+            job_result.get("mixedTrack"), str
+        ):
+            # 人声是合轨的输入，成品本身也是这个入口管理的产物：作废引用并留下还原材料。
+            deleted.update(capture_mix_artifact(job_result))
+            invalidate_mix_artifact(job, job_result)
+        if target_is_replacement or target_is_mix:
+            job.deleted_replaced_vocals[str(song)] = deleted
+            if (
+                target_is_replacement
+                and job.replace_song == song
+                and (job.replace_task is None or job.replace_task.done())
+            ):
+                job.replace_song = None
+                job.replace_status = None
+                job.replace_stage = None
+                job.replace_progress = None
+                job.replace_message = None
+                job.replace_error = None
+            job.save(settings.output_dir)
         return {"success": True}
 
     @application.put("/api/voice/result")
@@ -189,6 +246,8 @@ def install_voice_api(
     ) -> dict[str, bool]:
         job = request.app.state.jobs.get(job_id)
         job_result = _job_song_result(request, job_id, song)
+        if mix_busy(job):
+            raise HTTPException(status_code=409, detail="正在合轨，请稍后重试。")
         result_path = _result_path(settings, filename, job_id, song)
         if not result_path.is_file():
             trash_path = trash_result_path(settings, filename, job_id, song)
@@ -198,16 +257,31 @@ def install_voice_api(
             trash_path.replace(result_path)
         deleted_replaced_vocals = getattr(job, "deleted_replaced_vocals", {})
         deleted = deleted_replaced_vocals.get(str(song))
-        if isinstance(deleted, dict) and isinstance(deleted.get("url"), str):
-            try:
-                advertised_path = output_path_from_url(deleted["url"], settings.output_dir)
-            except ValueError:
-                advertised_path = None
-            if advertised_path == result_path:
-                job_result["replacedVocal"] = deleted["url"]
-                if isinstance(deleted.get("model"), str):
-                    job_result["_replacedVocalModel"] = deleted["model"]
-                del deleted_replaced_vocals[str(song)]
+        if isinstance(deleted, dict):
+            # 恢复的可能是替换人声，也可能是当初被软删除的成品；按实际恢复的文件决定还原什么。
+            target_is_replacement = _resolves_to(settings, deleted.get("url"), result_path)
+            target_is_mix = _resolves_to(settings, deleted.get("mixTrack"), result_path)
+            if target_is_replacement:
+                job_result["replacedVocal"] = deleted.pop("url")
+                model = deleted.pop("model", None)
+                if isinstance(model, str):
+                    job_result["_replacedVocalModel"] = model
+            if target_is_replacement or target_is_mix:
+                # 撤回删除时把当初作废的成品一并还原。两份存档可能分两次 PUT 回来（例如先撤回
+                # 人声、再撤回成品），所以**只有真正还原了才消费存档**：成品还在回收站里时把键
+                # 留在记录里，等它自己的 PUT 再还回去。
+                if isinstance(job_result.get("mixedTrack"), str):
+                    # 期间已经重新合过轨：存档里那份成品已经过期，丢掉，别让它在后续 PUT 里复活。
+                    deleted.pop("mixTrack", None)
+                    deleted.pop("mixWaveform", None)
+                elif target_is_mix or stored_path_exists(
+                    settings.output_dir, deleted.get("mixTrack")
+                ):
+                    if restore_mix_artifact(job_result, deleted):
+                        deleted.pop("mixTrack", None)
+                        deleted.pop("mixWaveform", None)
+                if not deleted:
+                    deleted_replaced_vocals.pop(str(song), None)
                 job.save(settings.output_dir)
         return {"success": True}
 
@@ -315,3 +389,223 @@ def trash_result_path(
         / f"song_{song + 1}"
         / _result_filename(filename)
     )
+
+
+def mix_output_filename(vocal_filename: str) -> str:
+    """原版的成品命名规则：`{人声名}_rvc_mix.wav`，同名原子覆盖。"""
+    return f"{_source_song_name(vocal_filename, 'completed')}_rvc_mix.wav"
+
+
+async def mix_tracks(
+    inputs: list[Path],
+    reference_path: Path,
+    output_path: Path,
+    timeout_seconds: float,
+) -> None:
+    """合轨入口：把内部超时统一报成配置的总超时。
+
+    原 `_mix_tracks` 的步骤序列原封不动地留在 :func:`_mix_steps`（滤镜图、响度补偿、
+    限幅参数与执行顺序都没有改动）；改名为公开函数只是因为路由按仓库约定挪到了
+    `app/main.py`（replace/split 同构），需要跨模块调用。
+    """
+    try:
+        await _mix_steps(inputs, reference_path, output_path, timeout_seconds)
+    except MixTimeoutError as exc:
+        raise RVCConversionError(
+            f"FFmpeg mixing timed out after {timeout_seconds:g} seconds"
+        ) from exc
+
+
+async def _mix_steps(
+    inputs: list[Path],
+    reference_path: Path,
+    output_path: Path,
+    timeout_seconds: float,
+) -> None:
+    environment = prepare_ffmpeg_environment()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+
+    def remaining() -> float:
+        value = deadline - loop.time()
+        if value <= 0:
+            raise MixTimeoutError("mix budget exhausted")
+        return value
+
+    sample_rate, channels, codec = await _master_audio_format(
+        reference_path, environment, remaining()
+    )
+    premix_path = output_path.with_name("premix.wav")
+    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+    for input_path in inputs:
+        command.extend(("-i", str(input_path)))
+    command.extend(
+        (
+            "-filter_complex",
+            MIX_FILTER,
+            "-map",
+            "[premix]",
+            "-ar",
+            str(sample_rate),
+            "-ac",
+            str(channels),
+            "-c:a",
+            "pcm_f32le",
+            str(premix_path),
+        )
+    )
+    await _run_ffmpeg(command, environment, remaining())
+    reference_loudness, premix_loudness = await asyncio.gather(
+        _integrated_loudness(reference_path, environment, remaining()),
+        _integrated_loudness(premix_path, environment, remaining()),
+    )
+    # ponytail: cap malformed/silent-input compensation; widen only if real mixes need it.
+    gain_db = max(-12.0, min(12.0, reference_loudness - premix_loudness))
+    await _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(premix_path),
+            "-af",
+            LIMIT_FILTER.format(gain_db=gain_db),
+            "-ar",
+            str(sample_rate),
+            "-ac",
+            str(channels),
+            "-c:a",
+            codec,
+            str(output_path),
+        ],
+        environment,
+        remaining(),
+    )
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RVCConversionError("FFmpeg mixing did not produce an output file")
+
+
+async def _master_audio_format(
+    input_path: Path, environment: dict[str, str], timeout_seconds: float
+) -> tuple[int, int, str]:
+    output = await _run_ffmpeg(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_rate,channels,codec_name,bits_per_sample,bits_per_raw_sample",
+            "-of",
+            "json",
+            str(input_path),
+        ],
+        environment,
+        timeout_seconds,
+        capture_stdout=True,
+    )
+    try:
+        stream = json.loads(output)["streams"][0]
+        sample_rate = int(stream["sample_rate"])
+        channels = int(stream["channels"])
+        bits = int(stream.get("bits_per_raw_sample") or stream.get("bits_per_sample") or 0)
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RVCConversionError("FFprobe could not read the master audio format") from exc
+    if not 8_000 <= sample_rate <= 384_000 or not 1 <= channels <= 32:
+        raise RVCConversionError("Master audio format is unsupported")
+    codec = stream.get("codec_name")
+    supported_pcm = {"pcm_u8", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le", "pcm_f64le"}
+    if codec not in supported_pcm:
+        codec = {8: "pcm_u8", 24: "pcm_s24le", 32: "pcm_s32le"}.get(bits, "pcm_s16le")
+    return sample_rate, channels, codec
+
+
+async def _integrated_loudness(
+    input_path: Path, environment: dict[str, str], timeout_seconds: float
+) -> float:
+    stderr = await _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-i",
+            str(input_path),
+            "-af",
+            "loudnorm=I=-14:LRA=20:TP=-1:print_format=json",
+            "-f",
+            "null",
+            "-",
+        ],
+        environment,
+        timeout_seconds,
+    )
+    matches = re.findall(r'\{\s*"input_i".*?\}', stderr, flags=re.DOTALL)
+    try:
+        value = float(json.loads(matches[-1])["input_i"])
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RVCConversionError("FFmpeg could not measure audio loudness") from exc
+    if not math.isfinite(value):
+        raise RVCConversionError("Audio loudness is not finite")
+    return value
+
+
+async def _run_ffmpeg(
+    command: list[str],
+    environment: dict[str, str],
+    timeout_seconds: float,
+    *,
+    capture_stdout: bool = False,
+) -> str:
+    """跑一个 ffmpeg/ffprobe 步骤；用法与 stems.py 的 Demucs 执行器保持一致。
+
+    与旧实现（Popen + 50ms 轮询 + 在事件循环上阻塞 wait）相比，命令、参数与超时预算语义
+    都没有变化，但不再阻塞事件循环，并显式关闭子进程 stdin（ffprobe 命令没带 `-nostdin`）。
+    输出仍写临时文件而不是管道：既不占内存，也不会因为调用方取消而留下未读的管道。
+    """
+    with tempfile.TemporaryFile() as output_stream, tempfile.TemporaryFile() as error_stream:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                env=environment,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=output_stream if capture_stdout else asyncio.subprocess.DEVNULL,
+                stderr=error_stream,
+            )
+        except OSError as exc:
+            raise RVCConversionError(f"Unable to start FFmpeg: {exc}") from exc
+        try:
+            await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            with suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise MixTimeoutError("ffmpeg step timed out") from exc
+        error_stream.seek(0)
+        detail = error_stream.read().decode("utf-8", errors="replace")
+        output_stream.seek(0)
+        output = output_stream.read().decode("utf-8", errors="replace")
+    if process.returncode != 0:
+        raise RVCConversionError(f"FFmpeg mixing failed: {detail.strip() or process.returncode}")
+    return output if capture_stdout else detail
+
+
+def _resolves_to(settings: Settings, value: object, target: Path) -> bool:
+    """记录里的路径是否正好指向 `target`（同一个歌曲目录里的同一个文件）。
+
+    统一走 `output_path_from_url`：记录里可能是裸路径、站内路径或绝对 URL，直接拼路径会
+    静默判错。解析不了或读不到都算"不是它"。
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        return output_path_from_url(value, settings.output_dir) == target
+    except (OSError, ValueError):
+        return False

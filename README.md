@@ -138,6 +138,89 @@ curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/replace?song=0'
 `PUT /api/voice/result` 恢复；两者均传 `job_id`、`filename` 和可选的 `song`，删除后可恢复，
 重新替换则会覆盖同一路径。
 
+## 合轨导出
+
+四轨分离并替换人声后，把替换后的人声与 drums/bass/other 合成一首成品。音频处理步骤与原
+实现一致——滤镜图、响度补偿与限幅参数逐字相同，执行器改用仓库统一的 async 子进程写法。
+人声先做 `equalizer f=3000 t=q w=1 g=2.5` + `volume=3dB`，再四路
+`amix=inputs=4:duration=longest:dropout_transition=0:normalize=0`；随后用 `loudnorm`
+测出成品与原曲的响度差、按最大 ±12 dB 补偿，最后过一次
+`alimiter=limit=0.891251`（−1 dBFS 真峰、latency 补偿）。输出沿用原曲的采样率与声道数
+（PCM 原曲沿用位深，其它格式回退 16-bit）。**静音或响度测不出来的输入直接失败**，
+不会静默按 0 dB 出成品。
+
+入口与 `/split`、`/replace` 同构：任务级、异步执行、进度走任务状态与 SSE，可取消。
+音轨取自任务结果（`fullTrack`、`replacedVocal`、drums/bass/other），不需要请求体。
+**合轨必须基于已替换的人声**：没有 `replacedVocal`（未替换，或替换产物已被删除）时返回 409
+并提示先完成替换；不提供"用原始 vocal 分轨直接合轨"的回退。
+
+```bash
+curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/mix?song=0'
+```
+
+- 成品写入 `output/jobs/<jobId>/song_<n>/<人声名>_rvc_mix.wav`（与 `fullTrack`、各分轨
+  同一目录），以 `mixedTrack` 暴露，并写入该歌曲 `waveforms` 的 `mix` 车道（640 bin）。
+  元数据先落盘、成品文件后原子替换；若进程恰好死在两步之间，重启时会摘掉指向不存在文件的
+  引用（不会对外报"有成品"却 404）。重启时还会清理被硬杀留下的 `.mix-*` 中间目录；隐藏目录
+  （`.trash`、`.mix-*`）一律不通过 `/output` 对外提供。
+  `GET /api/jobs` 的 history 投影里同样带 `mixedTrack`，可直接播放；历史列表按既有约定
+  不返回波形，也不返回合轨运行态。
+- 文件名固定、同名覆盖：混音在临时目录完成后才原子替换成品，因此**失败、超时、取消都不会
+  破坏上一版**。`job.json` 只在成功路径上更新 `mixedTrack` 与波形，顺序是先写元数据、再替换
+  文件（这样写盘失败时成品一个字节都没动）；两步之间被杀进程的窗口由上一条的重启修复兜底。
+- 音轨路径由任务结果给出，只校验形状（必须在 output 根内、正好在该歌曲目录、不在 `.trash`、
+  扩展名属于媒体白名单）；绝对 URL 按 `/output/` 之后的部分定位本地文件，与 `/split`、
+  `/replace` 处理分轨 URL 的方式一致，不会发起任何请求。
+- 与生成、拆轨、人声替换共享同一并发额度：额度用满返回 429；同一任务已有音频操作在跑返回
+  409。合轨进行中会拒绝该任务的拆轨、替换人声、分轨删除/恢复与替换产物删除/恢复。
+- 入参不合法时返回 400（路径形状/任务 id）、404（输入文件不存在/不可读、歌曲不存在）、
+  409（任务未完成、缺音轨、模型已变更、已有音频操作在跑）、429（额度用满）。超时阈值为
+  `RVC_MIX_TIMEOUT_SECONDS`（默认 180 秒），也可从 `GET /api/health` 的
+  `mixing.timeoutSeconds` 读取；同处还有 `mixing.modelGuardEnforced`，用于判断当前实例的
+  模型指纹守卫是否真的生效（缺资产时为 false）。混音本身的失败或超时（含静音输入）不改变 HTTP
+  状态：任务级入口已经返回 202，结果通过 `mixStatus=failed` 与 `mixError` 暴露，
+  错误只返回通用文案，细节写日志。`PATCH /api/jobs/<jobId>` 可取消：立即标记
+  `mixStatus=cancelled`，回收 FFmpeg 进程并丢弃半成品后再释放并发额度。
+- 波形提取失败不影响成品：成品照常落盘可播放，只是该歌曲没有 `mix` 车道，日志里会记一条
+  warning。
+- 输入变了就作废引用，让"是否过期"机器可判定。以下四种情况都会清掉 `mixedTrack` 与该歌曲的
+  `mix` 车道，`mixStatus` 随之由结果推导为 `null`——客户端据此要求用户重新合轨，不必自己猜：
+  **重新替换人声成功**、**替换结果被判定失效**（模型指纹不符，见下）、**删除任一分轨**
+  （人声/鼓/贝斯/其它都是合轨输入）、以及 **`DELETE /api/voice/result` 软删除替换人声或成品
+  本身**。成品文件保留在磁盘上（与替换人声旧文件同一取舍：不删、只是不再被引用），下一次合轨
+  会覆盖同名文件。可逆操作（分轨 `PUT`、替换产物 `PUT`）会把作废的成品引用与车道一起还原。
+- **替换失败、超时或被取消时，成品引用会还原**：人声引用按既有契约不还原（判定失效即撤下，
+  见 `tests/integration/test_replace_history.py`），但成品是已经完成、文件也没被动过的产物，
+  还原后 `mixStatus` 仍为 `succeeded`、可继续播放，只是重新合轨会 409（需要先有有效的人声）。
+  只有替换**成功**才会真正作废成品，那时才需要重新合轨。
+- `DELETE /api/voice/result` 只用于派生音频：删母带（`fullTrack`）返回 409；删成品本身会让
+  记录停止宣称该成品，`PUT` 撤回时连引用与 `mix` 车道一起还原。
+- **重新拆轨不会作废成品**：重拆只是把同一批分轨重新提取一遍，成品内容仍然成立，`mix` 车道
+  也照旧保留。
+- `mixedTrack` 与 `mix` 车道成对出现，但有两个例外要按字面理解：波形提取失败时成品照常发布
+  而没有 `mix` 车道（见下）；`GET /api/jobs` 的 history 投影按约定不返回波形。客户端不要用
+  `waveforms["mix"]` 的存在与否判断"有没有成品"，请直接看 `mixedTrack`。
+- 替换执行期间若进程重启：准入阶段已把 `replacedVocal` 与 `mixedTrack` 的引用摘掉并落盘，
+  重启后保持"没有有效替换人声"（两份文件都还在盘上），需要重新替换。这是刻意的安全默认：
+  不复活一份无法验证的替换人声。
+- 替换人声的模型指纹（`RVC_MODEL_PATH`/`RVC_INDEX_PATH`/`RVC_MODEL_VERSION` 变了）与结果里
+  记录的不符时，合轨返回 409 并提示先重新替换：否则会用旧模型的人声渲染出一个看起来正常的
+  成品。这一点与 `/replace` 判定缓存失效的判据一致。
+  **只在模型资产确实存在时才做这层比较**：指纹在文件缺失时把 `missing` 拼进摘要，缺资产的
+  实例（`.dockerignore` 排除了 `assets/rvc`，权重靠运行时挂载）算出的指纹与记录值必然不同，
+  若据此拒绝，就会把只依赖 ffmpeg 的合轨锁死，还给出一个必然失败的补救动作。此时放行合轨
+  并记一条 warning。
+
+任务状态里合轨以 `mixStatus`、`mixSong`、`mixError` 暴露，运行期间顶层
+`status/stage/progress/message` 与拆轨、替换人声一致地反映当前操作（混音阶段 `progress`
+从 76 起，波形阶段 90，完成 100）。`mixStatus` 与 `replaceStatus` 一样不落盘：重启后由
+结果里的 `mixedTrack` 推导为 `succeeded`；此时若只有一首歌有成品才给出 `mixSong`，多首
+都有成品时 `mixSong` 为 `null`——客户端应直接读每首歌自己的 `mixedTrack` 判断。
+
+合轨沿用原版滤镜图，最后一步没有按原曲时长截断（`amix=duration=longest`），因此成品可能
+比原曲长几十毫秒（Demucs 输出的 mp3 分轨带编码器补零），`mix` 车道的时轴也随之略长于其它
+车道。这是原版既有特性，本次未做改动；需要严格对齐时应在最后一步加 `-t <原曲时长>`。
+
 生成音乐。`provider` 可传 `minimax_music` 或 `elevenlabs_music`，不传时使用
 `MUSIC_PROVIDER`：
 

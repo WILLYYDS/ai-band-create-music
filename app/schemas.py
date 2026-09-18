@@ -25,6 +25,7 @@ class ErrorResponse(BaseModel):
 
 class MusicOutput(BaseModel):
     fullTrack: str
+    mixedTrack: str | None = Field(default=None, exclude_if=lambda value: value is None)
     replacedVocal: str | None = Field(default=None, exclude_if=lambda value: value is None)
     durationSeconds: float | None = None
     stems: dict[str, str]
@@ -85,3 +86,6 @@ class GenerationJobResponse(BaseModel):
     replaceStatus: Literal["pending", "running", "succeeded", "failed", "cancelled"] | None = None
     replaceSong: int | None = None
     replaceError: str | None = None
+    mixStatus: Literal["pending", "running", "succeeded", "failed", "cancelled"] | None = None
+    mixSong: int | None = None
+    mixError: str | None = None
