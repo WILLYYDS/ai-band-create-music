@@ -126,6 +126,25 @@ async def test_generate_returns_full_track_without_splitting(tmp_path: Path) -> 
     orchestrator.stem_separator.split.assert_not_called()
 
 
+async def test_generate_accepts_exact_duration_seconds(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path, enable_audio_splitting=False, music_provider="elevenlabs_music"
+    )
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
+    async with await _client(app) as client:
+        response = await client.post(
+            "/api/generate",
+            json={"prompt": "三十秒试听", "durationMinutes": 3, "durationSeconds": 30},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["durationMinutes"] == 0.5
+    assert body["requestedDurationSeconds"] == 30
+    assert orchestrator.music_provider.requested_durations == [30]
+
+
 @pytest.mark.parametrize(
     "duration_field",
     [{"durationMinutes": "auto"}, {"durationMinutes": None}, {}],

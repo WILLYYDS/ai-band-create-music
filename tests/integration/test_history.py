@@ -608,3 +608,16 @@ async def test_direct_failure_is_persisted(tmp_path):
     row = next(iter(load_jobs(settings.output_dir).values()))
     assert row.status == "failed"
     assert row.error == "provider died"
+
+
+async def test_job_title_is_listed_and_survives_restart(tmp_path):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    async with client(app) as http:
+        job_id = (
+            await http.post("/api/jobs", json={"prompt": "rock", "title": " 毕业后的狂响 "})
+        ).json()["jobId"]
+        await app.state.jobs[job_id].task
+        history = (await http.get("/api/jobs")).json()["jobs"]
+    assert history[0]["title"] == "毕业后的狂响"
+    assert load_jobs(settings.output_dir)[job_id].title == "毕业后的狂响"
