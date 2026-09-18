@@ -68,6 +68,8 @@ LLM_API_KEY=...
 分类格式的合格扩写结果必须包含 8 个简洁英文制作标签，覆盖风格与年代、速度与拍号、
 情绪、配器、人声、编曲结构、制作与混音以及排除项，目标长度为 350–900 字符。
 同时兼容 Qwen 返回的单方括号扁平制作标签列表，但至少需要 10 个标签和 280 字符。
+若模型以 JSON 数组返回 `styleTags`，其中不带方括号的裸标签（Qwen 常见的
+`Category: value` 写法）会在拼接前自动补上方括号，再按上面同一套规则校验。
 未指定的要素由 LLM 做协调一致的专业补充，短标签翻译不会再被当作扩写成功。
 
 对于 Qwen3/Qwen3.5，默认通过 `chat_template_kwargs.enable_thinking=false` 关闭推理，
@@ -144,6 +146,10 @@ curl -X POST http://127.0.0.1:8010/api/generate \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"明亮的普通话摇滚，清晰女声和有力鼓组","durationMinutes":"auto","provider":"minimax_music"}'
 ```
+
+`durationSeconds`（10–360）用于 30 秒试听这类精确短时长，传了它就会覆盖
+`durationMinutes`；MiniMax 仍然忽略任何固定时长。可选的 `title`（最长 100 字符）是
+群聊里选定的歌曲名，会随任务持久化，并由 `GET /api/jobs` 和任务 SSE 返回，供历史页显示。
 
 前端使用异步任务接口，以便刷新后恢复任务并显示真实阶段进度：
 
