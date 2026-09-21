@@ -27,12 +27,7 @@ class StreamingErrorBody(httpx.AsyncByteStream):
         yield b'{"detail":{"message":"unauthorized"}}'
 
 
-class StubLyricsWriter:
-    async def write_lyrics(
-        self, structured_prompt: str, user_prompt: str, duration_minutes: float | None
-    ) -> str:
-        assert duration_minutes is None
-        return "[Verse]\ntest lyrics"
+MINIMAX_USER_PROMPT = "[歌词与创作内容]\n[Verse]\ntest lyrics\n\n[风格要求]\nrock"
 
 
 def wav_bytes(seconds: float = 1) -> bytes:
@@ -111,16 +106,11 @@ async def test_minimax_provider_uses_direct_client(tmp_path: Path) -> None:
     assert direct_requests[0].url == "http://127.0.0.1:8111/v1/audio/jobs"
 
 
-async def test_elevenlabs_uses_composition_plan_and_streams_audio(tmp_path: Path) -> None:
+async def test_elevenlabs_sends_complete_prompt_and_streams_audio(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path.endswith("/plan"):
-            return httpx.Response(
-                200,
-                json={"sections": [{"duration_ms": 10_000, "lines": ["第一句", "第二句"]}]},
-            )
         return httpx.Response(200, content=b"ID3-generated-audio")
 
     settings = make_settings(
@@ -141,14 +131,15 @@ async def test_elevenlabs_uses_composition_plan_and_streams_audio(tmp_path: Path
     assert result.audio_path.read_bytes() == b"ID3-generated-audio"
     assert result.audio_path == settings.output_dir / "jobs/job-1/song_1/full_song_job-1_1.mp3"
     assert not list(settings.output_dir.glob("full_song_*"))
-    assert result.debug["mode"] == "composition_plan"
-    assert len(requests) == 2
-    plan_body = json.loads(requests[0].content)
-    assert "第一句原歌词\n第二句原歌词" in plan_body["prompt"]
-    music_body = json.loads(requests[1].content)
-    assert "composition_plan" in music_body
-    assert "prompt" not in music_body
-    assert "clear vocal articulation" in music_body["composition_plan"]["positive_global_styles"]
+    assert result.debug["mode"] == "prompt"
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v1/music"
+    music_body = json.loads(requests[0].content)
+    assert "[Genre: Rock]" in music_body["prompt"]
+    assert "第一句原歌词\n第二句原歌词" in music_body["prompt"]
+    assert "Mandarin Chinese lead vocals" in music_body["prompt"]
+    assert music_body["music_length_ms"] == 120_000
+    assert "composition_plan" not in music_body
 
 
 async def test_elevenlabs_reads_streaming_error_before_building_message(tmp_path: Path) -> None:
@@ -161,7 +152,6 @@ async def test_elevenlabs_reads_streaming_error_before_building_message(tmp_path
         music_provider="elevenlabs_music",
         elevenlabs_api_key="invalid",
         elevenlabs_music_base_url="https://eleven.test",
-        elevenlabs_use_composition_plan=False,
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(GenerationError, match="music_generation 权限"):
@@ -204,8 +194,8 @@ async def test_minimax_provider_omits_duration_for_auto(tmp_path: Path) -> None:
         minimax_base_url="https://minimax.test",
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result = await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
-            "[Genre: Rock]", None, "rock"
+        result = await MiniMaxMusicProvider(settings, client).generate(
+            "[Genre: Rock]", None, MINIMAX_USER_PROMPT
         )
 
     body = json.loads(requests[0].content)
@@ -239,8 +229,8 @@ async def test_minimax_provider_ignores_selected_duration(tmp_path: Path) -> Non
 
     settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result = await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
-            "[Genre: Rock]", 60, "rock", job_id="local-job"
+        result = await MiniMaxMusicProvider(settings, client).generate(
+            "[Genre: Rock]", 60, MINIMAX_USER_PROMPT, job_id="local-job"
         )
 
     body = json.loads(requests[0].content)
@@ -271,8 +261,8 @@ async def test_minimax_provider_offsets_seed_for_alternatives(tmp_path: Path) ->
 
     settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
-            "[Genre: Rock]", 60, "rock", variation=1
+        await MiniMaxMusicProvider(settings, client).generate(
+            "[Genre: Rock]", 60, MINIMAX_USER_PROMPT, variation=1
         )
 
     assert json.loads(requests[0].content)["seed"] == settings.minimax_seed + 1
@@ -288,7 +278,7 @@ async def test_minimax_provider_preserves_create_page_lyrics(tmp_path: Path) -> 
     settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
     lyrics = "夜色落进空荡站台，最后一班车没有回来，月光沿着铁轨沉默地延伸，我仍在原地等待。"
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
+        await MiniMaxMusicProvider(settings, client).generate(
             "[Genre: Dream Pop]",
             60,
             f"[歌词与创作内容]\n[Verse]\n{lyrics}\n\n[风格要求]\n梦幻流行、空灵女声",
@@ -308,8 +298,8 @@ async def test_minimax_provider_reports_server_error(tmp_path: Path) -> None:
     settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(GenerationError, match="422.*invalid request"):
-            await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
-                "[Genre: Rock]", 120, "rock", job_id="failed-job"
+            await MiniMaxMusicProvider(settings, client).generate(
+                "[Genre: Rock]", 120, MINIMAX_USER_PROMPT, job_id="failed-job"
             )
 
     diagnostics = json.loads(
@@ -330,8 +320,8 @@ async def test_minimax_provider_reports_direct_connection_target(tmp_path: Path)
             GenerationError,
             match=r"192\.168\.1\.4:8111/v1/audio/jobs.*绕过系统代理",
         ):
-            await MiniMaxMusicProvider(settings, client, StubLyricsWriter()).generate(
-                "[Genre: Rock]", 60, "rock"
+            await MiniMaxMusicProvider(settings, client).generate(
+                "[Genre: Rock]", 60, MINIMAX_USER_PROMPT
             )
 
 

@@ -36,7 +36,7 @@ MiniMax 和 ElevenLabs 的配置可以同时保留。真实 ElevenLabs 模式还
 MUSIC_API_MODE=real
 MUSIC_PROVIDER=elevenlabs_music
 LLM_API_KEY=...
-LLM_MAX_TOKENS=1024
+LLM_MAX_TOKENS=2048
 LLM_TIMEOUT_SECONDS=120
 LLM_DISABLE_THINKING=true
 ELEVENLABS_API_KEY=...
@@ -65,22 +65,17 @@ LLM_API_KEY=...
 音乐 Prompt 扩写建议使用非推理模型。推理模型可能先输出很长的思考过程，增加
 延迟并触发读取超时。遇到 LLM `ReadTimeout` 时，应先确认 `LLM_MODEL`，再根据
 服务延迟调整 `LLM_TIMEOUT_SECONDS`；后端不会自动重试网络超时，以免产生重复调用。
-分类格式的合格扩写结果必须包含 8 个简洁英文制作标签，覆盖风格与年代、速度与拍号、
-情绪、配器、人声、编曲结构、制作与混音以及排除项，目标长度为 350–900 字符。
-同时兼容 Qwen 返回的单方括号扁平制作标签列表，但至少需要 10 个标签和 280 字符。
-若模型以 JSON 数组返回 `styleTags`，其中不带方括号的裸标签（Qwen 常见的
-`Category: value` 写法）会在拼接前自动补上方括号，再按上面同一套规则校验。
+合格扩写结果必须包含 6–8 个 `[Category: value]` 英文制作标签，整体覆盖风格与年代、
+速度与拍号、情绪、配器、中文人声、编曲结构、制作与混音以及排除项；相邻类别可合并。
+若模型以 JSON 数组返回 `styleTags`，其中不带方括号的 `Category: value` 项会在拼接前
+自动补上方括号，再按同一套规则校验。
 未指定的要素由 LLM 做协调一致的专业补充，短标签翻译不会再被当作扩写成功。
 
 对于 Qwen3/Qwen3.5，默认通过 `chat_template_kwargs.enable_thinking=false` 关闭推理，
-避免思考过程耗尽输出预算。所有模型的实际 `max_tokens` 上限为 4096；健康检查会分别
-显示配置值、首轮实际值和重试实际值。
+避免思考过程耗尽输出预算。所有歌词与风格请求统一使用 `LLM_MAX_TOKENS`，默认 2048。
 
-若首轮响应不是纯标签或扩写细节不足，后端会进行一次温度为 0、输出预算至少为
-2048 tokens 的严格重试，并可从 `Final Answer`、末尾标签块或 JSON `tags` 中提取结果。
-仍然失败时，终端日志会记录 `finish_reason`、标签数、`content_chars` 和
-`reasoning_chars`，用于区分输出截断、细节不足、空正文以及供应商返回格式不兼容；
-日志不会记录用户 Prompt 和模型正文。
+歌词与风格在同一次 JSON 请求中生成；响应格式或内容校验失败时，后端会携带失败原因
+重试一次。
 
 Mock 模式需要把测试母带放到 `output/mock_full.mp3`，或者修改
 `MOCK_FULL_SONG_PATH`。

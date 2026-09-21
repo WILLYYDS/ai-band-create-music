@@ -18,11 +18,7 @@ from app.core.errors import GenerationError
 from app.services.audio_files import download_audio, require_readable_file, write_stream_atomically
 from app.services.job_files import job_song_dir, update_provider_diagnostic
 from app.services.prompt import (
-    OpenAICompatiblePromptExpander,
     _http_failure_message,
-    build_elevenlabs_planning_prompt,
-    enhance_elevenlabs_composition_plan,
-    looks_like_chinese_music_request,
     split_generation_prompt,
 )
 
@@ -30,6 +26,25 @@ MINIMAX_GENERATE_PATH = "/v1/audio/jobs"
 MINIMAX_LYRIC_LINE_LIMIT = 32
 LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")
 ProviderProgressCallback = Callable[[str, int | None, int | None], Awaitable[None]]
+
+
+def build_elevenlabs_prompt(
+    structured_prompt: str,
+    duration_minutes: float,
+    clear_chinese_vocal_mode: bool,
+    lyrics: str = "",
+) -> str:
+    requirements = [structured_prompt, f"Target duration: {duration_minutes:g} minutes."]
+    if clear_chinese_vocal_mode:
+        requirements.append(
+            "Chinese clear vocal mode: Use Mandarin Chinese lead vocals with clear articulation "
+            "and natural phrasing. Keep lyric density moderate with short singable lines and "
+            "breathing space between phrases. Make the lead vocal forward in the mix. Use light "
+            "reverb, minimal backing vocals, and avoid mumbling or swallowed syllables."
+        )
+    if lyrics:
+        requirements.extend(["Original lyrics (preserve wording and line order):", lyrics])
+    return "\n".join(requirements)
 
 
 def _audio_target(
@@ -324,44 +339,18 @@ class ElevenLabsMusicProvider:
         job_id: str | None = None,
     ) -> MusicResult:
         music_length_ms = duration_seconds * 1000
-        clear_chinese = (
-            self._settings.elevenlabs_clear_chinese_vocal_mode
-            and looks_like_chinese_music_request(user_prompt, structured_prompt)
-        )
-        use_plan = (
-            self._settings.elevenlabs_use_composition_plan
-            and not self._settings.elevenlabs_force_instrumental
-        )
+        clear_chinese = self._settings.elevenlabs_clear_chinese_vocal_mode
         lyrics, _ = split_generation_prompt(user_prompt)
-        planning_prompt = build_elevenlabs_planning_prompt(
+        prompt = build_elevenlabs_prompt(
             structured_prompt, duration_seconds / 60, clear_chinese, lyrics
         )
         try:
-            if use_plan:
-                plan_response = await self._client.post(
-                    f"{self._settings.elevenlabs_music_base_url}/v1/music/plan",
-                    json={
-                        "prompt": planning_prompt,
-                        "music_length_ms": music_length_ms,
-                        "model_id": self._settings.elevenlabs_music_model_id,
-                    },
-                    headers=self._headers(),
-                    timeout=self._settings.music_api_timeout_seconds,
-                )
-                plan_response.raise_for_status()
-                request_body = {
-                    "composition_plan": enhance_elevenlabs_composition_plan(
-                        plan_response.json(), clear_chinese
-                    ),
-                    "model_id": self._settings.elevenlabs_music_model_id,
-                }
-            else:
-                request_body = {
-                    "prompt": planning_prompt,
-                    "music_length_ms": music_length_ms,
-                    "model_id": self._settings.elevenlabs_music_model_id,
-                    "force_instrumental": self._settings.elevenlabs_force_instrumental,
-                }
+            request_body = {
+                "prompt": prompt,
+                "music_length_ms": music_length_ms,
+                "model_id": self._settings.elevenlabs_music_model_id,
+                "force_instrumental": self._settings.elevenlabs_force_instrumental,
+            }
 
             target = _audio_target(
                 self._settings,
@@ -389,7 +378,7 @@ class ElevenLabsMusicProvider:
                     "provider": "elevenlabs_music",
                     "modelId": self._settings.elevenlabs_music_model_id,
                     "outputFormat": self._settings.elevenlabs_music_output_format,
-                    "mode": "composition_plan" if use_plan else "prompt",
+                    "mode": "prompt",
                     "clearChineseVocalMode": clear_chinese,
                 },
             )
@@ -531,11 +520,9 @@ class MiniMaxMusicProvider:
         self,
         settings: Settings,
         client: httpx.AsyncClient,
-        lyrics_writer: OpenAICompatiblePromptExpander | None = None,
     ) -> None:
         self._settings = settings
         self._client = client
-        self._lyrics_writer = lyrics_writer or OpenAICompatiblePromptExpander(settings, client)
 
     async def generate(
         self,
@@ -554,11 +541,7 @@ class MiniMaxMusicProvider:
         try:
             lyrics, _ = split_generation_prompt(user_prompt)
             if not lyrics:
-                lyrics = await self._lyrics_writer.write_lyrics(
-                    structured_prompt,
-                    user_prompt,
-                    None,
-                )
+                raise GenerationError("MiniMax 音乐生成失败：缺少已准备好的歌词。")
             lyrics = _wrap_long_lyric_lines(lyrics)
             if len(lyrics) < 10:
                 raise GenerationError("MiniMax 音乐生成失败：生成的歌词不足 10 个字符。")
@@ -753,9 +736,5 @@ def create_music_provider(
     if selected == "suno_api":
         return SunoMusicProvider(settings, client)
     if selected == "minimax_music":
-        return MiniMaxMusicProvider(
-            settings,
-            direct_client or client,
-            OpenAICompatiblePromptExpander(settings, client),
-        )
+        return MiniMaxMusicProvider(settings, direct_client or client)
     return GenericMusicProvider(settings, client)

@@ -13,30 +13,21 @@ from app.services.stems import SplitResult, stem_output_files
 
 
 class StubPromptExpander:
-    async def expand(self, user_prompt: str) -> str:
-        return f"[Genre: Test], [Source: {user_prompt}]"
-
     async def prepare(
         self,
         user_prompt: str,
-        duration_minutes: int | None = None,
+        duration_minutes: float | None = None,
         *,
         job_id: str | None = None,
     ) -> PreparedPrompt:
         duration_seconds = duration_minutes * 60 if duration_minutes is not None else None
+        structured_prompt = f"[Genre: Test], [Source: {user_prompt}]"
         if user_prompt.startswith("[歌词与创作内容]"):
             lyrics = user_prompt.split("\n\n[风格要求]", 1)[0].split("\n", 1)[1]
-            return PreparedPrompt(
-                await self.expand(user_prompt), f"[Verse]\n{lyrics}", duration_seconds
-            )
+            return PreparedPrompt(structured_prompt, f"[Verse]\n{lyrics}", duration_seconds)
         return PreparedPrompt(
-            await self.expand(user_prompt), "[Verse]\n自动生成的测试歌词", duration_seconds
+            structured_prompt, "[Verse]\n自动生成的测试歌词", duration_seconds
         )
-
-    async def write_lyrics(
-        self, structured_prompt: str, user_prompt: str, duration_minutes: int
-    ) -> str:
-        return "[Verse]\n自动生成的测试歌词"
 
 
 class BlockingPromptExpander:
@@ -44,28 +35,20 @@ class BlockingPromptExpander:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def expand(self, user_prompt: str) -> str:
-        self.started.set()
-        await self.release.wait()
-        return "[Genre: Test]"
-
     async def prepare(
         self,
         user_prompt: str,
-        duration_minutes: int | None = None,
+        duration_minutes: float | None = None,
         *,
         job_id: str | None = None,
     ) -> PreparedPrompt:
+        self.started.set()
+        await self.release.wait()
         return PreparedPrompt(
-            await self.expand(user_prompt),
+            "[Genre: Test]",
             "[Verse]\n自动生成的测试歌词",
             duration_minutes * 60 if duration_minutes is not None else None,
         )
-
-    async def write_lyrics(
-        self, structured_prompt: str, user_prompt: str, duration_minutes: int
-    ) -> str:
-        return "[Verse]\n自动生成的测试歌词"
 
 
 class StubMusicProvider:

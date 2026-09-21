@@ -4,22 +4,16 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app.core.errors import GenerationError
 from app.services.prompt import (
-    LYRICS_SYSTEM_PROMPT,
     OpenAICompatiblePromptExpander,
-    build_elevenlabs_planning_prompt,
-    effective_llm_output_tokens,
-    enhance_elevenlabs_composition_plan,
     extract_structured_music_tags,
     extract_tagged_lyrics,
     is_expanded_music_prompt,
-    looks_like_chinese_music_request,
-    music_prompt_tag_count,
     normalize_llm_output,
     split_generation_prompt,
-    truncate_lyrics,
+    validate_tagged_lyrics,
 )
+from app.services.providers import build_elevenlabs_prompt
 from tests.helpers import make_settings
 
 EXPANDED_MANDARIN_ROCK_PROMPT = (
@@ -27,32 +21,17 @@ EXPANDED_MANDARIN_ROCK_PROMPT = (
     "a live-band foundation], "
     "[Tempo and Meter: Energetic 132 BPM in 4/4 with a steady driving eighth-note pulse "
     "and controlled syncopation], "
-    "[Mood: Bright, confident, uplifting, youthful, and emotionally direct without becoming "
-    "overly sweet], "
-    "[Harmony: Major-key center with open power-chord verses, rising pre-chorus tension, and "
-    "a broad singable chorus resolution], "
+    "[Mood: Bright, confident, uplifting, youthful, and emotionally direct], "
     "[Instrumentation: Layered electric rhythm guitars, selective melodic lead guitar, warm "
     "electric bass, acoustic rock drums, and subtle supporting synth pads], "
-    "[Drums and Bass: Punchy kick, crisp snare, energetic tom fills, bright cymbal lifts, and "
-    "a tight bass line locked to the kick], "
     "[Vocal: Clear Mandarin Chinese female lead with precise consonants, natural phrasing, a "
     "confident chest voice, and restrained harmonies only in the chorus], "
     "[Arrangement: Short guitar-and-drum intro, focused verse, rising pre-chorus, wide anthemic "
     "chorus, second verse, bridge breakdown, final double chorus, and concise outro], "
-    "[Dynamics: Keep verses lean and vocal-forward, expand guitars and cymbals through each "
-    "transition, then reach the strongest impact in the final chorus], "
     "[Production and Mix: Clean contemporary stereo mix with centered vocals, tight low end, "
     "wide guitars, transient-rich drums, light plate reverb, and gentle bus saturation], "
     "[Negative Constraints: No muddy low mids, no buried vocals, no excessive vocal reverb, "
     "no harsh cymbals, no metal screaming, and no dense backing-vocal clutter]"
-)
-QWEN_FLAT_MUSIC_PROMPT = (
-    "[Contemporary Mandopop Rock, 2020s Indie Pop, 128 BPM, 4/4 Time Signature, "
-    "Uplifting and Energetic Mood, Crisp Female Vocals, Mandarin Lyrics, "
-    "Belting and Breathiness, Punchy Kick Drum, Driving Snare, Bright Electric Guitars, "
-    "Clean Synth Pads, Layered Background Harmonies, Progressive Arrangement, "
-    "Verse-Chorus Structure, Wide Stereo Mix, High-Fidelity Production, Dynamic Swells, "
-    "Subtle Reverb, No Distortion, No Lo-Fi, No Auto-Tune Overuse]"
 )
 
 
@@ -65,12 +44,6 @@ ONE_MINUTE_LYRICS = generated_lyrics(10)
 
 def test_normalize_llm_output_removes_fences_and_quotes() -> None:
     assert normalize_llm_output('```text\n"[Genre: Folk]"\n```') == "[Genre: Folk]"
-
-
-def test_chinese_request_detection() -> None:
-    assert looks_like_chinese_music_request("普通话女声摇滚")
-    assert looks_like_chinese_music_request("Mandarin lead vocal")
-    assert not looks_like_chinese_music_request("instrumental dark techno")
 
 
 def test_structured_tag_extraction_rejects_thinking_process_examples() -> None:
@@ -144,13 +117,14 @@ def test_tagged_lyrics_must_preserve_every_original_line() -> None:
     assert extract_tagged_lyrics("[Verse]\n改写的第一句\n第二句", lyrics) is None
 
 
-def test_structured_tag_extraction_accepts_qwen_flat_music_tags() -> None:
-    assert extract_structured_music_tags(QWEN_FLAT_MUSIC_PROMPT) == QWEN_FLAT_MUSIC_PROMPT
-    assert is_expanded_music_prompt(QWEN_FLAT_MUSIC_PROMPT)
-    assert music_prompt_tag_count(QWEN_FLAT_MUSIC_PROMPT) == 22
+def test_tagged_lyrics_validation_preserves_supported_labels_and_rejects_unknown_ones() -> None:
+    lyrics = "[Verse 1]\n第一句\n[Instrumental Break]\n[Chorus]\n第二句"
+    assert validate_tagged_lyrics(lyrics) == lyrics
+    with pytest.raises(ValueError, match="不支持"):
+        validate_tagged_lyrics("[Verse]\n第一句\n[Final Chorus]\n第二句")
 
 
-def test_flat_music_tags_reject_short_unexpanded_list() -> None:
+def test_flat_music_tags_are_rejected() -> None:
     assert extract_structured_music_tags("[Mandopop Rock, Bright, Female Vocal]") is None
 
 
@@ -161,70 +135,14 @@ def test_expanded_music_prompt_requires_detail_and_category_coverage() -> None:
     )
     assert not is_expanded_music_prompt(concise)
     assert is_expanded_music_prompt(EXPANDED_MANDARIN_ROCK_PROMPT)
-
-
-async def test_prompt_expander_retries_insufficient_expansion(tmp_path: Path) -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if len(requests) == 1:
-            content = (
-                "[Genre: Mandarin Rock], [Mood: Bright, Energetic], [Vocal: Female, Clear], "
-                "[Instrumentation: Powerful Drums], [Production: Clean]"
-            )
-        else:
-            content = EXPANDED_MANDARIN_ROCK_PROMPT
-        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
-
-    settings = make_settings(
-        tmp_path,
-        llm_api_key="secret",
-        llm_base_url="https://llm.test/v1",
-        llm_max_tokens=256,
+    six_tags = (
+        "[Genre and Era: Modern Mandarin rock], [Tempo Meter and Mood: 128 BPM 4/4 uplifting], "
+        "[Instrumentation: Electric guitars bass and acoustic drums], "
+        "[Vocal: Clear Mandarin lead], [Arrangement: Verse chorus bridge outro], "
+        "[Production Mix and Negative Constraints: Wide clean mix; avoid muddy low mids]"
     )
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result = await OpenAICompatiblePromptExpander(settings, client).expand("普通话摇滚")
-
-    assert result == EXPANDED_MANDARIN_ROCK_PROMPT
-    assert is_expanded_music_prompt(result)
-    assert len(requests) == 2
-    retry_body = json.loads(requests[1].content)
-    assert retry_body["temperature"] == 0
-    assert retry_body["max_tokens"] == 1024
-    assert "Rejected draft" in retry_body["messages"][1]["content"]
-    assert "[Genre: Mandarin Rock]" in retry_body["messages"][1]["content"]
-
-
-async def test_qwen_disables_thinking_and_caps_output_tokens(tmp_path: Path) -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": EXPANDED_MANDARIN_ROCK_PROMPT}}]},
-        )
-
-    settings = make_settings(
-        tmp_path,
-        llm_api_key="secret",
-        llm_base_url="https://llm.test/v1",
-        llm_model="Qwen/Qwen3.5-9B-FP8",
-        llm_max_tokens=8192,
-    )
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result = await OpenAICompatiblePromptExpander(settings, client).expand("普通话摇滚")
-
-    assert result == EXPANDED_MANDARIN_ROCK_PROMPT
-    body = json.loads(requests[0].content)
-    assert body["max_tokens"] == 1024
-    assert body["chat_template_kwargs"] == {"enable_thinking": False}
-
-
-def test_effective_output_token_budget_has_safe_ceiling() -> None:
-    assert effective_llm_output_tokens(8192, strict=False) == 4096
-    assert effective_llm_output_tokens(256, strict=True) == 2048
+    assert is_expanded_music_prompt(six_tags)
+    assert not is_expanded_music_prompt(f"{EXPANDED_MANDARIN_ROCK_PROMPT}, [Extra: detail]")
 
 
 def test_create_prompt_splits_lyrics_from_style() -> None:
@@ -241,59 +159,6 @@ def test_create_prompt_splits_crlf_lyrics_from_style() -> None:
     )
     assert lyrics == "第一句\r\n第二句"
     assert style == "梦幻流行"
-
-
-async def test_prompt_expander_only_sends_style_and_disables_doubao_thinking(
-    tmp_path: Path,
-) -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": EXPANDED_MANDARIN_ROCK_PROMPT}}]},
-        )
-
-    settings = make_settings(
-        tmp_path,
-        llm_api_key="secret",
-        llm_base_url="https://llm.test/v1",
-        llm_model="doubao-seed-evolving",
-    )
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await OpenAICompatiblePromptExpander(settings, client).expand(
-            "[歌词与创作内容]\n不会发给 LLM 的歌词\n\n[风格要求]\n梦幻流行、空灵女声"
-        )
-
-    body = json.loads(requests[0].content)
-    assert body["messages"][1]["content"] == "梦幻流行、空灵女声"
-    assert body["thinking"] == {"type": "disabled"}
-
-
-async def test_lyrics_writer_returns_normalized_lyrics(tmp_path: Path) -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        content = "```text\n[Verse]\n第一句歌词\n[Chorus]\n第二句歌词\n```"
-        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
-
-    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        lyrics = await OpenAICompatiblePromptExpander(settings, client).write_lyrics(
-            "[Genre: Mandarin rock]", "普通话摇滚", 2
-        )
-
-    assert lyrics.startswith("[Verse]")
-    body = json.loads(requests[0].content)
-    assert body["temperature"] == 0.8
-    assert body["messages"][0]["content"] == LYRICS_SYSTEM_PROMPT
-    assert "请用简体中文" in body["messages"][1]["content"]
-    assert "目标时长：严格 120 秒（约 2 分钟）" in body["messages"][1]["content"]
-    assert "生成 20-40 行歌词" in body["messages"][1]["content"]
-    assert "前奏、过渡和尾奏合计尽量不超过 25 秒" in body["messages"][1]["content"]
-    assert "结尾歌词被截断" in body["messages"][1]["content"]
 
 
 async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Path) -> None:
@@ -336,7 +201,7 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
     assert len(requests) == 1
     body = json.loads(requests[0].content)
     assert body["temperature"] == 0
-    assert body["max_tokens"] == 4096
+    assert body["max_tokens"] == 2048
     assert body["thinking"] == {"type": "disabled"}
     assert body["response_format"] == {"type": "json_object"}
 
@@ -370,8 +235,7 @@ async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> 
 
     body = json.loads(requests[0].content)
     assert body["response_format"] == {"type": "json_object"}
-    assert "生成 10-20 行歌词" in body["messages"][1]["content"]
-    assert "结尾歌词被截断" in body["messages"][1]["content"]
+    assert "目标时长" not in body["messages"][1]["content"]
 
 
 async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Path) -> None:
@@ -416,8 +280,8 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
     assert len(requests) == 1
     body = json.loads(requests[0].content)
     assert "同时生成原创歌词和音乐风格说明" in body["messages"][0]["content"]
-    assert "目标时长：自动" in body["messages"][1]["content"]
-    assert "不要估算或返回任何时长字段" in body["messages"][1]["content"]
+    assert "原创简体中文歌词" in body["messages"][0]["content"]
+    assert "目标时长" not in body["messages"][1]["content"]
     diagnostics = json.loads(
         (settings.output_dir / "jobs/prompt-job/prompts.json").read_text(encoding="utf-8")
     )
@@ -563,48 +427,6 @@ async def test_prepare_retries_concise_style_and_adds_missing_verse_tag(tmp_path
 
 
 @pytest.mark.parametrize(
-    "invalid_lyrics",
-    [
-        generated_lyrics(31),
-        "[Verse]\n" + "过" * 33 + "\n" + "\n".join(f"第 {index} 句" for index in range(7)),
-    ],
-)
-async def test_prepare_retries_lyrics_that_do_not_fit_fixed_duration(
-    tmp_path: Path, invalid_lyrics: str
-) -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "taggedLyrics": (
-                                        invalid_lyrics if len(requests) == 1 else ONE_MINUTE_LYRICS
-                                    ),
-                                    "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
-                                }
-                            )
-                        }
-                    }
-                ]
-            },
-        )
-
-    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare("男声摇滚", 1)
-
-    assert prepared.lyrics == ONE_MINUTE_LYRICS
-    assert len(requests) == 2
-
-
-@pytest.mark.parametrize(
     "original",
     [
         "原歌词第一句\n原歌词第二句",
@@ -684,10 +506,8 @@ async def test_prepare_accepts_unbracketed_style_tag_array(tmp_path: Path) -> No
         "Vocals: Raw, Distorted, High-Energy Rap",
         "Instrumentation: Heavy Distorted 808 Bass, Aggressive Drums, Fuzz Guitar",
         "Arrangement: Minimalist, Fast-Paced, Chaotic Energy",
-        "Production: Lo-Fi Texture, Overdriven Mix, Punchy Transients",
-        "Mixing: Front-Loaded Vocals, Wide Stereo Bass, Aggressive EQ",
-        "Mastering: Loudness Maximized, Distorted Clipping, Hard Limiting",
-        "Structure: Compact, No Filler, Immediate Impact",
+        "Production and Mix: Lo-Fi Texture, Front-Loaded Vocals, Punchy Transients",
+        "Negative Constraints: No Muddy Bass, No Excessive Reverb",
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -705,99 +525,9 @@ async def test_prepare_accepts_unbracketed_style_tag_array(tmp_path: Path) -> No
     assert prepared.duration_seconds == 30
 
 
-async def test_lyrics_writer_handles_partitioned_content(tmp_path: Path) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": [
-                                {"type": "text", "text": "[Verse]\nfirst line"},
-                                {"type": "text", "text": "\n[Chorus]\nsecond line"},
-                            ]
-                        }
-                    }
-                ]
-            },
-        )
-
-    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        lyrics = await OpenAICompatiblePromptExpander(settings, client).write_lyrics(
-            "[Genre: pop]", "pop", 2
-        )
-    assert "[Chorus]" in lyrics
-
-
-async def test_lyrics_writer_rejects_empty_output(tmp_path: Path) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"choices": [{"message": {"content": ""}}]})
-
-    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(GenerationError, match="歌词生成失败"):
-            await OpenAICompatiblePromptExpander(settings, client).write_lyrics(
-                "[Genre: pop]", "pop", 2
-            )
-
-
-def test_truncate_lyrics_keeps_complete_lines_within_limit() -> None:
-    lyrics = "first\nsecond\nthird-long-line"
-    assert truncate_lyrics(lyrics, limit=12) == "first\nsecond"
-
-
-async def test_prompt_expander_reports_actionable_read_timeout(tmp_path: Path) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ReadTimeout("slow model", request=request)
-
-    settings = make_settings(
-        tmp_path,
-        llm_api_key="secret",
-        llm_base_url="https://llm.test/v1",
-        llm_timeout_seconds=45,
-    )
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(GenerationError, match="读取响应超过 45 秒"):
-            await OpenAICompatiblePromptExpander(settings, client).expand("普通话摇滚")
-
-
-@pytest.mark.parametrize("response_json", [[], "unexpected"])
-async def test_prompt_expander_rejects_non_object_json(
-    tmp_path: Path, response_json: object
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=response_json)
-
-    settings = make_settings(
-        tmp_path,
-        llm_api_key="secret",
-        llm_base_url="https://llm.test/v1",
-    )
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(GenerationError, match="LLM response JSON must be an object"):
-            await OpenAICompatiblePromptExpander(settings, client).expand("普通话摇滚")
-
-
-def test_planning_prompt_adds_clear_vocal_requirements() -> None:
-    prompt = build_elevenlabs_planning_prompt("[Genre: Rock]", 3, True)
+def test_elevenlabs_prompt_preserves_complete_lyrics_and_clear_vocal_requirements() -> None:
+    lyrics = "[Verse]\n" + "完整歌词行\n" * 800
+    prompt = build_elevenlabs_prompt("[Genre: Rock]", 3, True, lyrics)
     assert "Target duration: 3 minutes" in prompt
     assert "Mandarin Chinese lead vocals" in prompt
-
-
-def test_composition_plan_enhancement_is_non_mutating_and_limits_lines() -> None:
-    original = {
-        "positive_global_styles": ["rock"],
-        "sections": [
-            {
-                "duration_ms": 12_000,
-                "lines": ["一", "二", "三", "四"],
-            }
-        ],
-    }
-    enhanced = enhance_elevenlabs_composition_plan(original, True)
-    assert original["sections"][0]["lines"] == ["一", "二", "三", "四"]
-    assert enhanced["sections"][0]["lines"] == ["一", "二"]
-    assert "clear vocal articulation" in enhanced["positive_global_styles"]
-    assert "mumbled vocals" in enhanced["negative_global_styles"]
+    assert prompt.endswith(lyrics)
