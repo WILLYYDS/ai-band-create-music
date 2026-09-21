@@ -94,9 +94,11 @@ class BlockingVoiceEngine:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.calls = 0
+        self.params = None
 
     async def convert(self, input_path: Path, output_path: Path, **_params) -> None:
         self.calls += 1
+        self.params = _params
         assert input_path.name == "demo_vocal.mp3"
         self.started.set()
         await self.release.wait()
@@ -166,6 +168,7 @@ async def test_replace_runs_as_job_operation_and_caches_result(tmp_path: Path) -
     assert audio.content == b"RIFF-replaced"
     assert cached.status_code == 200
     assert engine.calls == 1
+    assert engine.params == {"rms_mix_rate": 0.0}
     assert events.text.startswith("data: ")
     assert "event: done" in events.text
     assert json.loads(events.text.rsplit("data: ", 1)[1])["replaceStatus"] == "succeeded"

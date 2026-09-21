@@ -109,7 +109,7 @@ curl http://127.0.0.1:8010/api/health
 
 RVC 默认自动查找 `assets/rvc` 中的模型、索引和 HuBERT/RMVPE 基础模型；也可通过
 `RVC_MODEL_PATH`、`RVC_INDEX_PATH` 和 `RVC_BASE_MODEL_DIR` 显式指定。RVC 推理在
-第一次转换时懒加载到 `cuda:0`；默认 `rms_mix_rate=1`，使替换人声沿用原人声的音量包络：
+第一次转换时懒加载到 `cuda:0`；任务替换固定使用 `rms_mix_rate=0`，使替换人声沿用原人声的音量包络：
 
 已完成拆轨的生成任务可直接启动后台人声替换，无需重新上传 vocal 文件：
 
@@ -141,8 +141,8 @@ curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/replace?song=0'
 ## 合轨导出
 
 四轨分离并替换人声后，把替换后的人声与 drums/bass/other 合成一首成品。音频处理步骤与原
-实现一致——滤镜图、响度补偿与限幅参数逐字相同，执行器改用仓库统一的 async 子进程写法。
-人声先做 `equalizer f=3000 t=q w=1 g=2.5` + `volume=3dB`，再四路
+实现沿用相同的响度补偿与限幅参数，执行器使用仓库统一的 async 子进程写法。
+RVC 单声道人声先显式复制为双声道并做 `equalizer f=3000 t=q w=1 g=2.5`，再四路
 `amix=inputs=4:duration=longest:dropout_transition=0:normalize=0`；随后用 `loudnorm`
 测出成品与原曲的响度差、按最大 ±12 dB 补偿，最后过一次
 `alimiter=limit=0.891251`（−1 dBFS 真峰、latency 补偿）。输出沿用原曲的采样率与声道数
