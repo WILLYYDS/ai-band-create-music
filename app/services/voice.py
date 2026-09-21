@@ -27,7 +27,7 @@ from app.services.stems import prepare_ffmpeg_environment
 logger = logging.getLogger(__name__)
 
 MIX_FILTER = (
-    "[0:a]equalizer=f=3000:t=q:w=1:g=2.5,volume=3dB[vocal];"
+    "[0:a]pan=stereo|c0=c0|c1=c0,equalizer=f=3000:t=q:w=1:g=2.5[vocal];"
     "[vocal][1:a][2:a][3:a]"
     "amix=inputs=4:duration=longest:dropout_transition=0:normalize=0[premix]"
 )

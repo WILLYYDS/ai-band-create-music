@@ -271,3 +271,14 @@ def test_mix_filter_input_count_matches_the_stem_list():
 
     assert declared == len(labels) == 1 + len(MIX_BACKING_STEMS)
     assert len(STEM_NAMES) == 1 + len(MIX_BACKING_STEMS)
+
+
+def test_mix_filter_keeps_stereo_when_rvc_vocal_is_mono(tmp_path):
+    inputs = [write_wav(tmp_path / "vocal.wav", 220, channels=1)] + [
+        write_wav(tmp_path / f"backing{index}.wav", 330 + index * 110)
+        for index in range(3)
+    ]
+
+    premix = build_premix(inputs, tmp_path / "premix.wav")
+
+    assert int(probe(premix)["channels"]) == 2

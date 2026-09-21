@@ -1169,7 +1169,9 @@ def create_app(
                     if job.replace_cancel_requested:
                         raise asyncio.CancelledError
                     conversion_task = asyncio.create_task(
-                        request.app.state.voice_engine.convert(vocal_path, output_path)
+                        request.app.state.voice_engine.convert(
+                            vocal_path, output_path, rms_mix_rate=0.0
+                        )
                     )
                     try:
                         await asyncio.wait_for(
@@ -2057,7 +2059,7 @@ def _rvc_assets_present(settings: Settings) -> bool:
 
 def _rvc_model_fingerprint(settings: Settings) -> str:
     paths = [settings.rvc_model_path, settings.rvc_index_path]
-    parts = [settings.rvc_model_version]
+    parts = [settings.rvc_model_version, "rms_mix_rate=0"]
     for path in paths:
         if path is None:
             parts.append("")
