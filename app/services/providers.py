@@ -24,6 +24,8 @@ from app.services.prompt import (
 
 MINIMAX_GENERATE_PATH = "/v1/audio/jobs"
 MINIMAX_LYRIC_LINE_LIMIT = 32
+# ElevenLabs /v1/music compose API documents a maximum prompt length of 4100 characters:
+# https://elevenlabs.io/docs/api-reference/music/compose
 ELEVENLABS_PROMPT_MAX_CHARS = 4100
 LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")
 ProviderProgressCallback = Callable[[str, int | None, int | None], Awaitable[None]]
@@ -340,24 +342,48 @@ class ElevenLabsMusicProvider:
         job_id: str | None = None,
     ) -> MusicResult:
         music_length_ms = duration_seconds * 1000
-        clear_chinese = self._settings.elevenlabs_clear_chinese_vocal_mode
+        force_instrumental = self._settings.elevenlabs_force_instrumental
+        clear_chinese = (
+            self._settings.elevenlabs_clear_chinese_vocal_mode and not force_instrumental
+        )
         lyrics, _ = split_generation_prompt(user_prompt)
         prompt = build_elevenlabs_prompt(
             structured_prompt, duration_seconds / 60, clear_chinese, lyrics
         )
-        if len(prompt) > ELEVENLABS_PROMPT_MAX_CHARS:
-            raise GenerationError(
-                "ElevenLabs 音乐生成失败：完整歌词与风格 Prompt 长度为 "
-                f"{len(prompt)}，超过接口上限 {ELEVENLABS_PROMPT_MAX_CHARS}；"
-                "请缩短歌词或风格要求后重试。"
-            )
+        request_body = {
+            "prompt": prompt,
+            "music_length_ms": music_length_ms,
+            "model_id": self._settings.elevenlabs_music_model_id,
+            "force_instrumental": force_instrumental,
+        }
+        url = f"{self._settings.elevenlabs_music_base_url}/v1/music"
+        request_diagnostic = {
+            "method": "POST",
+            "url": url,
+            "params": {"output_format": self._settings.elevenlabs_music_output_format},
+            "body": request_body,
+        }
+        update_provider_diagnostic(
+            self._settings.output_dir,
+            job_id,
+            variation,
+            request=request_diagnostic,
+        )
         try:
-            request_body = {
-                "prompt": prompt,
-                "music_length_ms": music_length_ms,
-                "model_id": self._settings.elevenlabs_music_model_id,
-                "force_instrumental": self._settings.elevenlabs_force_instrumental,
-            }
+            if len(prompt) > ELEVENLABS_PROMPT_MAX_CHARS:
+                message = (
+                    "ElevenLabs 音乐生成失败：完整歌词与风格 Prompt 长度为 "
+                    f"{len(prompt)}，超过接口上限 {ELEVENLABS_PROMPT_MAX_CHARS}；"
+                    "请缩短歌词或风格要求后重试。"
+                )
+                update_provider_diagnostic(
+                    self._settings.output_dir,
+                    job_id,
+                    variation,
+                    request=request_diagnostic,
+                    validationError=message,
+                )
+                raise GenerationError(message)
 
             target = _audio_target(
                 self._settings,
@@ -367,7 +393,7 @@ class ElevenLabsMusicProvider:
             )
             async with self._client.stream(
                 "POST",
-                f"{self._settings.elevenlabs_music_base_url}/v1/music",
+                url,
                 json=request_body,
                 params={"output_format": self._settings.elevenlabs_music_output_format},
                 headers=self._headers(accept_audio=True),

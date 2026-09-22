@@ -127,11 +127,12 @@ def test_tagged_lyrics_must_preserve_every_original_line() -> None:
 def test_lyrics_section_tags_are_normalized_without_changing_unknown_labels() -> None:
     lyrics = (
         "[verse1]\n第一句\nintro\n第二句\n[pre chorus]\n第三句\n"
-        "[间奏]\n[吉他独奏]\n[Verse 1: 主唱]\n[Guitar Solo]"
+        "[间奏]\nSolo\nBridge\nOutro\n间奏\n[吉他独奏]\n[Verse 1: 主唱]\n[Guitar Solo]"
     )
     assert normalize_lyrics_section_tags(lyrics) == (
-        "[Verse 1]\n第一句\n[Intro]\n第二句\n[Pre-Chorus]\n第三句\n"
-        "[Instrumental]\n[吉他独奏]\n[Verse 1: 主唱]\n[Guitar Solo]"
+        "[Verse 1]\n第一句\nintro\n第二句\n[Pre-Chorus]\n第三句\n"
+        "[Instrumental]\nSolo\nBridge\nOutro\n间奏\n[吉他独奏]\n"
+        "[Verse 1: 主唱]\n[Guitar Solo]"
     )
 
 
@@ -172,6 +173,13 @@ def test_expanded_music_prompt_requires_detail_and_category_coverage() -> None:
     assert is_expanded_music_prompt(normalized)
     assert normalized.count("[") == STYLE_TAG_MAX
     assert all(tag[1:-1] in normalized for tag in STRUCTURED_TAG_PATTERN.findall(extra_tags))
+
+    oversized_value = f"[Genre: {'x' * 801}]"
+    assert extract_structured_music_tags(oversized_value) is None
+    oversized_overflow = ", ".join(
+        [EXPANDED_MANDARIN_ROCK_PROMPT, *(f"[Extra {index}: {'x' * 110}]" for index in range(8))]
+    )
+    assert extract_structured_music_tags(oversized_overflow) is None
 
 
 def test_create_prompt_splits_lyrics_from_style() -> None:
@@ -251,7 +259,7 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
         (
             "[verse1]\n第一句\nintro\n第二句",
             "[Verse]\n模型返回内容会被忽略",
-            "[Verse 1]\n第一句\n[Intro]\n第二句",
+            "[Verse 1]\n第一句\nintro\n第二句",
         ),
     ],
 )

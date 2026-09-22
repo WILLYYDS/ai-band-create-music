@@ -163,9 +163,42 @@ async def test_elevenlabs_rejects_oversized_complete_prompt_before_request(tmp_p
                 "[Genre: Rock]",
                 120,
                 f"[歌词与创作内容]\n{lyrics}",
+                job_id="oversized-job",
             )
 
     assert not requests
+    diagnostics = json.loads(
+        (settings.output_dir / "jobs/oversized-job/prompts.json").read_text(encoding="utf-8")
+    )
+    provider_request = diagnostics["providerRequests"][0]
+    assert provider_request["request"]["body"]["prompt"].endswith(lyrics)
+    assert "超过接口上限 4100" in provider_request["validationError"]
+
+
+async def test_elevenlabs_instrumental_mode_omits_chinese_vocal_direction(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=b"ID3-generated-audio")
+
+    settings = make_settings(
+        tmp_path,
+        music_api_mode="real",
+        music_provider="elevenlabs_music",
+        elevenlabs_api_key="secret",
+        elevenlabs_music_base_url="https://eleven.test",
+        elevenlabs_force_instrumental=True,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await ElevenLabsMusicProvider(settings, client).generate(
+            "[Genre: dark techno]", 180, ""
+        )
+
+    body = json.loads(requests[0].content)
+    assert body["force_instrumental"] is True
+    assert "Mandarin Chinese lead vocals" not in body["prompt"]
+    assert result.debug["clearChineseVocalMode"] is False
 
 
 async def test_elevenlabs_reads_streaming_error_before_building_message(tmp_path: Path) -> None:

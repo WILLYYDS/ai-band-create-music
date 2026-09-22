@@ -13,6 +13,8 @@ from app.services.job_files import update_job_diagnostics
 
 STYLE_TAG_MIN = 6
 STYLE_TAG_MAX = 8
+STYLE_TAG_KEY_MAX_CHARS = 80
+STYLE_TAG_VALUE_MAX_CHARS = 800
 REQUIRED_STYLE_CATEGORY_ALIASES = (
     ("genre", "style"),
     ("tempo", "rhythm", "meter"),
@@ -60,7 +62,10 @@ GENERATE_LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
     ]
 )
 
-STRUCTURED_TAG_PATTERN = re.compile(r"\[\s*[A-Za-z][A-Za-z0-9 /_-]*\s*:\s*[^\[\]\r\n]+\s*\]")
+STRUCTURED_TAG_PATTERN = re.compile(
+    rf"\[\s*[A-Za-z][A-Za-z0-9 /_-]{{0,{STYLE_TAG_KEY_MAX_CHARS - 1}}}\s*:"
+    rf"\s*[^\[\]\r\n]{{1,{STYLE_TAG_VALUE_MAX_CHARS}}}\s*\]"
+)
 LYRICS_SECTION_PATTERN = re.compile(
     r"\[(?:Intro|Verse(?: \d+)?|Pre-Chorus|Chorus(?: \d+)?|Post-Chorus|"
     r"Bridge(?: \d+)?|Instrumental(?: Break)?|Solo|Outro)\]",
@@ -128,7 +133,11 @@ def normalize_lyrics_section_tags(lyrics: str) -> str:
         content = line.rstrip("\r\n")
         ending = line[len(content) :]
         stripped = content.strip()
-        token = stripped[1:-1].strip() if re.fullmatch(r"\[[^\[\]\r\n]+\]", stripped) else stripped
+        bracketed = re.fullmatch(r"\[[^\[\]\r\n]+\]", stripped)
+        if not bracketed:
+            normalized_lines.append(line)
+            continue
+        token = stripped[1:-1].strip()
         compact = re.sub(r"[\s_-]+", "", token).casefold()
         numbered = re.fullmatch(r"(verse|chorus|bridge)(\d*)", compact)
         if numbered:
@@ -253,10 +262,12 @@ def _normalize_tags_only(candidate: str) -> str | None:
             normalized_tags.append(f"[{key.strip()}: {value}]")
     if len(normalized_tags) > STYLE_TAG_MAX:
         normalized_tags = _merge_style_tags(normalized_tags)
+        if normalized_tags is None:
+            return None
     return ", ".join(normalized_tags) or None
 
 
-def _merge_style_tags(tags: list[str]) -> list[str]:
+def _merge_style_tags(tags: list[str]) -> list[str] | None:
     keys = [tag[1 : tag.index(":")].strip().lower() for tag in tags]
     selected: set[int] = set()
     for aliases in REQUIRED_STYLE_CATEGORY_ALIASES:
@@ -277,8 +288,17 @@ def _merge_style_tags(tags: list[str]) -> list[str]:
     left, right = selected_tags[-2:]
     left_key = left[1 : left.index(":")].strip()
     right_key = right[1 : right.index(":")].strip()
-    combined = f"[{left_key} and {right_key}: {left[1:-1]}; {right[1:-1]}]"
-    additional = f"[Additional Directions: {'; '.join(overflow)}]"
+    combined_key = f"{left_key} and {right_key}"
+    combined_value = f"{left[1:-1]}; {right[1:-1]}"
+    additional_value = "; ".join(overflow)
+    if (
+        len(combined_key) > STYLE_TAG_KEY_MAX_CHARS
+        or len(combined_value) > STYLE_TAG_VALUE_MAX_CHARS
+        or len(additional_value) > STYLE_TAG_VALUE_MAX_CHARS
+    ):
+        return None
+    combined = f"[{combined_key}: {combined_value}]"
+    additional = f"[Additional Directions: {additional_value}]"
     return [*selected_tags[:-2], combined, additional]
 
 
