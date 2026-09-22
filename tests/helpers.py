@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import wave
 from pathlib import Path
 
 from app.core.config import Settings
@@ -99,7 +100,9 @@ class StubStemSeparator:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_files = stem_output_files(input_path)
         for file_name in output_files.values():
-            (output_dir / file_name).write_bytes(b"ID3-stem-audio")
+            with wave.open(str(output_dir / file_name), "wb") as audio:
+                audio.setparams((1, 2, 8_000, 0, "NONE", "not compressed"))
+                audio.writeframes(b"\x00\x00" * 800)
         return SplitResult("stub split", "", 5, output_files)
 
 

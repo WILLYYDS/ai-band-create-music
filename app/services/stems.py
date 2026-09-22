@@ -27,13 +27,12 @@ class SplitProfile:
     shifts: str
     overlap: str
     segment: str
-    mp3_bitrate: str
 
 
 SPLIT_PROFILES = {
-    "fast": SplitProfile("mdx_q", "2", "1", "0.10", "12", "128"),
-    "balanced": SplitProfile("htdemucs", "0", "1", "0.25", "", "192"),
-    "quality": SplitProfile("htdemucs", "0", "2", "0.35", "", "192"),
+    "fast": SplitProfile("mdx_q", "2", "1", "0.10", "12"),
+    "balanced": SplitProfile("htdemucs", "0", "1", "0.25", ""),
+    "quality": SplitProfile("htdemucs", "0", "2", "0.35", ""),
 }
 MODEL_MAX_SEGMENT_SECONDS = {"htdemucs": 7.8, "htdemucs_ft": 7.8, "htdemucs_6s": 7.8}
 
@@ -94,7 +93,6 @@ def build_demucs_command(settings: Settings, input_path: Path, work_dir: Path) -
     jobs = settings.demucs_jobs or profile.jobs
     shifts = settings.demucs_shifts or profile.shifts
     overlap = settings.demucs_overlap or profile.overlap
-    bitrate = settings.demucs_mp3_bitrate or profile.mp3_bitrate
     command = [
         sys.executable,
         "-m",
@@ -103,9 +101,6 @@ def build_demucs_command(settings: Settings, input_path: Path, work_dir: Path) -
         model,
         "--out",
         str(work_dir),
-        "--mp3",
-        "--mp3-bitrate",
-        bitrate,
         "--jobs",
         jobs,
         "--shifts",
@@ -139,16 +134,16 @@ def prepare_ffmpeg_environment() -> dict[str, str]:
 
 
 def _find_stem(work_dir: Path, stem_name: str) -> Path:
-    matches = list(work_dir.rglob(f"{stem_name}.mp3"))
+    matches = list(work_dir.rglob(f"{stem_name}.wav"))
     if not matches:
-        raise GenerationError(f"Demucs 已结束，但没有找到分轨文件：{stem_name}.mp3")
+        raise GenerationError(f"Demucs 已结束，但没有找到分轨文件：{stem_name}.wav")
     return matches[0]
 
 
 def stem_output_files(input_path: Path) -> dict[str, str]:
     base_name = re.sub(r"[^\w\-. ]+", "_", input_path.stem, flags=re.UNICODE).strip(" ._")
     base_name = base_name[:160] or "music"
-    return {stem_name: f"{base_name}_{stem_name}.mp3" for stem_name in STEM_NAMES}
+    return {stem_name: f"{base_name}_{stem_name}.wav" for stem_name in STEM_NAMES}
 
 
 def _copy_stems(
