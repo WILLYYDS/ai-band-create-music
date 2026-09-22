@@ -4,12 +4,16 @@ from pathlib import Path
 import httpx
 import pytest
 
+from app.core.errors import GenerationError
 from app.services.prompt import (
+    STRUCTURED_TAG_PATTERN,
+    STYLE_TAG_MAX,
     OpenAICompatiblePromptExpander,
     extract_structured_music_tags,
     extract_tagged_lyrics,
     is_expanded_music_prompt,
     normalize_llm_output,
+    normalize_lyrics_section_tags,
     split_generation_prompt,
     validate_tagged_lyrics,
 )
@@ -98,7 +102,9 @@ def test_structured_tag_extraction_accepts_json_tag_list() -> None:
 def test_structured_tag_extraction_accepts_detailed_tag_values() -> None:
     value = "detailed audible production direction " * 7
     prompt = f"[Instrumentation: {value}], [Production and Mix: {value}]"
-    assert extract_structured_music_tags(prompt) == prompt
+    assert extract_structured_music_tags(prompt) == (
+        f"[Instrumentation: {value.strip()}], [Production and Mix: {value.strip()}]"
+    )
 
 
 def test_structured_tag_extraction_removes_lyrics_generation_conflicts() -> None:
@@ -109,6 +115,7 @@ def test_structured_tag_extraction_removes_lyrics_generation_conflicts() -> None
     assert extract_structured_music_tags(prompt) == (
         "[Genre: Alternative Rock], [Negative Constraints: no EDM drops]"
     )
+    assert extract_structured_music_tags("[Negative Constraints: no vocals]") is None
 
 
 def test_tagged_lyrics_must_preserve_every_original_line() -> None:
@@ -117,11 +124,26 @@ def test_tagged_lyrics_must_preserve_every_original_line() -> None:
     assert extract_tagged_lyrics("[Verse]\n改写的第一句\n第二句", lyrics) is None
 
 
+def test_lyrics_section_tags_are_normalized_without_changing_unknown_labels() -> None:
+    lyrics = (
+        "[verse1]\n第一句\nintro\n第二句\n[pre chorus]\n第三句\n"
+        "[间奏]\n[吉他独奏]\n[Verse 1: 主唱]\n[Guitar Solo]"
+    )
+    assert normalize_lyrics_section_tags(lyrics) == (
+        "[Verse 1]\n第一句\n[Intro]\n第二句\n[Pre-Chorus]\n第三句\n"
+        "[Instrumental]\n[吉他独奏]\n[Verse 1: 主唱]\n[Guitar Solo]"
+    )
+
+
 def test_tagged_lyrics_validation_preserves_supported_labels_and_rejects_unknown_ones() -> None:
     lyrics = "[Verse 1]\n第一句\n[Instrumental Break]\n[Chorus]\n第二句"
     assert validate_tagged_lyrics(lyrics) == lyrics
     with pytest.raises(ValueError, match="不支持"):
         validate_tagged_lyrics("[Verse]\n第一句\n[Final Chorus]\n第二句")
+    user_lyrics = "[Verse]\n第一句\n[Guitar Solo]\n（副歌重复两次）\n第二句"
+    assert validate_tagged_lyrics(user_lyrics, strict=False) == user_lyrics
+    with pytest.raises(ValueError, match="没有可演唱内容"):
+        validate_tagged_lyrics("[Verse]\n[Guitar Solo]\n（副歌重复两次）", strict=False)
 
 
 def test_flat_music_tags_are_rejected() -> None:
@@ -142,7 +164,14 @@ def test_expanded_music_prompt_requires_detail_and_category_coverage() -> None:
         "[Production Mix and Negative Constraints: Wide clean mix; avoid muddy low mids]"
     )
     assert is_expanded_music_prompt(six_tags)
-    assert not is_expanded_music_prompt(f"{EXPANDED_MANDARIN_ROCK_PROMPT}, [Extra: detail]")
+    extra_tags = (
+        f"{EXPANDED_MANDARIN_ROCK_PROMPT}, [Energy: Explosive], [Regional Texture: Guzheng accents]"
+    )
+    normalized = extract_structured_music_tags(extra_tags)
+    assert normalized is not None
+    assert is_expanded_music_prompt(normalized)
+    assert normalized.count("[") == STYLE_TAG_MAX
+    assert all(tag[1:-1] in normalized for tag in STRUCTURED_TAG_PATTERN.findall(extra_tags))
 
 
 def test_create_prompt_splits_lyrics_from_style() -> None:
@@ -204,6 +233,48 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
     assert body["max_tokens"] == 2048
     assert body["thinking"] == {"type": "disabled"}
     assert body["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.parametrize(
+    ("lyrics", "tagged", "expected"),
+    [
+        (
+            "[Verse]\n第一句\n[Guitar Solo]\n（副歌重复两次）\n第二句",
+            "[Verse]\n模型返回内容会被忽略",
+            "[Verse]\n第一句\n[Guitar Solo]\n（副歌重复两次）\n第二句",
+        ),
+        (
+            "我走过长街\n[间奏]\n灯火通明",
+            "[Verse]\n我走过长街\n[间奏]\n灯火通明",
+            "我走过长街\n[Instrumental]\n灯火通明",
+        ),
+        (
+            "[verse1]\n第一句\nintro\n第二句",
+            "[Verse]\n模型返回内容会被忽略",
+            "[Verse 1]\n第一句\n[Intro]\n第二句",
+        ),
+    ],
+)
+async def test_prepare_normalizes_known_user_labels_without_changing_unknown_ones(
+    tmp_path: Path, lyrics: str, tagged: str, expected: str
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        content = json.dumps(
+            {"taggedLyrics": tagged, "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT},
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    user_prompt = f"[歌词与创作内容]\n{lyrics}\n\n[风格要求]\n普通话摇滚"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(user_prompt)
+
+    assert prepared.lyrics == expected
+    assert len(requests) == 1
 
 
 async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> None:
@@ -385,6 +456,52 @@ async def test_prepare_retries_once_after_invalid_json(tmp_path: Path) -> None:
     assert len(requests) == 2
     retry_body = json.loads(requests[1].content)
     assert retry_body["messages"][-1]["content"].startswith("上次响应未满足")
+
+
+async def test_prepare_retry_skips_empty_assistant_message(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        content = ""
+        if len(requests) == 2:
+            content = json.dumps(
+                {
+                    "taggedLyrics": ONE_MINUTE_LYRICS,
+                    "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                },
+                ensure_ascii=False,
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await OpenAICompatiblePromptExpander(settings, client).prepare("[风格要求]\n男声摇滚", 1)
+
+    retry_body = json.loads(requests[1].content)
+    assert [message["role"] for message in retry_body["messages"]] == ["system", "user", "user"]
+
+
+async def test_prepare_reports_second_validation_failure(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "not json"}}]})
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match="模型未返回 JSON 对象"):
+            await OpenAICompatiblePromptExpander(settings, client).prepare("[风格要求]\n男声摇滚")
+
+    assert len(requests) == 2
+
+
+async def test_prepare_rejects_missing_llm_key_before_request(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, llm_api_key=None)
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(GenerationError, match="缺少 LLM_API_KEY"):
+            await OpenAICompatiblePromptExpander(settings, client).prepare("[风格要求]\n男声摇滚")
 
 
 async def test_prepare_retries_concise_style_and_adds_missing_verse_tag(tmp_path: Path) -> None:

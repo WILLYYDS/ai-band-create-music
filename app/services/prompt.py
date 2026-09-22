@@ -13,6 +13,16 @@ from app.services.job_files import update_job_diagnostics
 
 STYLE_TAG_MIN = 6
 STYLE_TAG_MAX = 8
+REQUIRED_STYLE_CATEGORY_ALIASES = (
+    ("genre", "style"),
+    ("tempo", "rhythm", "meter"),
+    ("mood", "emotion"),
+    ("instrument", "guitar", "drum", "bass"),
+    ("vocal", "voice"),
+    ("arrangement", "structure", "section"),
+    ("production", "mix", "recording"),
+    ("negative", "exclusion", "avoid"),
+)
 STYLE_TAG_REQUIREMENTS = "\n".join(
     [
         f"styleTags 必须包含 {STYLE_TAG_MIN}-{STYLE_TAG_MAX} 个详细英文音乐制作标签，"
@@ -21,8 +31,7 @@ STYLE_TAG_REQUIREMENTS = "\n".join(
         "Arrangement、Production and Mix、Negative Constraints；允许在同一标签中合并相邻类别。",
         "标签值应包含可听见、可执行的细节，例如 BPM、律动、音色、中文人声唱法、"
         "段落推进、空间效果、动态变化和需要避免的声音。",
-        "保留用户的显式要求，为未指定项补充协调一致的专业选择；"
-        "不得引用具体艺人或受版权保护作品。",
+        "保留用户的显式要求，为未指定项补充协调一致的专业选择；不得引用具体艺人或受版权保护作品。",
         "Negative Constraints 禁止出现 no lyrics、no vocals 或 no melody。",
     ]
 )
@@ -51,14 +60,22 @@ GENERATE_LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
     ]
 )
 
-STRUCTURED_TAG_PATTERN = re.compile(
-    r"\[\s*[A-Za-z][A-Za-z0-9 /_-]{0,39}\s*:\s*[^\[\]\r\n]{1,320}\s*\]"
-)
+STRUCTURED_TAG_PATTERN = re.compile(r"\[\s*[A-Za-z][A-Za-z0-9 /_-]*\s*:\s*[^\[\]\r\n]+\s*\]")
 LYRICS_SECTION_PATTERN = re.compile(
     r"\[(?:Intro|Verse(?: \d+)?|Pre-Chorus|Chorus(?: \d+)?|Post-Chorus|"
     r"Bridge(?: \d+)?|Instrumental(?: Break)?|Solo|Outro)\]",
     re.IGNORECASE,
 )
+LYRICS_SECTION_ALIASES = {
+    "intro": "Intro",
+    "prechorus": "Pre-Chorus",
+    "postchorus": "Post-Chorus",
+    "instrumental": "Instrumental",
+    "instrumentalbreak": "Instrumental Break",
+    "solo": "Solo",
+    "outro": "Outro",
+    "间奏": "Instrumental",
+}
 FORBIDDEN_LYRICS_CONSTRAINT_PATTERN = re.compile(
     r"(?:[,;]\s*)?\bno (?:lyrics(?:\s+or\s+melody(?:\s+generation)?)?|"
     r"vocals?|melody(?:\s+generation)?)\b",
@@ -105,6 +122,26 @@ def normalize_llm_output(raw_content: object) -> str:
     return content.strip().strip("\"'").strip()
 
 
+def normalize_lyrics_section_tags(lyrics: str) -> str:
+    normalized_lines: list[str] = []
+    for line in lyrics.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        ending = line[len(content) :]
+        stripped = content.strip()
+        token = stripped[1:-1].strip() if re.fullmatch(r"\[[^\[\]\r\n]+\]", stripped) else stripped
+        compact = re.sub(r"[\s_-]+", "", token).casefold()
+        numbered = re.fullmatch(r"(verse|chorus|bridge)(\d*)", compact)
+        if numbered:
+            section = numbered.group(1).title()
+            number = numbered.group(2)
+            normalized_lines.append(f"[{section}{f' {number}' if number else ''}]{ending}")
+        elif compact in LYRICS_SECTION_ALIASES:
+            normalized_lines.append(f"[{LYRICS_SECTION_ALIASES[compact]}]{ending}")
+        else:
+            normalized_lines.append(line)
+    return "".join(normalized_lines)
+
+
 def extract_json_object(raw_content: object) -> dict[str, Any]:
     """Extract the first JSON object from an otherwise chatty LLM response."""
     content = normalize_llm_output(raw_content)
@@ -137,16 +174,24 @@ def extract_tagged_lyrics(raw_content: object, original_lyrics: str) -> str | No
     return "\n".join(lines)
 
 
-def validate_tagged_lyrics(lyrics: str) -> str:
+def validate_tagged_lyrics(lyrics: str, *, strict: bool = True) -> str:
     text = lyrics.strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+    stage_direction_pattern = r"[（(].*[）)]"
     if not any(LYRICS_SECTION_PATTERN.fullmatch(line) for line in lines):
         raise ValueError("歌词缺少受支持的段落标签")
-    if any(line.startswith("[") and not LYRICS_SECTION_PATTERN.fullmatch(line) for line in lines):
+    if strict and any(
+        line.startswith("[") and not LYRICS_SECTION_PATTERN.fullmatch(line) for line in lines
+    ):
         raise ValueError("歌词包含不支持的段落标签")
-    if any(re.fullmatch(r"[（(].*[）)]", line) for line in lines):
+    if strict and any(re.fullmatch(stage_direction_pattern, line) for line in lines):
         raise ValueError("歌词包含演奏或制作说明")
-    if not any(not LYRICS_SECTION_PATTERN.fullmatch(line) for line in lines):
+    if not any(
+        not LYRICS_SECTION_PATTERN.fullmatch(line)
+        and not (line.startswith("[") and line.endswith("]"))
+        and not re.fullmatch(stage_direction_pattern, line)
+        for line in lines
+    ):
         raise ValueError("歌词没有可演唱内容")
     return text
 
@@ -199,11 +244,42 @@ def _normalize_tags_only(candidate: str) -> str | None:
     remainder = STRUCTURED_TAG_PATTERN.sub("", candidate)
     if remainder.strip(" \t\r\n,;*_`-'\""):
         return None
-    normalized_tags = [
-        FORBIDDEN_LYRICS_CONSTRAINT_PATTERN.sub("", re.sub(r"\s+", " ", tag)).strip()
-        for tag in tags
-    ]
-    return ", ".join(normalized_tags)
+    normalized_tags: list[str] = []
+    for tag in tags:
+        cleaned = FORBIDDEN_LYRICS_CONSTRAINT_PATTERN.sub("", re.sub(r"\s+", " ", tag)).strip()
+        key, value = cleaned[1:-1].split(":", 1)
+        value = value.strip(" \t,;")
+        if value:
+            normalized_tags.append(f"[{key.strip()}: {value}]")
+    if len(normalized_tags) > STYLE_TAG_MAX:
+        normalized_tags = _merge_style_tags(normalized_tags)
+    return ", ".join(normalized_tags) or None
+
+
+def _merge_style_tags(tags: list[str]) -> list[str]:
+    keys = [tag[1 : tag.index(":")].strip().lower() for tag in tags]
+    selected: set[int] = set()
+    for aliases in REQUIRED_STYLE_CATEGORY_ALIASES:
+        match = next(
+            (index for index, key in enumerate(keys) if any(alias in key for alias in aliases)),
+            None,
+        )
+        if match is not None:
+            selected.add(match)
+    for index in range(len(tags)):
+        if len(selected) >= STYLE_TAG_MAX:
+            break
+        selected.add(index)
+
+    selected_indexes = sorted(selected)[:STYLE_TAG_MAX]
+    selected_tags = [tags[index] for index in selected_indexes]
+    overflow = [tag[1:-1] for index, tag in enumerate(tags) if index not in selected]
+    left, right = selected_tags[-2:]
+    left_key = left[1 : left.index(":")].strip()
+    right_key = right[1 : right.index(":")].strip()
+    combined = f"[{left_key} and {right_key}: {left[1:-1]}; {right[1:-1]}]"
+    additional = f"[Additional Directions: {'; '.join(overflow)}]"
+    return [*selected_tags[:-2], combined, additional]
 
 
 def _extract_json_tags(content: str) -> str | None:
@@ -262,20 +338,11 @@ def is_expanded_music_prompt(structured_prompt: str) -> bool:
         return False
 
     keys = [tag[1 : tag.index(":")].strip().lower() for tag in tags]
-    required_category_aliases = (
-        ("genre", "style"),
-        ("tempo", "rhythm", "meter"),
-        ("mood", "emotion"),
-        ("instrument", "guitar", "drum", "bass"),
-        ("vocal", "voice"),
-        ("arrangement", "structure", "section"),
-        ("production", "mix", "recording"),
-        ("negative", "exclusion", "avoid"),
-    )
     return all(
         any(alias in key for key in keys for alias in aliases)
-        for aliases in required_category_aliases
+        for aliases in REQUIRED_STYLE_CATEGORY_ALIASES
     )
+
 
 class OpenAICompatiblePromptExpander:
     def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
@@ -292,13 +359,12 @@ class OpenAICompatiblePromptExpander:
         if self._settings.llm_api_key is None:
             raise GenerationError("歌词与风格处理失败：缺少 LLM_API_KEY 环境变量。")
         lyrics, style = split_generation_prompt(user_prompt)
+        lyrics = normalize_lyrics_section_tags(lyrics)
         generate_lyrics = not lyrics
         if generate_lyrics:
             request_content = f"创作要求：\n{style or user_prompt}"
         else:
-            request_content = (
-                f"歌词：\n{lyrics}\n\n风格要求：\n{style or '请补充协调的音乐风格'}"
-            )
+            request_content = f"歌词：\n{lyrics}\n\n风格要求：\n{style or '请补充协调的音乐风格'}"
         request_body: dict[str, object] = {
             "model": self._settings.llm_model,
             "temperature": 0,
@@ -333,7 +399,11 @@ class OpenAICompatiblePromptExpander:
                 if attempt:
                     request_body["messages"] = [
                         *original_messages,
-                        {"role": "assistant", "content": rejected_content[:2000]},
+                        *(
+                            [{"role": "assistant", "content": rejected_content[:2000]}]
+                            if rejected_content
+                            else []
+                        ),
                         {
                             "role": "user",
                             "content": (
@@ -403,8 +473,11 @@ class OpenAICompatiblePromptExpander:
                     )
                     if isinstance(tagged_content, list):
                         tagged_content = "\n".join(str(line) for line in tagged_content)
+                    tagged_content = normalize_lyrics_section_tags(
+                        normalize_llm_output(tagged_content)
+                    )
                     if generate_lyrics:
-                        tagged = normalize_llm_output(tagged_content)
+                        tagged = tagged_content
                         if tagged and not LYRICS_SECTION_PATTERN.search(tagged):
                             tagged = f"[Verse]\n{tagged}"
                     elif LYRICS_SECTION_PATTERN.search(lyrics):
@@ -413,7 +486,7 @@ class OpenAICompatiblePromptExpander:
                         tagged = extract_tagged_lyrics(tagged_content, lyrics) or (
                             f"[Verse]\n{lyrics}"
                         )
-                    tagged = validate_tagged_lyrics(tagged)
+                    tagged = validate_tagged_lyrics(tagged, strict=generate_lyrics)
                     style_tags = (
                         prepared.get("styleTags")
                         or prepared.get("style_tags")
@@ -449,8 +522,10 @@ class OpenAICompatiblePromptExpander:
                         )
                     if attempt:
                         raise
+            raise GenerationError("歌词与风格处理失败：重试后仍未获得有效结果。")
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
             raise GenerationError(f"歌词与风格处理失败：{_http_failure_message(exc)}") from exc
+
 
 def _http_failure_message(error: Exception) -> str:
     if isinstance(error, httpx.HTTPStatusError):

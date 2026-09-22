@@ -142,6 +142,32 @@ async def test_elevenlabs_sends_complete_prompt_and_streams_audio(tmp_path: Path
     assert "composition_plan" not in music_body
 
 
+async def test_elevenlabs_rejects_oversized_complete_prompt_before_request(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=b"unexpected")
+
+    settings = make_settings(
+        tmp_path,
+        music_api_mode="real",
+        music_provider="elevenlabs_music",
+        elevenlabs_api_key="secret",
+        elevenlabs_music_base_url="https://eleven.test",
+    )
+    lyrics = "[Verse]\n" + "很长的完整歌词" * 700
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match="超过接口上限 4100"):
+            await ElevenLabsMusicProvider(settings, client).generate(
+                "[Genre: Rock]",
+                120,
+                f"[歌词与创作内容]\n{lyrics}",
+            )
+
+    assert not requests
+
+
 async def test_elevenlabs_reads_streaming_error_before_building_message(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, stream=StreamingErrorBody())

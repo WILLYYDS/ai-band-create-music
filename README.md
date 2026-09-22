@@ -6,7 +6,7 @@ AI 音乐生成与 RVC 人声替换的纯 FastAPI 后端。项目使用 `uv` 固
 ## 功能
 
 - OpenAI-compatible LLM 音乐 Prompt 结构化扩写与质量校验
-- ElevenLabs Music API（Composition Plan / 直接 Prompt）
+- ElevenLabs Music API（直接 Prompt）
 - Suno sidecar 和 Generic Provider 兼容适配器
 - 内置 Demucs `vocal / drums / bass / other` 四轨分离实现（当前生成管线未启用）
 - RVC 人声替换、结果下载、软删除与恢复
@@ -41,6 +41,10 @@ LLM_TIMEOUT_SECONDS=120
 LLM_DISABLE_THINKING=true
 ELEVENLABS_API_KEY=...
 ```
+
+ElevenLabs 直接接收完整的结构化歌词、扩充风格标签和固定的 `music_length_ms`，由模型自行
+安排段落与演唱节奏。后端不会裁剪歌词；组合后的 Prompt 超过接口的 4100 字符上限时会在
+调用前报错。歌词相对目标时长过长时可能无法完整唱完，调用方需要缩短歌词或增加目标时长。
 
 自部署 MiniMax Music 3 使用兼容的 `/v1/audio/jobs` 接口：
 

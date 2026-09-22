@@ -26,9 +26,7 @@ class StubPromptExpander:
         if user_prompt.startswith("[歌词与创作内容]"):
             lyrics = user_prompt.split("\n\n[风格要求]", 1)[0].split("\n", 1)[1]
             return PreparedPrompt(structured_prompt, f"[Verse]\n{lyrics}", duration_seconds)
-        return PreparedPrompt(
-            structured_prompt, "[Verse]\n自动生成的测试歌词", duration_seconds
-        )
+        return PreparedPrompt(structured_prompt, "[Verse]\n自动生成的测试歌词", duration_seconds)
 
 
 class BlockingPromptExpander:

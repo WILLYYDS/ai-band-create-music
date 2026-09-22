@@ -24,6 +24,7 @@ from app.services.prompt import (
 
 MINIMAX_GENERATE_PATH = "/v1/audio/jobs"
 MINIMAX_LYRIC_LINE_LIMIT = 32
+ELEVENLABS_PROMPT_MAX_CHARS = 4100
 LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")
 ProviderProgressCallback = Callable[[str, int | None, int | None], Awaitable[None]]
 
@@ -344,6 +345,12 @@ class ElevenLabsMusicProvider:
         prompt = build_elevenlabs_prompt(
             structured_prompt, duration_seconds / 60, clear_chinese, lyrics
         )
+        if len(prompt) > ELEVENLABS_PROMPT_MAX_CHARS:
+            raise GenerationError(
+                "ElevenLabs 音乐生成失败：完整歌词与风格 Prompt 长度为 "
+                f"{len(prompt)}，超过接口上限 {ELEVENLABS_PROMPT_MAX_CHARS}；"
+                "请缩短歌词或风格要求后重试。"
+            )
         try:
             request_body = {
                 "prompt": prompt,
@@ -541,6 +548,7 @@ class MiniMaxMusicProvider:
         try:
             lyrics, _ = split_generation_prompt(user_prompt)
             if not lyrics:
+                # The orchestrator always supplies prepared lyrics; keep this for direct callers.
                 raise GenerationError("MiniMax 音乐生成失败：缺少已准备好的歌词。")
             lyrics = _wrap_long_lyric_lines(lyrics)
             if len(lyrics) < 10:
