@@ -12,6 +12,7 @@ def test_default_port_and_prompt_limit(tmp_path: Path) -> None:
     assert settings.port == 8010
     assert settings.prompt_max_chars == 2000
     assert settings.llm_timeout_seconds == 120
+    assert settings.llm_max_tokens == 2048
     assert settings.rvc_conversion_timeout_seconds == 1800
     assert settings.llm_disable_thinking is True
     assert settings.task_backend == "inline"
@@ -58,3 +59,8 @@ def test_invalid_duration_range_is_rejected(tmp_path: Path) -> None:
         )
     with pytest.raises(ValidationError):
         make_settings(tmp_path, max_duration_minutes=7)
+
+
+def test_llm_output_budget_is_capped(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        make_settings(tmp_path, llm_max_tokens=4097)

@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_timeout_seconds: float = Field(default=120, gt=0)
     llm_temperature: float = Field(default=0.2, ge=0, le=2)
-    llm_max_tokens: int = Field(default=1024, ge=1)
+    llm_max_tokens: int = Field(default=2048, ge=1, le=4096)
     llm_disable_thinking: bool = True
 
     music_api_mode: Literal["mock", "real"] = "mock"
@@ -74,7 +74,6 @@ class Settings(BaseSettings):
     elevenlabs_music_base_url: str = "https://api.elevenlabs.io"
     elevenlabs_music_model_id: str = "music_v2"
     elevenlabs_music_output_format: str = "auto"
-    elevenlabs_use_composition_plan: bool = True
     elevenlabs_clear_chinese_vocal_mode: bool = True
     elevenlabs_force_instrumental: bool = False
     elevenlabs_bypass_global_proxy: bool = True

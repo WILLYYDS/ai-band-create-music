@@ -48,8 +48,7 @@ async def test_health_preserves_legacy_contract(tmp_path: Path) -> None:
     assert body["maxConcurrentGenerations"] == 1
     assert body["outputUrl"] == "http://testserver/output"
     assert body["llm"]["timeoutSeconds"] == 120
-    assert body["llm"]["initialMaxTokens"] == 1024
-    assert body["llm"]["retryMaxTokens"] == 2048
+    assert body["llm"]["maxTokens"] == 2048
     assert body["llm"]["disableThinking"] is True
     assert body["splitting"]["enabled"] is True
     assert body["splitting"]["mode"] == "on_demand"

@@ -55,7 +55,7 @@ from app.services.job_files import (
     stored_path_exists,
 )
 from app.services.orchestrator import GenerationOrchestrator
-from app.services.prompt import OpenAICompatiblePromptExpander, effective_llm_output_tokens
+from app.services.prompt import OpenAICompatiblePromptExpander
 from app.services.providers import create_music_provider
 from app.services.stems import STEM_NAMES, DemucsStemSeparator
 from app.services.voice import (
@@ -459,18 +459,11 @@ def create_app(
                 "model": application_settings.llm_model,
                 "timeoutSeconds": application_settings.llm_timeout_seconds,
                 "maxTokens": application_settings.llm_max_tokens,
-                "initialMaxTokens": effective_llm_output_tokens(
-                    application_settings.llm_max_tokens, strict=False
-                ),
-                "retryMaxTokens": effective_llm_output_tokens(
-                    application_settings.llm_max_tokens, strict=True
-                ),
                 "disableThinking": application_settings.llm_disable_thinking,
             },
             "elevenLabs": {
                 "modelId": application_settings.elevenlabs_music_model_id,
                 "outputFormat": application_settings.elevenlabs_music_output_format,
-                "useCompositionPlan": application_settings.elevenlabs_use_composition_plan,
                 "clearChineseVocalMode": application_settings.elevenlabs_clear_chinese_vocal_mode,
             },
             "splitting": {
