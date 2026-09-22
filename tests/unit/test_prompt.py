@@ -40,7 +40,7 @@ EXPANDED_MANDARIN_ROCK_PROMPT = (
 
 
 def generated_lyrics(line_count: int) -> str:
-    return "[Verse]\n" + "\n".join(f"第 {index} 句歌词" for index in range(line_count))
+    return "[verse]\n" + "\n".join(f"第 {index} 句歌词" for index in range(line_count))
 
 
 ONE_MINUTE_LYRICS = generated_lyrics(10)
@@ -130,8 +130,8 @@ def test_lyrics_section_tags_are_normalized_without_changing_unknown_labels() ->
         "[间奏]\nSolo\nBridge\nOutro\n间奏\n[吉他独奏]\n[Verse 1: 主唱]\n[Guitar Solo]"
     )
     assert normalize_lyrics_section_tags(lyrics) == (
-        "[Verse 1]\n第一句\nintro\n第二句\n[Pre-Chorus]\n第三句\n"
-        "[Instrumental]\nSolo\nBridge\nOutro\n间奏\n[吉他独奏]\n"
+        "[verse 1]\n第一句\nintro\n第二句\n[pre-chorus]\n第三句\n"
+        "[instrumental]\nSolo\nBridge\nOutro\n间奏\n[吉他独奏]\n"
         "[Verse 1: 主唱]\n[Guitar Solo]"
     )
 
@@ -139,10 +139,11 @@ def test_lyrics_section_tags_are_normalized_without_changing_unknown_labels() ->
 @pytest.mark.parametrize(
     ("raw", "canonical"),
     [
-        ("[Pre-Chorus 2]", "[Pre-Chorus 2]"),
-        ("[post chorus2]", "[Post-Chorus 2]"),
-        ("[instrumental2]", "[Instrumental 2]"),
-        ("[instrumental break 2]", "[Instrumental Break 2]"),
+        ("[Pre-Chorus 2]", "[pre-chorus 2]"),
+        ("[post chorus2]", "[post-chorus 2]"),
+        ("[instrumental2]", "[instrumental 2]"),
+        ("[instrumental break 2]", "[instrumental break 2]"),
+        ("[HOOK]", "[hook]"),
     ],
 )
 def test_numbered_lyrics_sections_share_normalization_and_validation(
@@ -153,13 +154,34 @@ def test_numbered_lyrics_sections_share_normalization_and_validation(
     assert validate_tagged_lyrics(normalized) == normalized
 
 
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    [
+        ("[INTRO]", "[intro]"),
+        ("[Verse 1]", "[verse 1]"),
+        ("[verse2]", "[verse 2]"),
+        ("[Pre Chorus]", "[pre-chorus]"),
+        ("[CHORUS]", "[chorus]"),
+        ("[Hook]", "[hook]"),
+        ("[Bridge]", "[bridge]"),
+        ("[Outro]", "[outro]"),
+    ],
+)
+def test_ai_talk_lyrics_section_tags_are_supported(raw: str, canonical: str) -> None:
+    assert validate_tagged_lyrics(f"{raw}\n第一句") == f"{canonical}\n第一句"
+
+
 def test_tagged_lyrics_validation_preserves_supported_labels_and_rejects_unknown_ones() -> None:
     lyrics = "[Verse 1]\n第一句\n[Instrumental Break]\n[Chorus]\n第二句"
-    assert validate_tagged_lyrics(lyrics) == lyrics
+    assert validate_tagged_lyrics(lyrics) == (
+        "[verse 1]\n第一句\n[instrumental break]\n[chorus]\n第二句"
+    )
     with pytest.raises(ValueError, match="不支持"):
         validate_tagged_lyrics("[Verse]\n第一句\n[Final Chorus]\n第二句")
     user_lyrics = "[Verse]\n第一句\n[Guitar Solo]\n（副歌重复两次）\n第二句"
-    assert validate_tagged_lyrics(user_lyrics, strict=False) == user_lyrics
+    assert validate_tagged_lyrics(user_lyrics, strict=False) == (
+        "[verse]\n第一句\n[Guitar Solo]\n（副歌重复两次）\n第二句"
+    )
     with pytest.raises(ValueError, match="没有可演唱内容"):
         validate_tagged_lyrics("[Verse]\n[Guitar Solo]\n（副歌重复两次）", strict=False)
 
@@ -250,7 +272,7 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
         )
 
     assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
-    assert prepared.lyrics == "[Verse]\n第一句\n[Chorus]\n第二句"
+    assert prepared.lyrics == "[verse]\n第一句\n[chorus]\n第二句"
     assert prepared.duration_seconds is None
     assert len(requests) == 1
     body = json.loads(requests[0].content)
@@ -266,17 +288,17 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
         (
             "[Verse]\n第一句\n[Guitar Solo]\n（副歌重复两次）\n第二句",
             "[Verse]\n模型返回内容会被忽略",
-            "[Verse]\n第一句\n[Guitar Solo]\n（副歌重复两次）\n第二句",
+            "[verse]\n第一句\n[Guitar Solo]\n（副歌重复两次）\n第二句",
         ),
         (
             "我走过长街\n[间奏]\n灯火通明",
             "[Verse]\n我走过长街\n[间奏]\n灯火通明",
-            "我走过长街\n[Instrumental]\n灯火通明",
+            "我走过长街\n[instrumental]\n灯火通明",
         ),
         (
             "[verse1]\n第一句\nintro\n第二句",
             "[Verse]\n模型返回内容会被忽略",
-            "[Verse 1]\n第一句\nintro\n第二句",
+            "[verse 1]\n第一句\nintro\n第二句",
         ),
     ],
 )
@@ -542,7 +564,7 @@ async def test_prepare_retries_concise_style_and_adds_missing_verse_tag(tmp_path
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "lyrics": ONE_MINUTE_LYRICS.removeprefix("[Verse]\n"),
+                                    "lyrics": ONE_MINUTE_LYRICS.removeprefix("[verse]\n"),
                                     "style": (
                                         "[Genre: Rock]"
                                         if len(requests) == 1
@@ -646,7 +668,12 @@ async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(
             f"[歌词与创作内容]\n{original}\n\n[风格要求]\n摇滚"
         )
 
-    assert prepared.lyrics == (original if original.startswith("[") else f"[Verse]\n{original}")
+    expected = (
+        normalize_lyrics_section_tags(original)
+        if original.startswith("[")
+        else f"[verse]\n{original}"
+    )
+    assert prepared.lyrics == expected
 
 
 async def test_prepare_accepts_style_tags_as_json_array(tmp_path: Path) -> None:

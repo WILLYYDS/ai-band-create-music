@@ -43,8 +43,8 @@ STYLE_TAG_REQUIREMENTS = "\n".join(
 LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
     [
         "你是专业音乐制作人与歌词结构编辑，同时完成歌词分段和音乐风格扩写。",
-        "只能插入 [Intro]、[Verse]、[Pre-Chorus]、[Chorus]、[Post-Chorus]、"
-        "[Bridge]、[Instrumental]、[Solo]、[Outro]，标签必须单独占一行。",
+        "只能插入 [intro]、[verse]、[pre-chorus]、[chorus]、[hook]、[post-chorus]、"
+        "[bridge]、[instrumental]、[solo]、[outro]，标签必须单独占一行。",
         "不得增加、删除、改写、重排或重复任何歌词。",
         STYLE_TAG_REQUIREMENTS,
         "只返回 JSON 对象，包含字符串 taggedLyrics 和字符串 styleTags；不要解释或输出代码块。",
@@ -54,11 +54,11 @@ LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
 GENERATE_LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
     [
         "你是专业音乐制作人与填词人，根据用户的创作要求同时生成原创歌词和音乐风格说明。",
-        "默认创作可直接演唱的原创简体中文歌词，使用 [Intro]、[Verse]、[Chorus]、"
-        "[Bridge]、[Outro] 等结构标签，每个标签独占一行。",
-        "taggedLyrics 只能包含支持的英文结构标签和真正需要唱出的歌词；禁止 [Guitar Solo]、"
-        "[Final Chorus] 等自造标签，禁止用括号写演奏、制作或时长说明。独奏只能写 [Solo]，"
-        "最后副歌仍写 [Chorus]。",
+        "默认创作可直接演唱的原创简体中文歌词，使用 [intro]、[verse]、[pre-chorus]、"
+        "[chorus]、[hook]、[bridge]、[outro] 等小写结构标签，每个标签独占一行。",
+        "taggedLyrics 只能包含支持的英文结构标签和真正需要唱出的歌词；禁止 [guitar solo]、"
+        "[final chorus] 等自造标签，禁止用括号写演奏、制作或时长说明。独奏只能写 [solo]，"
+        "最后副歌仍写 [chorus]。",
         f"除结构标签外，taggedLyrics 的歌词正文合计不得超过 {GENERATED_LYRICS_MAX_CHARS} 个字符。",
         STYLE_TAG_REQUIREMENTS,
         "只返回 JSON 对象，包含字符串 taggedLyrics 和字符串 styleTags；不要解释或输出代码块。",
@@ -70,17 +70,18 @@ STRUCTURED_TAG_PATTERN = re.compile(
     rf"\s*[^\[\]\r\n]{{1,{STYLE_TAG_VALUE_MAX_CHARS}}}\s*\]"
 )
 LYRICS_SECTION_SPECS = {
-    "intro": ("Intro", False),
-    "verse": ("Verse", True),
-    "prechorus": ("Pre-Chorus", True),
-    "chorus": ("Chorus", True),
-    "postchorus": ("Post-Chorus", True),
-    "bridge": ("Bridge", True),
-    "instrumental": ("Instrumental", True),
-    "instrumentalbreak": ("Instrumental Break", True),
-    "solo": ("Solo", False),
-    "outro": ("Outro", False),
-    "间奏": ("Instrumental", True),
+    "intro": ("intro", False),
+    "verse": ("verse", True),
+    "prechorus": ("pre-chorus", True),
+    "chorus": ("chorus", True),
+    "hook": ("hook", False),
+    "postchorus": ("post-chorus", True),
+    "bridge": ("bridge", True),
+    "instrumental": ("instrumental", True),
+    "instrumentalbreak": ("instrumental break", True),
+    "solo": ("solo", False),
+    "outro": ("outro", False),
+    "间奏": ("instrumental", True),
 }
 _CANONICAL_LYRICS_SECTIONS = dict(LYRICS_SECTION_SPECS.values())
 LYRICS_SECTION_PATTERN = re.compile(
@@ -193,7 +194,7 @@ def extract_tagged_lyrics(raw_content: object, original_lyrics: str) -> str | No
 
 
 def validate_tagged_lyrics(lyrics: str, *, strict: bool = True) -> str:
-    text = lyrics.strip()
+    text = normalize_lyrics_section_tags(lyrics.strip())
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     stage_direction_pattern = r"[（(].*[）)]"
     if not any(LYRICS_SECTION_PATTERN.fullmatch(line) for line in lines):
@@ -519,12 +520,12 @@ class OpenAICompatiblePromptExpander:
                     if generate_lyrics:
                         tagged = tagged_content
                         if tagged and not LYRICS_SECTION_PATTERN.search(tagged):
-                            tagged = f"[Verse]\n{tagged}"
+                            tagged = f"[verse]\n{tagged}"
                     elif LYRICS_SECTION_PATTERN.search(lyrics):
                         tagged = lyrics
                     else:
                         tagged = extract_tagged_lyrics(tagged_content, lyrics) or (
-                            f"[Verse]\n{lyrics}"
+                            f"[verse]\n{lyrics}"
                         )
                     tagged = validate_tagged_lyrics(tagged, strict=generate_lyrics)
                     if generate_lyrics:
