@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_timeout_seconds: float = Field(default=120, gt=0)
     llm_temperature: float = Field(default=0.2, ge=0, le=2)
-    llm_max_tokens: int = Field(default=2048, ge=1)
+    llm_max_tokens: int = Field(default=2048, ge=1, le=4096)
     llm_disable_thinking: bool = True
 
     music_api_mode: Literal["mock", "real"] = "mock"

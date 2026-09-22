@@ -136,6 +136,23 @@ def test_lyrics_section_tags_are_normalized_without_changing_unknown_labels() ->
     )
 
 
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    [
+        ("[Pre-Chorus 2]", "[Pre-Chorus 2]"),
+        ("[post chorus2]", "[Post-Chorus 2]"),
+        ("[instrumental2]", "[Instrumental 2]"),
+        ("[instrumental break 2]", "[Instrumental Break 2]"),
+    ],
+)
+def test_numbered_lyrics_sections_share_normalization_and_validation(
+    raw: str, canonical: str
+) -> None:
+    normalized = normalize_lyrics_section_tags(f"{raw}\n第一句")
+    assert normalized == f"{canonical}\n第一句"
+    assert validate_tagged_lyrics(normalized) == normalized
+
+
 def test_tagged_lyrics_validation_preserves_supported_labels_and_rejects_unknown_ones() -> None:
     lyrics = "[Verse 1]\n第一句\n[Instrumental Break]\n[Chorus]\n第二句"
     assert validate_tagged_lyrics(lyrics) == lyrics
@@ -549,6 +566,49 @@ async def test_prepare_retries_concise_style_and_adds_missing_verse_tag(tmp_path
     assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
     assert prepared.lyrics == ONE_MINUTE_LYRICS
     assert len(requests) == 2
+
+
+async def test_prepare_retry_reports_missing_style_category(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    missing_negative = EXPANDED_MANDARIN_ROCK_PROMPT.rsplit(", [Negative Constraints:", 1)[0]
+    missing_negative = f"{missing_negative}, [Extra: Detailed audible direction]"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        style_tags = missing_negative if len(requests) == 1 else EXPANDED_MANDARIN_ROCK_PROMPT
+        content = json.dumps(
+            {"taggedLyrics": ONE_MINUTE_LYRICS, "styleTags": style_tags}, ensure_ascii=False
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare("男声摇滚")
+
+    assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
+    retry_body = json.loads(requests[1].content)
+    assert "未覆盖以下风格类别：negative；当前标签数 8" in retry_body["messages"][-1]["content"]
+
+
+async def test_prepare_retries_generated_lyrics_over_character_budget(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        lyrics = "[Verse]\n" + ("唱" * 1001) if len(requests) == 1 else ONE_MINUTE_LYRICS
+        content = json.dumps(
+            {"taggedLyrics": lyrics, "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT},
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare("男声摇滚")
+
+    assert prepared.lyrics == ONE_MINUTE_LYRICS
+    retry_body = json.loads(requests[1].content)
+    assert "模型生成的歌词正文超过 1000 个字符" in retry_body["messages"][-1]["content"]
 
 
 @pytest.mark.parametrize(

@@ -15,6 +15,7 @@ STYLE_TAG_MIN = 6
 STYLE_TAG_MAX = 8
 STYLE_TAG_KEY_MAX_CHARS = 80
 STYLE_TAG_VALUE_MAX_CHARS = 800
+GENERATED_LYRICS_MAX_CHARS = 1000
 REQUIRED_STYLE_CATEGORY_ALIASES = (
     ("genre", "style"),
     ("tempo", "rhythm", "meter"),
@@ -33,6 +34,7 @@ STYLE_TAG_REQUIREMENTS = "\n".join(
         "Arrangement、Production and Mix、Negative Constraints；允许在同一标签中合并相邻类别。",
         "标签值应包含可听见、可执行的细节，例如 BPM、律动、音色、中文人声唱法、"
         "段落推进、空间效果、动态变化和需要避免的声音。",
+        "每个原始标签值不超过 200 个字符；需要合并时仍须保持信息完整。",
         "保留用户的显式要求，为未指定项补充协调一致的专业选择；不得引用具体艺人或受版权保护作品。",
         "Negative Constraints 禁止出现 no lyrics、no vocals 或 no melody。",
     ]
@@ -57,6 +59,7 @@ GENERATE_LYRICS_AND_STYLE_SYSTEM_PROMPT = "\n".join(
         "taggedLyrics 只能包含支持的英文结构标签和真正需要唱出的歌词；禁止 [Guitar Solo]、"
         "[Final Chorus] 等自造标签，禁止用括号写演奏、制作或时长说明。独奏只能写 [Solo]，"
         "最后副歌仍写 [Chorus]。",
+        f"除结构标签外，taggedLyrics 的歌词正文合计不得超过 {GENERATED_LYRICS_MAX_CHARS} 个字符。",
         STYLE_TAG_REQUIREMENTS,
         "只返回 JSON 对象，包含字符串 taggedLyrics 和字符串 styleTags；不要解释或输出代码块。",
     ]
@@ -66,21 +69,29 @@ STRUCTURED_TAG_PATTERN = re.compile(
     rf"\[\s*[A-Za-z][A-Za-z0-9 /_-]{{0,{STYLE_TAG_KEY_MAX_CHARS - 1}}}\s*:"
     rf"\s*[^\[\]\r\n]{{1,{STYLE_TAG_VALUE_MAX_CHARS}}}\s*\]"
 )
+LYRICS_SECTION_SPECS = {
+    "intro": ("Intro", False),
+    "verse": ("Verse", True),
+    "prechorus": ("Pre-Chorus", True),
+    "chorus": ("Chorus", True),
+    "postchorus": ("Post-Chorus", True),
+    "bridge": ("Bridge", True),
+    "instrumental": ("Instrumental", True),
+    "instrumentalbreak": ("Instrumental Break", True),
+    "solo": ("Solo", False),
+    "outro": ("Outro", False),
+    "间奏": ("Instrumental", True),
+}
+_CANONICAL_LYRICS_SECTIONS = dict(LYRICS_SECTION_SPECS.values())
 LYRICS_SECTION_PATTERN = re.compile(
-    r"\[(?:Intro|Verse(?: \d+)?|Pre-Chorus|Chorus(?: \d+)?|Post-Chorus|"
-    r"Bridge(?: \d+)?|Instrumental(?: Break)?|Solo|Outro)\]",
+    r"\[(?:"
+    + "|".join(
+        rf"{re.escape(canonical)}(?: \d+)?" if numbered else re.escape(canonical)
+        for canonical, numbered in _CANONICAL_LYRICS_SECTIONS.items()
+    )
+    + r")\]",
     re.IGNORECASE,
 )
-LYRICS_SECTION_ALIASES = {
-    "intro": "Intro",
-    "prechorus": "Pre-Chorus",
-    "postchorus": "Post-Chorus",
-    "instrumental": "Instrumental",
-    "instrumentalbreak": "Instrumental Break",
-    "solo": "Solo",
-    "outro": "Outro",
-    "间奏": "Instrumental",
-}
 FORBIDDEN_LYRICS_CONSTRAINT_PATTERN = re.compile(
     r"(?:[,;]\s*)?\bno (?:lyrics(?:\s+or\s+melody(?:\s+generation)?)?|"
     r"vocals?|melody(?:\s+generation)?)\b",
@@ -139,13 +150,11 @@ def normalize_lyrics_section_tags(lyrics: str) -> str:
             continue
         token = stripped[1:-1].strip()
         compact = re.sub(r"[\s_-]+", "", token).casefold()
-        numbered = re.fullmatch(r"(verse|chorus|bridge)(\d*)", compact)
-        if numbered:
-            section = numbered.group(1).title()
-            number = numbered.group(2)
-            normalized_lines.append(f"[{section}{f' {number}' if number else ''}]{ending}")
-        elif compact in LYRICS_SECTION_ALIASES:
-            normalized_lines.append(f"[{LYRICS_SECTION_ALIASES[compact]}]{ending}")
+        match = re.fullmatch(r"([^\d]+)(\d*)", compact)
+        spec = LYRICS_SECTION_SPECS.get(match.group(1)) if match else None
+        number = match.group(2) if match else ""
+        if spec and (not number or spec[1]):
+            normalized_lines.append(f"[{spec[0]}{f' {number}' if number else ''}]{ending}")
         else:
             normalized_lines.append(line)
     return "".join(normalized_lines)
@@ -349,19 +358,30 @@ def _extract_trailing_tag_sequence(content: str) -> str | None:
     return _normalize_tags_only(", ".join(selected))
 
 
-def is_expanded_music_prompt(structured_prompt: str) -> bool:
+def music_prompt_validation_error(structured_prompt: str) -> str | None:
     normalized = _normalize_tags_only(structured_prompt)
     if normalized is None:
-        return False
+        return "模型未返回完整格式的风格标签"
     tags = STRUCTURED_TAG_PATTERN.findall(normalized)
     if not STYLE_TAG_MIN <= len(tags) <= STYLE_TAG_MAX:
-        return False
+        return (
+            f"模型应返回 {STYLE_TAG_MIN}-{STYLE_TAG_MAX} 个完整格式的风格标签；"
+            f"当前标签数 {len(tags)}"
+        )
 
     keys = [tag[1 : tag.index(":")].strip().lower() for tag in tags]
-    return all(
-        any(alias in key for key in keys for alias in aliases)
+    missing = [
+        aliases[0]
         for aliases in REQUIRED_STYLE_CATEGORY_ALIASES
-    )
+        if not any(alias in key for key in keys for alias in aliases)
+    ]
+    if missing:
+        return f"模型未覆盖以下风格类别：{', '.join(missing)}；当前标签数 {len(tags)}"
+    return None
+
+
+def is_expanded_music_prompt(structured_prompt: str) -> bool:
+    return music_prompt_validation_error(structured_prompt) is None
 
 
 class OpenAICompatiblePromptExpander:
@@ -507,6 +527,17 @@ class OpenAICompatiblePromptExpander:
                             f"[Verse]\n{lyrics}"
                         )
                     tagged = validate_tagged_lyrics(tagged, strict=generate_lyrics)
+                    if generate_lyrics:
+                        lyric_chars = sum(
+                            len(line.strip())
+                            for line in tagged.splitlines()
+                            if not LYRICS_SECTION_PATTERN.fullmatch(line.strip())
+                        )
+                        if lyric_chars > GENERATED_LYRICS_MAX_CHARS:
+                            raise ValueError(
+                                "模型生成的歌词正文超过 "
+                                f"{GENERATED_LYRICS_MAX_CHARS} 个字符；当前 {lyric_chars} 个字符"
+                            )
                     style_tags = (
                         prepared.get("styleTags")
                         or prepared.get("style_tags")
@@ -524,10 +555,9 @@ class OpenAICompatiblePromptExpander:
                     structured = extract_structured_music_tags(style_tags) or normalize_llm_output(
                         style_tags
                     )
-                    if not structured or not is_expanded_music_prompt(structured):
-                        raise ValueError(
-                            f"模型未返回 {STYLE_TAG_MIN}-{STYLE_TAG_MAX} 个完整格式的风格标签"
-                        )
+                    validation_error = music_prompt_validation_error(structured)
+                    if validation_error:
+                        raise ValueError(validation_error)
                     return PreparedPrompt(
                         structured,
                         tagged,

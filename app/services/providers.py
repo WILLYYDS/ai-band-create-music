@@ -374,7 +374,7 @@ class ElevenLabsMusicProvider:
                 message = (
                     "ElevenLabs 音乐生成失败：完整歌词与风格 Prompt 长度为 "
                     f"{len(prompt)}，超过接口上限 {ELEVENLABS_PROMPT_MAX_CHARS}；"
-                    "请缩短歌词或风格要求后重试。"
+                    "用户提供歌词时请缩短歌词或风格要求；自动写词时请检查生成歌词预算和标签长度。"
                 )
                 update_provider_diagnostic(
                     self._settings.output_dir,
