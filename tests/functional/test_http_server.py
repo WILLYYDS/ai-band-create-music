@@ -58,7 +58,10 @@ def test_complete_generation_over_real_http(tmp_path: Path) -> None:
         assert body["structuredPrompt"].startswith("[Genre: Test]")
         assert sorted(downloads) == ["bass", "drums", "other", "vocal"]
         assert all(response.status_code == 200 for response in downloads.values())
-        assert all(response.content == b"ID3-stem-audio" for response in downloads.values())
+        assert all(
+            response.content[:4] == b"RIFF" and response.content[8:12] == b"WAVE"
+            for response in downloads.values()
+        )
     finally:
         server.should_exit = True
         thread.join(timeout=5)

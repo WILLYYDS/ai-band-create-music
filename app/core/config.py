@@ -99,7 +99,6 @@ class Settings(BaseSettings):
     demucs_shifts: str = ""
     demucs_overlap: str = ""
     demucs_segment: str = ""
-    demucs_mp3_bitrate: str = ""
 
     rvc_model_path: Path = Field(
         default_factory=lambda: _default_rvc_asset("weights", "*.pth", "model.pth")
