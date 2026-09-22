@@ -45,6 +45,8 @@ ELEVENLABS_API_KEY=...
 ElevenLabs 直接接收完整的结构化歌词、扩充风格标签和固定的 `music_length_ms`，由模型自行
 安排段落与演唱节奏。后端不会裁剪歌词；组合后的 Prompt 超过接口的 4100 字符上限时会在
 调用前报错。歌词相对目标时长过长时可能无法完整唱完，调用方需要缩短歌词或增加目标时长。
+请求两首时后端会使用相同歌词和风格独立调用两次 ElevenLabs。音频固定请求
+`pcm_44100`，再在本地封装为 16-bit 立体声 WAV，不保存 MP3。
 当前产品只生成中文歌曲，不再根据请求内容检测演唱语言：ElevenLabs 默认追加中文清晰人声
 要求，MiniMax 同样直接接收中文歌词与中文人声风格标签。启用
 `ELEVENLABS_FORCE_INSTRUMENTAL=true` 时会自动关闭 ElevenLabs 中文人声要求，避免与纯音乐

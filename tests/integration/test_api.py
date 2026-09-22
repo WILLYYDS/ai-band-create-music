@@ -206,7 +206,7 @@ async def test_minimax_count_two_returns_two_results(tmp_path: Path) -> None:
     assert provider.variations == [0, 1]
 
 
-async def test_elevenlabs_count_two_warns_and_generates_one(tmp_path: Path) -> None:
+async def test_elevenlabs_count_two_returns_two_results(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
     provider = StubMusicProvider(settings.mock_full_song_path, "elevenlabs_music")
@@ -221,10 +221,10 @@ async def test_elevenlabs_count_two_warns_and_generates_one(tmp_path: Path) -> N
 
     body = response.json()
     assert response.status_code == 200
-    assert body["count"] == 1
-    assert body["alternatives"] == []
-    assert "暂不支持" in body["warning"]
-    assert provider.variations == [0]
+    assert body["count"] == 2
+    assert len(body["alternatives"]) == 1
+    assert body["warning"] is None
+    assert provider.variations == [0, 1]
 
 
 async def test_ai_talk_lyrics_are_tagged_before_music_generation(tmp_path: Path) -> None:

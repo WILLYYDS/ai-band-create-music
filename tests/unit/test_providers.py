@@ -108,10 +108,11 @@ async def test_minimax_provider_uses_direct_client(tmp_path: Path) -> None:
 
 async def test_elevenlabs_sends_complete_prompt_and_streams_audio(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
+    pcm = b"\x00\x00\x01\x00" * 100
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, content=b"ID3-generated-audio")
+        return httpx.Response(200, content=pcm)
 
     settings = make_settings(
         tmp_path,
@@ -128,18 +129,57 @@ async def test_elevenlabs_sends_complete_prompt_and_streams_audio(tmp_path: Path
             job_id="job-1",
         )
 
-    assert result.audio_path.read_bytes() == b"ID3-generated-audio"
-    assert result.audio_path == settings.output_dir / "jobs/job-1/song_1/full_song_job-1_1.mp3"
+    with wave.open(str(result.audio_path), "rb") as audio:
+        assert audio.getparams()[:3] == (2, 2, 44_100)
+        assert audio.readframes(audio.getnframes()) == pcm
+    assert result.audio_path == settings.output_dir / "jobs/job-1/song_1/full_song_job-1_1.wav"
     assert not list(settings.output_dir.glob("full_song_*"))
-    assert result.debug["mode"] == "prompt"
+    assert result.debug["mode"] == "prompt_pcm_wav"
     assert len(requests) == 1
     assert requests[0].url.path == "/v1/music"
+    assert requests[0].url.params["output_format"] == "pcm_44100"
+    assert requests[0].headers["accept"] == "audio/pcm"
     music_body = json.loads(requests[0].content)
     assert "[Genre: Rock]" in music_body["prompt"]
     assert "第一句原歌词\n第二句原歌词" in music_body["prompt"]
     assert "Mandarin Chinese lead vocals" in music_body["prompt"]
     assert music_body["music_length_ms"] == 120_000
     assert "composition_plan" not in music_body
+
+
+async def test_elevenlabs_variations_preserve_the_same_prompt(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=b"\x00\x00\x00\x00")
+
+    settings = make_settings(
+        tmp_path,
+        music_api_mode="real",
+        elevenlabs_api_key="secret",
+        elevenlabs_music_base_url="https://eleven.test",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = ElevenLabsMusicProvider(settings, client)
+        await provider.generate("[Genre: Rock]", 60, "", variation=0)
+        await provider.generate("[Genre: Rock]", 60, "", variation=1)
+
+    prompts = [json.loads(request.content)["prompt"] for request in requests]
+    assert prompts[0] == prompts[1]
+    assert all("seed" not in json.loads(request.content) for request in requests)
+
+
+async def test_elevenlabs_rejects_non_pcm_output(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        music_api_mode="real",
+        elevenlabs_api_key="secret",
+        elevenlabs_music_output_format="auto",
+    )
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(GenerationError, match="必须为受支持的 pcm"):
+            await ElevenLabsMusicProvider(settings, client).generate("[Genre: Rock]", 60, "")
 
 
 async def test_elevenlabs_rejects_oversized_complete_prompt_before_request(tmp_path: Path) -> None:
