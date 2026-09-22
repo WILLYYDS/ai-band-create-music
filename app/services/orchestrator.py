@@ -91,9 +91,7 @@ class GenerationOrchestrator:
         effective_duration_minutes = (
             None if selected_provider == "minimax_music" else duration_minutes
         )
-        effective_count = (
-            count if selected_provider in {"minimax_music", "elevenlabs_music"} else 1
-        )
+        effective_count = count if selected_provider in {"minimax_music", "elevenlabs_music"} else 1
 
         async def report(
             stage: str,
@@ -165,6 +163,8 @@ class GenerationOrchestrator:
             )
             outputs: list[dict[str, Any]] = []
             music_provider = self.music_providers.get(selected_provider, self.music_provider)
+            # Variations are intentionally serial and the response is atomic: if a later
+            # generation fails, the whole request fails instead of returning a partial set.
             for index in range(effective_count):
                 song_number = index + 1
                 await report(
@@ -232,6 +232,7 @@ class GenerationOrchestrator:
                 "requestedCount": count,
                 "provider": selected_provider,
                 "alternatives": outputs[1:],
+                # Kept for compatibility with released clients; no current provider warns.
                 "warning": None,
                 **primary,
             }

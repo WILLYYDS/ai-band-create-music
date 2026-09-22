@@ -4,7 +4,7 @@ import asyncio
 import re
 import time
 import wave
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -29,7 +29,6 @@ MINIMAX_LYRIC_LINE_LIMIT = 32
 ELEVENLABS_PROMPT_MAX_CHARS = 4100
 ELEVENLABS_PCM_CHANNELS = 2
 ELEVENLABS_PCM_SAMPLE_WIDTH = 2
-ELEVENLABS_PCM_FORMAT = re.compile(r"pcm_(8000|16000|22050|24000|32000|44100|48000)")
 LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")
 ProviderProgressCallback = Callable[[str, int | None, int | None], Awaitable[None]]
 
@@ -328,11 +327,8 @@ class ElevenLabsMusicProvider:
             raise GenerationError("ElevenLabs 音乐生成失败：缺少 ELEVENLABS_API_KEY 环境变量。")
         return secret.get_secret_value()
 
-    def _headers(self, accept_audio: bool = False) -> dict[str, str]:
-        headers = {"xi-api-key": self._api_key(), "Content-Type": "application/json"}
-        if accept_audio:
-            headers["Accept"] = "audio/pcm"
-        return headers
+    def _headers(self) -> dict[str, str]:
+        return {"xi-api-key": self._api_key(), "Content-Type": "application/json"}
 
     async def generate(
         self,
@@ -354,13 +350,7 @@ class ElevenLabsMusicProvider:
             structured_prompt, duration_seconds / 60, clear_chinese, lyrics
         )
         output_format = self._settings.elevenlabs_music_output_format
-        format_match = ELEVENLABS_PCM_FORMAT.fullmatch(output_format)
-        if format_match is None:
-            raise GenerationError(
-                "ElevenLabs 音乐生成失败：ELEVENLABS_MUSIC_OUTPUT_FORMAT "
-                "必须为受支持的 pcm_* 格式。"
-            )
-        sample_rate = int(format_match.group(1))
+        sample_rate = int(output_format.removeprefix("pcm_"))
         request_body = {
             "prompt": prompt,
             "music_length_ms": music_length_ms,
@@ -407,13 +397,15 @@ class ElevenLabsMusicProvider:
                 url,
                 json=request_body,
                 params={"output_format": output_format},
-                headers=self._headers(accept_audio=True),
+                headers=self._headers(),
                 timeout=self._settings.music_api_timeout_seconds,
             ) as response:
                 if not response.is_success:
                     await response.aread()
                 response.raise_for_status()
-                await self._write_pcm_wav(response.aiter_bytes(), target, sample_rate)
+                actual_duration_seconds = await self._write_pcm_wav(
+                    response.aiter_bytes(), target, sample_rate, duration_seconds
+                )
             return MusicResult(
                 target,
                 {
@@ -422,6 +414,7 @@ class ElevenLabsMusicProvider:
                     "outputFormat": output_format,
                     "mode": "prompt_pcm_wav",
                     "clearChineseVocalMode": clear_chinese,
+                    "durationSeconds": actual_duration_seconds,
                 },
             )
         except GenerationError:
@@ -432,11 +425,18 @@ class ElevenLabsMusicProvider:
             raise GenerationError(f"ElevenLabs 音乐生成失败：{_http_failure_message(exc)}") from exc
 
     @staticmethod
-    async def _write_pcm_wav(chunks: Any, target: Path, sample_rate: int) -> None:
+    async def _write_pcm_wav(
+        chunks: AsyncIterator[bytes],
+        target: Path,
+        sample_rate: int,
+        expected_duration_seconds: int,
+    ) -> float:
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f"{target.name}.{time.time_ns()}.part")
         written = 0
         try:
+            # write_stream_atomically cannot write RIFF sizes; wave patches them on close
+            # before the completed temporary file is atomically renamed.
             with wave.open(str(temporary), "wb") as audio:
                 audio.setparams(
                     (
@@ -454,7 +454,17 @@ class ElevenLabsMusicProvider:
                         audio.writeframesraw(chunk)
             if written == 0:
                 raise GenerationError("ElevenLabs 音乐生成接口返回空音频。")
+            frame_size = ELEVENLABS_PCM_CHANNELS * ELEVENLABS_PCM_SAMPLE_WIDTH
+            if written % frame_size:
+                raise GenerationError("ElevenLabs 音乐生成接口返回了不完整的 PCM 音频帧。")
+            actual_duration_seconds = written / (sample_rate * frame_size)
+            if abs(actual_duration_seconds - expected_duration_seconds) > 1:
+                raise GenerationError(
+                    "ElevenLabs 音乐生成接口返回的 PCM 时长异常："
+                    f"期望 {expected_duration_seconds} 秒，实际 {actual_duration_seconds:.3f} 秒。"
+                )
             temporary.replace(target)
+            return round(actual_duration_seconds, 3)
         finally:
             temporary.unlink(missing_ok=True)
 

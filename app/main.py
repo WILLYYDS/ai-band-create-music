@@ -163,6 +163,7 @@ class GenerationJob:
     total_steps: int | None = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     message: str = "任务已创建"
+    # Persisted response compatibility for jobs created by older releases.
     warning: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
