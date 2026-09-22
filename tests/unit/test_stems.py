@@ -21,6 +21,8 @@ def test_fast_profile_builds_expected_demucs_command(tmp_path: Path) -> None:
         tmp_path / "work",
     )
     assert command[1:3] == ["-m", "demucs"]
+    assert "--mp3" not in command
+    assert "--mp3-bitrate" not in command
     assert command[command.index("--name") + 1] == "mdx_q"
     assert command[command.index("--segment") + 1] == "12"
 
@@ -70,8 +72,8 @@ def test_non_finite_segment_is_rejected(value: str) -> None:
 
 def test_stem_outputs_include_original_music_name() -> None:
     assert stem_output_files(Path("普通话摇滚.mp3")) == {
-        "vocal": "普通话摇滚_vocal.mp3",
-        "drums": "普通话摇滚_drums.mp3",
-        "bass": "普通话摇滚_bass.mp3",
-        "other": "普通话摇滚_other.mp3",
+        "vocal": "普通话摇滚_vocal.wav",
+        "drums": "普通话摇滚_drums.wav",
+        "bass": "普通话摇滚_bass.wav",
+        "other": "普通话摇滚_other.wav",
     }
