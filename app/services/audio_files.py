@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import shutil
 from collections.abc import AsyncIterator
@@ -9,6 +11,77 @@ from urllib.parse import quote, unquote, urlsplit
 import httpx
 
 from app.core.errors import GenerationError
+
+logger = logging.getLogger(__name__)
+
+
+async def make_playback_mp3(source: Path, output_dir: Path) -> str | None:
+    """Encode one WAV version; a failed preview never changes the source or its result."""
+    if source.suffix.lower() != ".wav":
+        return None
+    temporary = None
+    process = None
+    try:
+        from app.services.stems import prepare_ffmpeg_environment
+
+        with source.open("rb") as audio:
+            header = audio.read(12)
+        if header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+            return None
+        version = source.stat()
+        playback_dir = source.parent / "playtrack"
+        playback_dir.mkdir(exist_ok=True)
+        target = playback_dir / (
+            f"{source.stem}.playback-{version.st_ino}-{version.st_mtime_ns}-{version.st_size}.mp3"
+        )
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(source),
+            "-codec:a",
+            "libmp3lame",
+            "-q:a",
+            "2",
+            "-f",
+            "mp3",
+            str(temporary),
+            env=prepare_ffmpeg_environment(),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+        if process.returncode or not temporary.is_file() or not temporary.stat().st_size:
+            raise RuntimeError(stderr.decode(errors="replace").strip() or "empty MP3")
+        temporary.replace(target)
+        return target.relative_to(output_dir).as_posix()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("playback encoding skipped source=%s", source, exc_info=True)
+        return None
+    finally:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def playback_matches(source: Path, preview: Path) -> bool:
+    if not source.is_file() or not preview.is_file():
+        return False
+    version = source.stat()
+    return (
+        preview.stat().st_size > 0
+        and preview.name
+        == f"{source.stem}.playback-{version.st_ino}-{version.st_mtime_ns}-{version.st_size}.mp3"
+        and preview.parent == source.parent / "playtrack"
+    )
 
 
 def detect_audio_content_type(path: Path) -> str:

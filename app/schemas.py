@@ -25,6 +25,7 @@ class ErrorResponse(BaseModel):
 
 class MusicOutput(BaseModel):
     fullTrack: str
+    playback: dict[str, Any] | None = Field(default=None, exclude_if=lambda value: value is None)
     mixedTrack: str | None = Field(default=None, exclude_if=lambda value: value is None)
     replacedVocal: str | None = Field(default=None, exclude_if=lambda value: value is None)
     durationSeconds: float | None = None

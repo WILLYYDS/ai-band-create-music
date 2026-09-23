@@ -70,6 +70,9 @@ def drop_mix_artifact(output: dict[str, Any]) -> bool:
     if not isinstance(output, dict) or not isinstance(output.get("mixedTrack"), str):
         return False
     output.pop("mixedTrack", None)
+    playback = output.get("playback")
+    if isinstance(playback, dict):
+        playback.pop("mixedTrack", None)
     waveforms = output.get("waveforms")
     if isinstance(waveforms, dict):
         waveforms.pop("mix", None)
@@ -81,6 +84,9 @@ def capture_mix_artifact(output: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(output, dict) or not isinstance(output.get("mixedTrack"), str):
         return {}
     captured: dict[str, Any] = {"mixTrack": output["mixedTrack"]}
+    playback = output.get("playback")
+    if isinstance(playback, dict) and isinstance(playback.get("mixedTrack"), str):
+        captured["mixPlayback"] = playback["mixedTrack"]
     waveforms = output.get("waveforms")
     if isinstance(waveforms, dict) and isinstance(waveforms.get("mix"), list):
         captured["mixWaveform"] = waveforms["mix"]
@@ -94,6 +100,8 @@ def restore_mix_artifact(output: dict[str, Any], captured: object) -> bool:
     if "mixedTrack" in output or not isinstance(captured.get("mixTrack"), str):
         return False
     output["mixedTrack"] = captured["mixTrack"]
+    if isinstance(captured.get("mixPlayback"), str):
+        output.setdefault("playback", {})["mixedTrack"] = captured["mixPlayback"]
     waveforms = output.get("waveforms")
     if isinstance(waveforms, dict) and isinstance(captured.get("mixWaveform"), list):
         waveforms["mix"] = captured["mixWaveform"]
