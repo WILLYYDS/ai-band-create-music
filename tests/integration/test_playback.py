@@ -1,5 +1,6 @@
 import os
 import shutil
+import sys
 import wave
 from pathlib import Path
 
@@ -63,18 +64,22 @@ async def test_four_preview_urls_range_and_stale_versions(tmp_path: Path) -> Non
     assert response.headers["content-type"].startswith("audio/mpeg")
     assert response.headers["content-length"] == "3"
     assert response.headers["content-range"].startswith("bytes 0-2/")
-    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
     assert len(response.content) == 3
 
     previous_mtime = paths["replacedVocal"].stat().st_mtime_ns
     replacement = paths["replacedVocal"].with_suffix(".new")
     wav(replacement)
+    replacement.write_bytes(replacement.read_bytes()[:-2] + b"\1\0")
     os.utime(replacement, ns=(previous_mtime, previous_mtime))
     replacement.replace(paths["replacedVocal"])
     assert (
         "replacedVocal"
         not in _render_result_urls(result, "http://testserver", settings)["playback"]
     )
+    fresh = await make_playback_mp3(paths["replacedVocal"], settings.output_dir)
+    assert fresh != previews["replacedVocal"]
+    assert not (settings.output_dir / previews["replacedVocal"]).exists()
     saved = capture_mix_artifact(result)
     assert saved["mixPlayback"] == previews["mixedTrack"]
     drop_mix_artifact(result)
@@ -100,8 +105,8 @@ async def test_generation_and_split_publish_previews(tmp_path: Path) -> None:
         assert (await client.post(f"/api/jobs/{job_id}/split")).status_code == 202
         await app.state.jobs[job_id].split_task
         split = (await client.get(f"/api/jobs/{job_id}")).json()["result"]
-        assert set(split["playback"]["stems"]) == set(split["stems"])
-        assert all(url.endswith(".mp3") for url in split["playback"]["stems"].values())
+        assert "stems" not in split["playback"]
+        assert all(url.endswith(".wav") for url in split["stems"].values())
 
 
 async def test_failed_encoding_leaves_wav_and_no_preview(
@@ -118,6 +123,28 @@ async def test_failed_encoding_leaves_wav_and_no_preview(
     assert await make_playback_mp3(source, tmp_path) is None
     assert source.read_bytes() == original
     assert not list(tmp_path.rglob("*.mp3"))
+
+
+async def test_encoder_timeout_kills_child_and_removes_temp(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+
+    source = tmp_path / "full.wav"
+    wav(source)
+    original = source.read_bytes()
+    spawned = []
+    create = asyncio.create_subprocess_exec
+
+    async def sleeping_encoder(*_args, **kwargs):
+        process = await create(sys.executable, "-c", "import time; time.sleep(10)", **kwargs)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr("app.services.audio_files.PLAYBACK_ENCODE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("app.services.audio_files.asyncio.create_subprocess_exec", sleeping_encoder)
+    assert await make_playback_mp3(source, tmp_path) is None
+    assert spawned[0].returncode is not None
+    assert source.read_bytes() == original
+    assert not list((tmp_path / "playtrack").iterdir())
 
 
 async def test_replacement_waveform_and_delete_restore_preview(tmp_path: Path) -> None:

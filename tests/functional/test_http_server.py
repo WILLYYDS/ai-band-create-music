@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import socket
 import threading
 import time
@@ -113,6 +114,11 @@ def test_mix_over_real_http_with_real_ffmpeg(tmp_path: Path) -> None:
     import json
     import subprocess
 
+    import pytest
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("real FFmpeg tools are unavailable")
+
     from app.main import GenerationJob
 
     settings = make_settings(tmp_path)
@@ -169,6 +175,11 @@ def test_mix_over_real_http_with_real_ffmpeg(tmp_path: Path) -> None:
                     break
                 time.sleep(0.05)
             audio = client.get(detail["result"]["mixedTrack"])
+            while time.monotonic() < deadline and not detail["result"].get("playback", {}).get(
+                "mixedTrack"
+            ):
+                time.sleep(0.05)
+                detail = client.get(f"/api/jobs/{job_id}").json()
             preview = client.get(
                 detail["result"]["playback"]["mixedTrack"], headers={"Range": "bytes=0-2"}
             )

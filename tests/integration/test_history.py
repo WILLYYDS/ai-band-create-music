@@ -621,17 +621,30 @@ async def test_resplit_invalidates_mix_and_replacement(tmp_path, monkeypatch):
         result = app.state.jobs[job_id].result
         result["mixedTrack"] = f"jobs/{job_id}/song_1/demo_rvc_mix.wav"
         result["replacedVocal"] = f"jobs/{job_id}/song_1/demo_rvc_vocal.wav"
+        replaced_path = settings.output_dir / result["replacedVocal"]
+        replaced_path.write_bytes(b"RIFF" + b"\0" * 32)
+        result["_replacedVocalModel"] = "model-v1"
         result["playback"] = {"mixedTrack": "old-mix.mp3", "replacedVocal": "old-vocal.mp3"}
-        result["waveforms"] = {"full": [0.25], "mix": [0.75] * 640}
+        result["waveforms"] = {"full": [0.25], "mix": [0.75] * 640, "replaced": [0.4] * 640}
 
         assert (await http.post(f"/api/jobs/{job_id}/split?song=0")).status_code == 202
         await app.state.jobs[job_id].split_task
         completed = (await http.get(f"/api/jobs/{job_id}")).json()["result"]
+        stashed = dict(app.state.jobs[job_id].deleted_replaced_vocals["0"])
+        restored = await http.request(
+            "PUT", "/api/voice/result",
+            data={"filename": stashed["url"], "job_id": job_id, "song": "0"},
+        )
 
     assert "mixedTrack" not in completed and "replacedVocal" not in completed
     assert "mixedTrack" not in completed["playback"]
     assert "replacedVocal" not in completed["playback"]
     assert set(completed["waveforms"]) == {"full", "vocal", "drums", "bass", "other"}
+    assert stashed["playback"] == "old-vocal.mp3"
+    assert stashed["model"] == "model-v1"
+    assert stashed["waveform"] == [0.4] * 640
+    assert restored.status_code == 200
+    assert app.state.jobs[job_id].result["replacedVocal"] == stashed["url"]
 
 
 async def test_job_title_is_listed_and_survives_restart(tmp_path):

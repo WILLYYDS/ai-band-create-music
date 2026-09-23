@@ -721,6 +721,68 @@ async def test_cancellation_discards_the_mix(tmp_path, install_stubs, monkeypatc
     assert not (settings.output_dir / "jobs" / job.job_id / "song_1" / "demo_rvc_mix.wav").exists()
 
 
+async def test_cancel_during_preview_keeps_published_mix_succeeded(
+    tmp_path, install_stubs, monkeypatch
+):
+    install_stubs()
+    settings = make_settings(tmp_path)
+    app = build_app(settings)
+    job = seed_job(app, settings)
+    encoding = asyncio.Event()
+
+    async def blocked_preview(*_args):
+        encoding.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("app.main.make_playback_mp3", blocked_preview)
+    async with client(app) as http:
+        accepted = await http.post(mix_url(job))
+        assert accepted.status_code == 202
+        await asyncio.wait_for(encoding.wait(), 2)
+        job.mix_task.cancel()
+        await job.mix_task
+        detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
+
+    assert detail["mixStatus"] == "succeeded"
+    assert detail["result"]["mixedTrack"].endswith(".wav")
+    assert "mixedTrack" not in detail["result"].get("playback", {})
+    assert (settings.output_dir / job.result["mixedTrack"]).is_file()
+
+
+async def test_preview_save_failure_keeps_published_mix_succeeded(
+    tmp_path, install_stubs, monkeypatch
+):
+    install_stubs()
+    settings = make_settings(tmp_path)
+    app = build_app(settings)
+    job = seed_job(app, settings)
+    save = GenerationJob.save
+    calls = 0
+
+    def fail_second_save(current_job, root):
+        nonlocal calls
+        if current_job is not job:
+            return save(current_job, root)
+        calls += 1
+        if calls == 2:
+            raise OSError("preview metadata unavailable")
+        save(current_job, root)
+
+    async def preview(*_args):
+        return "playtrack/preview.mp3"
+
+    monkeypatch.setattr(GenerationJob, "save", fail_second_save)
+    monkeypatch.setattr("app.main.make_playback_mp3", preview)
+    async with client(app) as http:
+        assert (await http.post(mix_url(job))).status_code == 202
+        await job.mix_task
+        detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
+    assert calls == 2
+    assert detail["mixStatus"] == "succeeded"
+    assert "mixedTrack" not in job.result.get("playback", {})
+    assert (settings.output_dir / job.result["mixedTrack"]).is_file()
+
+
 # ------------------------------------------------------- replacement model / provenance
 
 

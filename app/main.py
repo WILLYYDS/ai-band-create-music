@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import AsyncIterator
@@ -910,16 +911,29 @@ def create_app(
                         },
                     }
                 )
-                stem_playback = {}
-                for name, file_name in split_result.files.items():
-                    preview = await make_playback_mp3(
-                        output_dir / file_name, application_settings.output_dir
-                    )
-                    if preview:
-                        stem_playback[name] = preview
                 result["stems"] = stems
                 playback = result.setdefault("playback", {})
-                playback["stems"] = stem_playback
+                playback.pop("stems", None)
+                job.deleted_replaced_vocals.pop(str(song), None)
+                replaced_url = result.get("replacedVocal")
+                if isinstance(replaced_url, str) and stored_path_exists(
+                    application_settings.output_dir, replaced_url
+                ):
+                    previous_waveforms = result.get("waveforms")
+                    deleted = {"url": replaced_url}
+                    for key, value in (
+                        ("playback", playback.get("replacedVocal")),
+                        (
+                            "waveform",
+                            previous_waveforms.get("replaced")
+                            if isinstance(previous_waveforms, dict)
+                            else None,
+                        ),
+                        ("model", result.get("_replacedVocalModel")),
+                    ):
+                        if value is not None:
+                            deleted[key] = value
+                    job.deleted_replaced_vocals[str(song)] = deleted
                 playback.pop("replacedVocal", None)
                 result.pop("replacedVocal", None)
                 result.pop("_replacedVocalModel", None)
@@ -1413,14 +1427,18 @@ def create_app(
                             )
                         raise
                 result.setdefault("playback", {}).pop("mixedTrack", None)
-                preview = await make_playback_mp3(result_path, application_settings.output_dir)
-                if preview:
-                    result["playback"]["mixedTrack"] = preview
-                job.save(application_settings.output_dir)
                 job.mix_status = "succeeded"
                 job.mix_stage = "completed"
                 job.mix_progress = 100
                 job.mix_message = "合轨完成"
+                try:
+                    preview = await make_playback_mp3(result_path, application_settings.output_dir)
+                    if preview:
+                        result["playback"]["mixedTrack"] = preview
+                    job.save(application_settings.output_dir)
+                except (Exception, asyncio.CancelledError):
+                    result["playback"].pop("mixedTrack", None)
+                    logger.warning("mix preview skipped job_id=%s", job.job_id, exc_info=True)
                 if not fresh_waveforms:
                     # 波形只是编辑器的绘制数据，提取失败不影响已经落盘的成品。
                     logger.warning(
@@ -1738,8 +1756,9 @@ def create_app(
             "waveform": waveforms.get(stem_name) if isinstance(waveforms, dict) else None,
         }
         playback = result.get("playback")
-        if isinstance(playback, dict):
-            deleted_entry["playback"] = playback.get("stems", {}).get(stem_name)
+        stem_playback = playback.get("stems") if isinstance(playback, dict) else None
+        if isinstance(stem_playback, dict):
+            deleted_entry["playback"] = stem_playback.get(stem_name)
         # 分轨是合轨的输入：删掉它就等于让成品不再对应当前歌曲。引用连同车道一起作废，
         # 但先存进撤回记录，PUT 恢复分轨时能把成品一并还原（与其它撤回字段同一机制）。
         if isinstance(result.get("mixedTrack"), str):
@@ -1748,8 +1767,8 @@ def create_app(
                 deleted_entry["mixWaveform"] = waveforms["mix"]
         job.deleted_stems[deleted_key] = deleted_entry
         del stems[stem_name]
-        if isinstance(playback, dict):
-            playback.get("stems", {}).pop(stem_name, None)
+        if isinstance(stem_playback, dict):
+            stem_playback.pop(stem_name, None)
         result["stemUrls"] = list(stems.values())
         replaced_waveform = waveforms.get("replaced") if isinstance(waveforms, dict) else None
         if isinstance(waveforms, dict):
@@ -1926,7 +1945,13 @@ def create_app(
         response_status = status.HTTP_206_PARTIAL_CONTENT if request.headers.get("range") else 200
         headers = {
             "Accept-Ranges": "bytes",
-            "Cache-Control": "no-store",
+            "Cache-Control": (
+                "public, max-age=31536000, immutable"
+                if len(relative.parts) >= 2
+                and relative.parts[-2] == "playtrack"
+                and re.fullmatch(r".+\.playback-[0-9a-f]{64}\.mp3", target.name)
+                else "no-store"
+            ),
             "Content-Length": str(end - start + 1),
         }
         if response_status == status.HTTP_206_PARTIAL_CONTENT:
@@ -2231,33 +2256,32 @@ def _render_result_urls(
             output["mixedTrack"] = _public_audio_url(mixed_track, base_url, settings)
         previews = output.get("playback")
         if isinstance(previews, dict):
+            def valid_preview(source: object, preview: object) -> str | None:
+                if not isinstance(source, str) or not isinstance(preview, str):
+                    return None
+                try:
+                    if playback_matches(
+                        _output_path_from_url(source, settings),
+                        _output_path_from_url(preview, settings),
+                    ):
+                        return _public_audio_url(preview, base_url, settings)
+                except (OSError, ValueError):
+                    pass
+                return None
+
             valid = {}
             for key in ("fullTrack", "replacedVocal", "mixedTrack"):
-                source, preview = output.get(key), previews.get(key)
-                if isinstance(source, str) and isinstance(preview, str):
-                    try:
-                        if playback_matches(
-                            _output_path_from_url(source, settings),
-                            _output_path_from_url(preview, settings),
-                        ):
-                            valid[key] = _public_audio_url(preview, base_url, settings)
-                    except (OSError, ValueError):
-                        pass
+                url = valid_preview(output.get(key), previews.get(key))
+                if url:
+                    valid[key] = url
             stems = output.get("stems")
             stem_previews = previews.get("stems")
             if isinstance(stems, dict) and isinstance(stem_previews, dict):
                 valid_stems = {}
                 for name, preview in stem_previews.items():
-                    source = stems.get(name)
-                    if isinstance(source, str) and isinstance(preview, str):
-                        try:
-                            if playback_matches(
-                                _output_path_from_url(source, settings),
-                                _output_path_from_url(preview, settings),
-                            ):
-                                valid_stems[name] = _public_audio_url(preview, base_url, settings)
-                        except (OSError, ValueError):
-                            pass
+                    url = valid_preview(stems.get(name), preview)
+                    if url:
+                        valid_stems[name] = url
                 if valid_stems:
                     valid["stems"] = valid_stems
             output["playback"] = valid

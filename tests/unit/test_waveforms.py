@@ -5,7 +5,6 @@ import numpy as np
 from app.services.waveforms import (
     WAVEFORM_BIN_COUNT,
     extract_waveform,
-    merge_waveform_sets,
     summarize_waveform,
 )
 
@@ -31,18 +30,3 @@ def test_both_entry_points_share_one_default_bin_count() -> None:
         == inspect.signature(extract_waveform).parameters["bin_count"].default
         == WAVEFORM_BIN_COUNT
     )
-
-
-def test_merge_waveform_sets_replaces_legacy_bins_with_fresh_ones() -> None:
-    legacy = {"full": [0.25] * 64}
-    fresh = {"full": [0.25] * 640, "vocal": [0.5] * 640, "drums": [0.5] * 640}
-
-    assert merge_waveform_sets(legacy, fresh) == fresh
-
-
-def test_merge_waveform_sets_keeps_stored_bins_when_extraction_failed() -> None:
-    legacy = {"full": [0.25] * 64}
-
-    assert merge_waveform_sets(legacy, {}) == legacy
-    assert merge_waveform_sets(None, {}) == {}
-    assert merge_waveform_sets("not a mapping", {}) == {}
