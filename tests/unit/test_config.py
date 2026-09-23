@@ -29,8 +29,9 @@ def test_minimax_music_defaults_and_provider(tmp_path: Path) -> None:
     assert settings.minimax_timeout_seconds == 7200
 
 
-def test_elevenlabs_legacy_auto_output_is_migrated(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path, elevenlabs_music_output_format="auto")
+@pytest.mark.parametrize("value", ["auto", " AUTO ", " PCM_44100 "])
+def test_elevenlabs_legacy_auto_output_is_migrated(tmp_path: Path, value: str) -> None:
+    settings = make_settings(tmp_path, elevenlabs_music_output_format=value)
     assert settings.elevenlabs_music_output_format == "pcm_44100"
 
 

@@ -154,6 +154,7 @@ class Settings(BaseSettings):
     @field_validator("elevenlabs_music_output_format")
     @classmethod
     def require_elevenlabs_pcm(cls, value: str) -> str:
+        value = value.strip().lower()
         if value == "auto":
             return "pcm_44100"
         if not re.fullmatch(r"pcm_(8000|16000|22050|24000|32000|44100|48000)", value):

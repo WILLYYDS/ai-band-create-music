@@ -458,7 +458,9 @@ class ElevenLabsMusicProvider:
             if written % frame_size:
                 raise GenerationError("ElevenLabs 音乐生成接口返回了不完整的 PCM 音频帧。")
             actual_duration_seconds = written / (sample_rate * frame_size)
-            if abs(actual_duration_seconds - expected_duration_seconds) > 1:
+            # ponytail: ratio only catches severe mismatch; use provider metadata when available.
+            ratio = actual_duration_seconds / expected_duration_seconds
+            if not 0.6 <= ratio <= 1.6:
                 raise GenerationError(
                     "ElevenLabs 音乐生成接口返回的 PCM 时长异常："
                     f"期望 {expected_duration_seconds} 秒，实际 {actual_duration_seconds:.3f} 秒。"
