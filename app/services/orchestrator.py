@@ -12,7 +12,7 @@ from app.core.config import Settings
 from app.core.errors import CapacityExceededError
 from app.infrastructure.events import EventPublisher, GenerationEvent
 from app.infrastructure.queue import TaskDispatcher
-from app.services.audio_files import ensure_file_under_root
+from app.services.audio_files import ensure_file_under_root, make_playback_mp3
 from app.services.job_files import job_song_dir, update_job_diagnostics
 from app.services.prompt import PromptExpander, split_generation_prompt
 from app.services.providers import MusicProvider
@@ -205,11 +205,13 @@ class GenerationOrchestrator:
                     f"full_song_{job_id}_{song_number}{music_result.audio_path.suffix}",
                 )
                 full_relative = full_path.relative_to(self.settings.output_dir)
+                full_playback = await make_playback_mp3(full_path, self.settings.output_dir)
 
                 await report("waveform", None, f"正在提取第 {song_number} 首真实波形")
                 outputs.append(
                     {
                         "fullTrack": full_relative.as_posix(),
+                        **({"playback": {"fullTrack": full_playback}} if full_playback else {}),
                         "stems": {},
                         "stemUrls": [],
                         "waveforms": await extract_waveforms({"full": full_path}),

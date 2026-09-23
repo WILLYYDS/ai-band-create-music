@@ -212,6 +212,12 @@ def install_voice_api(
         target_is_mix = _resolves_to(settings, job_result.get("mixedTrack"), result_path)
         if target_is_replacement:
             deleted["url"] = job_result.pop("replacedVocal")
+            playback = job_result.get("playback")
+            if isinstance(playback, dict):
+                deleted["playback"] = playback.pop("replacedVocal", None)
+            waveforms = job_result.get("waveforms")
+            if isinstance(waveforms, dict):
+                deleted["waveform"] = waveforms.pop("replaced", None)
             model = job_result.pop("_replacedVocalModel", None)
             if isinstance(model, str):
                 deleted["model"] = model
@@ -263,6 +269,14 @@ def install_voice_api(
             target_is_mix = _resolves_to(settings, deleted.get("mixTrack"), result_path)
             if target_is_replacement:
                 job_result["replacedVocal"] = deleted.pop("url")
+                if isinstance(deleted.get("playback"), str):
+                    job_result.setdefault("playback", {})["replacedVocal"] = deleted.pop("playback")
+                else:
+                    deleted.pop("playback", None)
+                if isinstance(deleted.get("waveform"), list):
+                    job_result.setdefault("waveforms", {})["replaced"] = deleted.pop("waveform")
+                else:
+                    deleted.pop("waveform", None)
                 model = deleted.pop("model", None)
                 if isinstance(model, str):
                     job_result["_replacedVocalModel"] = model
@@ -274,12 +288,14 @@ def install_voice_api(
                     # 期间已经重新合过轨：存档里那份成品已经过期，丢掉，别让它在后续 PUT 里复活。
                     deleted.pop("mixTrack", None)
                     deleted.pop("mixWaveform", None)
+                    deleted.pop("mixPlayback", None)
                 elif target_is_mix or stored_path_exists(
                     settings.output_dir, deleted.get("mixTrack")
                 ):
                     if restore_mix_artifact(job_result, deleted):
                         deleted.pop("mixTrack", None)
                         deleted.pop("mixWaveform", None)
+                        deleted.pop("mixPlayback", None)
                 if not deleted:
                     deleted_replaced_vocals.pop(str(song), None)
                 job.save(settings.output_dir)

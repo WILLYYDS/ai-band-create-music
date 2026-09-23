@@ -23,8 +23,16 @@ class ErrorResponse(BaseModel):
     message: str
 
 
+class PlaybackUrls(BaseModel):
+    fullTrack: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    replacedVocal: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    mixedTrack: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    stems: dict[str, str] | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
 class MusicOutput(BaseModel):
     fullTrack: str
+    playback: PlaybackUrls | None = Field(default=None, exclude_if=lambda value: value is None)
     mixedTrack: str | None = Field(default=None, exclude_if=lambda value: value is None)
     replacedVocal: str | None = Field(default=None, exclude_if=lambda value: value is None)
     durationSeconds: float | None = None

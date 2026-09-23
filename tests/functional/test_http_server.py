@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import socket
 import threading
 import time
@@ -113,6 +114,11 @@ def test_mix_over_real_http_with_real_ffmpeg(tmp_path: Path) -> None:
     import json
     import subprocess
 
+    import pytest
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("real FFmpeg tools are unavailable")
+
     from app.main import GenerationJob
 
     settings = make_settings(tmp_path)
@@ -169,6 +175,14 @@ def test_mix_over_real_http_with_real_ffmpeg(tmp_path: Path) -> None:
                     break
                 time.sleep(0.05)
             audio = client.get(detail["result"]["mixedTrack"])
+            while time.monotonic() < deadline and not detail["result"].get("playback", {}).get(
+                "mixedTrack"
+            ):
+                time.sleep(0.05)
+                detail = client.get(f"/api/jobs/{job_id}").json()
+            preview = client.get(
+                detail["result"]["playback"]["mixedTrack"], headers={"Range": "bytes=0-2"}
+            )
             history = client.get("/api/jobs").json()["jobs"][0]
 
         assert accepted.status_code == 202, accepted.text
@@ -177,6 +191,10 @@ def test_mix_over_real_http_with_real_ffmpeg(tmp_path: Path) -> None:
         assert history["result"]["mixedTrack"] == detail["result"]["mixedTrack"]
         assert len(detail["result"]["waveforms"]["mix"]) == 640
         assert audio.status_code == 200 and len(audio.content) > 1000
+        assert preview.status_code == 206 and preview.headers["content-type"].startswith(
+            "audio/mpeg"
+        )
+        assert preview.headers["content-length"] == "3"
         # 成品与原始音频同格式（真实 ffprobe 读盘）。
         probe = json.loads(
             subprocess.run(

@@ -87,19 +87,3 @@ async def extract_waveforms(paths: dict[str, Path]) -> dict[str, list[float]]:
 
     results = await asyncio.gather(*(extract(name, path) for name, path in paths.items()))
     return {result[0]: result[1] for result in results if result is not None and result[1]}
-
-
-def merge_waveform_sets(previous: object, fresh: dict[str, list[float]]) -> dict[str, list[float]]:
-    """Return the waveform map to store for a freshly split song.
-
-    A split re-extracts and rewrites every lane, so the fresh bins replace the stored
-    map rather than merging into it: jobs persisted before the 640-bin change hold a
-    64-bin ``"full"`` envelope, and merging 640-bin stems into it would hand clients
-    lanes of different lengths on one shared x-axis. A stale lane we could not
-    re-extract is dropped instead of shipped mismatched, and the stored map is only
-    kept when extraction produced nothing at all, so an ffmpeg failure cannot drop
-    waveforms that were already persisted.
-    """
-    if fresh:
-        return dict(fresh)
-    return dict(previous) if isinstance(previous, dict) else {}
