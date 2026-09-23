@@ -315,6 +315,22 @@ stems, stemUrls, waveforms, splitEnabled, debug
 音乐生成只产出完整混音，不会自动拆轨。从历史记录进入编辑时，调用分轨接口执行
 Demucs 四轨分离并通过任务 SSE 推送真实进度；已有 `stems` 时直接复用结果。
 
+拆轨依次经过 `stage=splitting`（Demucs，`progress=76`）、`waveform`（真实波形，
+`progress=90`）、`preview`（每轨试听 MP3，`progress` 在 90→100 之间随完成的轨道递增）
+和 `completed`。`preview` 阶段的 `result.stems`、`splitEnabled`、`waveforms` 已经写入，
+`splitStatus` 仍为 `running`：
+
+- **`preview` 阶段取消只取消编码器**：`PATCH /api/jobs/{jobId}` 仍会取消该阶段的
+  ffmpeg 编码任务，因为 WAV 分轨与波形都已落盘，`splitStatus` 不被改写，任务照常以
+  `succeeded` 收尾，只是 `result.playback.stems` 缺少试听 MP3（客户端回落到 WAV）。
+  这样 PATCH 的响应与最终状态不会互相矛盾。`splitting`/`waveform` 阶段取消才是终态：
+  `splitStatus=cancelled`。
+- **分轨进行中（`splitStatus` 为 `pending`/`running`，含 `preview` 窗口）拒绝删除/恢复
+  分轨**，返回 `409`：此时编码器正在读写 `playtrack/`，删除会丢失播放引用，恢复会永久
+  降级为 WAV。`/split`、`/replace` 的同类冲突防护不变。
+- 单轨试听编码失败或被取消只影响那一轨（该 key 不出现在 `result.playback.stems`），
+  不会把整个分轨判为失败。
+
 ## 本地基础设施模式
 
 当前版本不需要 Redis 或消息队列：
