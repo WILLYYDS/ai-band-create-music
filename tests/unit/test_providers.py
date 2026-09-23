@@ -180,8 +180,9 @@ async def test_elevenlabs_variations_preserve_the_same_prompt(tmp_path: Path) ->
         await provider.generate("[Genre: Rock]", 3, "", variation=0)
         await provider.generate("[Genre: Rock]", 3, "", variation=1)
 
-    prompts = [json.loads(request.content)["prompt"] for request in requests]
-    assert prompts[0] == prompts[1]
+    bodies = [json.loads(request.content) for request in requests]
+    assert bodies[0] == bodies[1]
+    assert all("seed" not in body for body in bodies)
 
 
 async def test_elevenlabs_rejects_oversized_complete_prompt_before_request(tmp_path: Path) -> None:

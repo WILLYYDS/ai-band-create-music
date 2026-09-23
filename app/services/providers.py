@@ -27,6 +27,9 @@ MINIMAX_LYRIC_LINE_LIMIT = 32
 # ElevenLabs /v1/music compose API documents a maximum prompt length of 4100 characters:
 # https://elevenlabs.io/docs/api-reference/music/compose
 ELEVENLABS_PROMPT_MAX_CHARS = 4100
+# Live music_v2 pcm_44100 check (2026-09-23): a 3s request returned 529,200 bytes
+# (44,100 Hz × 2 channels × 2 bytes × 3s), with distinct signals in both channels.
+# This account received HTTP 200; the wrapped WAV decoded as 16-bit stereo, 3.000s.
 ELEVENLABS_PCM_CHANNELS = 2
 ELEVENLABS_PCM_SAMPLE_WIDTH = 2
 LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")

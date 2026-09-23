@@ -232,7 +232,8 @@ class GenerationOrchestrator:
                 "requestedCount": count,
                 "provider": selected_provider,
                 "alternatives": outputs[1:],
-                # Kept for compatibility with released clients; no current provider warns.
+                # Kept for released clients. Compare count with requestedCount when
+                # a provider only supports one song; no warning is emitted.
                 "warning": None,
                 **primary,
             }

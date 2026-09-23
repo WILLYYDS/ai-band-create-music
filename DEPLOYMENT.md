@@ -107,8 +107,10 @@ docker compose up -d --no-build
 
 - 旧版 `.env` 中的 `ELEVENLABS_MUSIC_OUTPUT_FORMAT=auto` 会自动兼容为
   `pcm_44100`；其他非 `pcm_*` 值会在服务启动时报错。
-- ElevenLabs 的双曲生成是串行且整体成功的：第二首失败时整个任务失败。
+- ElevenLabs 的双曲生成是串行且按两次调用计费：第二首失败时整个任务失败，
+  第一首 WAV 仍留在 `output/jobs/<id>/song_1/`；清理失败任务时应包含该目录。
   请优先使用 `/api/jobs` 异步任务端点；如果使用同步生成端点，反向代理超时必须
   高于两次 ElevenLabs 生成的总时间。
 - 44.1 kHz、16-bit 立体声 WAV 约为 10.6 MB/分钟。在 6 分钟、两首歌的上限下，
   单任务约需 127 MB 磁盘和下载流量，部署时需相应规划 `output` 容量与出网带宽。
+  前端的 `fullTrack` 已是 `.wav`，播放时返回 `audio/wav`。

@@ -223,7 +223,7 @@ async def test_elevenlabs_count_two_returns_two_results(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert body["count"] == 2
     assert len(body["alternatives"]) == 1
-    assert "warning" in body
+    assert body["warning"] is None
     assert provider.variations == [0, 1]
 
 
