@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -73,7 +74,7 @@ class Settings(BaseSettings):
     elevenlabs_api_key: SecretStr | None = None
     elevenlabs_music_base_url: str = "https://api.elevenlabs.io"
     elevenlabs_music_model_id: str = "music_v2"
-    elevenlabs_music_output_format: str = "auto"
+    elevenlabs_music_output_format: str = "pcm_44100"
     elevenlabs_clear_chinese_vocal_mode: bool = True
     elevenlabs_force_instrumental: bool = False
     elevenlabs_bypass_global_proxy: bool = True
@@ -149,6 +150,16 @@ class Settings(BaseSettings):
     @classmethod
     def strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @field_validator("elevenlabs_music_output_format")
+    @classmethod
+    def require_elevenlabs_pcm(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value == "auto":
+            return "pcm_44100"
+        if not re.fullmatch(r"pcm_(8000|16000|22050|24000|32000|44100|48000)", value):
+            raise ValueError("ELEVENLABS_MUSIC_OUTPUT_FORMAT 必须为受支持的 pcm_* 格式")
+        return value
 
     @model_validator(mode="after")
     def validate_duration_range(self) -> Settings:

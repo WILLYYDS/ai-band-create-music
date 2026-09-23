@@ -163,6 +163,7 @@ class GenerationJob:
     total_steps: int | None = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     message: str = "任务已创建"
+    # Persisted response compatibility for jobs created by older releases.
     warning: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
@@ -603,17 +604,10 @@ def create_app(
 
         jobs: dict[str, GenerationJob] = request.app.state.jobs
         job_id = f"job_{int(asyncio.get_running_loop().time() * 1000)}_{uuid4().hex[:8]}"
-        selected_provider = payload.provider or application_settings.music_provider
-        warning = (
-            "ElevenLabs Music 暂不支持单次生成两首，已按一首生成。"
-            if payload.count == 2 and selected_provider == "elevenlabs_music"
-            else None
-        )
         job = GenerationJob(
             job_id=job_id,
             prompt=prompt,
             title=(payload.title or "").strip() or None,
-            warning=warning,
         )
 
         def publish() -> None:

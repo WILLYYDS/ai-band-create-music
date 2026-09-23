@@ -4,7 +4,7 @@ import asyncio
 import re
 import time
 import wave
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -27,6 +27,11 @@ MINIMAX_LYRIC_LINE_LIMIT = 32
 # ElevenLabs /v1/music compose API documents a maximum prompt length of 4100 characters:
 # https://elevenlabs.io/docs/api-reference/music/compose
 ELEVENLABS_PROMPT_MAX_CHARS = 4100
+# Live music_v2 pcm_44100 check (2026-09-23): a 3s request returned 529,200 bytes
+# (44,100 Hz × 2 channels × 2 bytes × 3s), with distinct signals in both channels.
+# This account received HTTP 200; the wrapped WAV decoded as 16-bit stereo, 3.000s.
+ELEVENLABS_PCM_CHANNELS = 2
+ELEVENLABS_PCM_SAMPLE_WIDTH = 2
 LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")
 ProviderProgressCallback = Callable[[str, int | None, int | None], Awaitable[None]]
 
@@ -325,11 +330,8 @@ class ElevenLabsMusicProvider:
             raise GenerationError("ElevenLabs 音乐生成失败：缺少 ELEVENLABS_API_KEY 环境变量。")
         return secret.get_secret_value()
 
-    def _headers(self, accept_audio: bool = False) -> dict[str, str]:
-        headers = {"xi-api-key": self._api_key(), "Content-Type": "application/json"}
-        if accept_audio:
-            headers["Accept"] = "audio/mpeg"
-        return headers
+    def _headers(self) -> dict[str, str]:
+        return {"xi-api-key": self._api_key(), "Content-Type": "application/json"}
 
     async def generate(
         self,
@@ -350,6 +352,8 @@ class ElevenLabsMusicProvider:
         prompt = build_elevenlabs_prompt(
             structured_prompt, duration_seconds / 60, clear_chinese, lyrics
         )
+        output_format = self._settings.elevenlabs_music_output_format
+        sample_rate = int(output_format.removeprefix("pcm_"))
         request_body = {
             "prompt": prompt,
             "music_length_ms": music_length_ms,
@@ -360,7 +364,7 @@ class ElevenLabsMusicProvider:
         request_diagnostic = {
             "method": "POST",
             "url": url,
-            "params": {"output_format": self._settings.elevenlabs_music_output_format},
+            "params": {"output_format": output_format},
             "body": request_body,
         }
         update_provider_diagnostic(
@@ -387,7 +391,7 @@ class ElevenLabsMusicProvider:
 
             target = _audio_target(
                 self._settings,
-                f"full_song_elevenlabs_{time.time_ns()}.mp3",
+                f"full_song_elevenlabs_{time.time_ns()}.wav",
                 job_id,
                 variation,
             )
@@ -395,24 +399,25 @@ class ElevenLabsMusicProvider:
                 "POST",
                 url,
                 json=request_body,
-                params={"output_format": self._settings.elevenlabs_music_output_format},
-                headers=self._headers(accept_audio=True),
+                params={"output_format": output_format},
+                headers=self._headers(),
                 timeout=self._settings.music_api_timeout_seconds,
             ) as response:
                 if not response.is_success:
                     await response.aread()
                 response.raise_for_status()
-                await write_stream_atomically(
-                    response.aiter_bytes(), target, "ElevenLabs 音乐生成接口返回空音频。"
+                actual_duration_seconds = await self._write_pcm_wav(
+                    response.aiter_bytes(), target, sample_rate, duration_seconds
                 )
             return MusicResult(
                 target,
                 {
                     "provider": "elevenlabs_music",
                     "modelId": self._settings.elevenlabs_music_model_id,
-                    "outputFormat": self._settings.elevenlabs_music_output_format,
-                    "mode": "prompt",
+                    "outputFormat": output_format,
+                    "mode": "prompt_pcm_wav",
                     "clearChineseVocalMode": clear_chinese,
+                    "durationSeconds": actual_duration_seconds,
                 },
             )
         except GenerationError:
@@ -421,6 +426,52 @@ class ElevenLabsMusicProvider:
             raise GenerationError(self._failure_message(exc)) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise GenerationError(f"ElevenLabs 音乐生成失败：{_http_failure_message(exc)}") from exc
+
+    @staticmethod
+    async def _write_pcm_wav(
+        chunks: AsyncIterator[bytes],
+        target: Path,
+        sample_rate: int,
+        expected_duration_seconds: int,
+    ) -> float:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f"{target.name}.{time.time_ns()}.part")
+        written = 0
+        try:
+            # write_stream_atomically cannot write RIFF sizes; wave patches them on close
+            # before the completed temporary file is atomically renamed.
+            with wave.open(str(temporary), "wb") as audio:
+                audio.setparams(
+                    (
+                        ELEVENLABS_PCM_CHANNELS,
+                        ELEVENLABS_PCM_SAMPLE_WIDTH,
+                        sample_rate,
+                        0,
+                        "NONE",
+                        "not compressed",
+                    )
+                )
+                async for chunk in chunks:
+                    if chunk:
+                        written += len(chunk)
+                        audio.writeframesraw(chunk)
+            if written == 0:
+                raise GenerationError("ElevenLabs 音乐生成接口返回空音频。")
+            frame_size = ELEVENLABS_PCM_CHANNELS * ELEVENLABS_PCM_SAMPLE_WIDTH
+            if written % frame_size:
+                raise GenerationError("ElevenLabs 音乐生成接口返回了不完整的 PCM 音频帧。")
+            actual_duration_seconds = written / (sample_rate * frame_size)
+            # ponytail: ratio only catches severe mismatch; use provider metadata when available.
+            ratio = actual_duration_seconds / expected_duration_seconds
+            if not 0.6 <= ratio <= 1.6:
+                raise GenerationError(
+                    "ElevenLabs 音乐生成接口返回的 PCM 时长异常："
+                    f"期望 {expected_duration_seconds} 秒，实际 {actual_duration_seconds:.3f} 秒。"
+                )
+            temporary.replace(target)
+            return round(actual_duration_seconds, 3)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _failure_message(error: httpx.HTTPStatusError) -> str:

@@ -50,6 +50,7 @@ class GenerateResponse(MusicOutput):
     lyrics: str
     count: Literal[1, 2] = 1
     alternatives: list[MusicOutput] = Field(default_factory=list)
+    # Backward-compatible response field used by released clients.
     warning: str | None = None
 
 
@@ -77,6 +78,7 @@ class GenerationJobResponse(BaseModel):
     step: int | None = None
     totalSteps: int | None = None
     message: str
+    # Backward-compatible response field used by released clients.
     warning: str | None = None
     result: GenerateResponse | None = None
     error: str | None = None

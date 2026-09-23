@@ -29,6 +29,17 @@ def test_minimax_music_defaults_and_provider(tmp_path: Path) -> None:
     assert settings.minimax_timeout_seconds == 7200
 
 
+@pytest.mark.parametrize("value", ["auto", " AUTO ", " PCM_44100 "])
+def test_elevenlabs_legacy_auto_output_is_migrated(tmp_path: Path, value: str) -> None:
+    settings = make_settings(tmp_path, elevenlabs_music_output_format=value)
+    assert settings.elevenlabs_music_output_format == "pcm_44100"
+
+
+def test_elevenlabs_non_pcm_output_is_rejected_at_config_load(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="必须为受支持的 pcm"):
+        make_settings(tmp_path, elevenlabs_music_output_format="mp3_44100_128")
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
