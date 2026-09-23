@@ -914,11 +914,11 @@ def create_app(
                 result["stems"] = stems
                 playback = result.setdefault("playback", {})
                 playback.pop("stems", None)
-                job.deleted_replaced_vocals.pop(str(song), None)
                 replaced_url = result.get("replacedVocal")
                 if isinstance(replaced_url, str) and stored_path_exists(
                     application_settings.output_dir, replaced_url
                 ):
+                    # Only a newly invalidated replacement supersedes an earlier undo stash.
                     previous_waveforms = result.get("waveforms")
                     deleted = {"url": replaced_url}
                     for key, value in (
@@ -1431,12 +1431,14 @@ def create_app(
                 job.mix_stage = "completed"
                 job.mix_progress = 100
                 job.mix_message = "合轨完成"
+                publish()
                 try:
                     preview = await make_playback_mp3(result_path, application_settings.output_dir)
                     if preview:
                         result["playback"]["mixedTrack"] = preview
                     job.save(application_settings.output_dir)
                 except (Exception, asyncio.CancelledError):
+                    # The WAV is already published: cancellation can skip only the optional preview.
                     result["playback"].pop("mixedTrack", None)
                     logger.warning("mix preview skipped job_id=%s", job.job_id, exc_info=True)
                 if not fresh_waveforms:
@@ -1949,7 +1951,7 @@ def create_app(
                 "public, max-age=31536000, immutable"
                 if len(relative.parts) >= 2
                 and relative.parts[-2] == "playtrack"
-                and re.fullmatch(r".+\.playback-[0-9a-f]{64}\.mp3", target.name)
+                and re.fullmatch(r".+\.playback-\d+-\d+\.mp3", target.name)
                 else "no-store"
             ),
             "Content-Length": str(end - start + 1),

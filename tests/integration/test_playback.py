@@ -20,7 +20,9 @@ def wav(path: Path) -> None:
         output.writeframes(b"\0\0" * 8000)
 
 
-async def test_four_preview_urls_range_and_stale_versions(tmp_path: Path) -> None:
+async def test_four_preview_urls_range_and_stale_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     settings = make_settings(tmp_path)
     folder = settings.output_dir / "jobs/j/song_1"
     names = {
@@ -53,6 +55,18 @@ async def test_four_preview_urls_range_and_stale_versions(tmp_path: Path) -> Non
     rendered = _render_result_urls(result, "http://testserver", settings)
     assert set(rendered["playback"]) == {"fullTrack", "stems", "replacedVocal", "mixedTrack"}
     assert rendered["fullTrack"].endswith(".wav")
+    original_open = Path.open
+
+    def reject_wav_read(path: Path, *args, **kwargs):
+        if path.suffix == ".wav":
+            raise AssertionError("result rendering must not read WAV bytes")
+        return original_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", reject_wav_read)
+        assert _render_result_urls(result, "http://testserver", settings)["playback"] == rendered[
+            "playback"
+        ]
     app = create_app(settings, make_orchestrator(settings))
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app), base_url="http://testserver"
@@ -71,7 +85,7 @@ async def test_four_preview_urls_range_and_stale_versions(tmp_path: Path) -> Non
     replacement = paths["replacedVocal"].with_suffix(".new")
     wav(replacement)
     replacement.write_bytes(replacement.read_bytes()[:-2] + b"\1\0")
-    os.utime(replacement, ns=(previous_mtime, previous_mtime))
+    os.utime(replacement, ns=(previous_mtime + 1_000_000, previous_mtime + 1_000_000))
     replacement.replace(paths["replacedVocal"])
     assert (
         "replacedVocal"

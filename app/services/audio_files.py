@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import os
 import shutil
 import tempfile
 from collections.abc import AsyncIterator
-from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
@@ -19,21 +17,9 @@ logger = logging.getLogger(__name__)
 PLAYBACK_ENCODE_TIMEOUT_SECONDS = 120
 
 
-@lru_cache(maxsize=256)
-def _wav_version(path: Path, inode: int, mtime_ns: int, ctime_ns: int, size: int) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as audio:
-        for chunk in iter(lambda: audio.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _playback_name(source: Path) -> str:
     version = source.stat()
-    digest = _wav_version(
-        source, version.st_ino, version.st_mtime_ns, version.st_ctime_ns, version.st_size
-    )
-    return f"{source.stem}.playback-{digest}.mp3"
+    return f"{source.stem}.playback-{version.st_mtime_ns}-{version.st_size}.mp3"
 
 
 async def make_playback_mp3(source: Path, output_dir: Path) -> str | None:
@@ -87,6 +73,7 @@ async def make_playback_mp3(source: Path, output_dir: Path) -> str | None:
         if target.name != _playback_name(source):
             return None
         temporary.replace(target)
+        # Older previews may still be named in an undo stash; restoring then falls back to WAV.
         for old in playback_dir.glob(f"{source.stem}.playback-*.mp3"):
             if old != target:
                 old.unlink(missing_ok=True)

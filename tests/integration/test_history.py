@@ -647,6 +647,19 @@ async def test_resplit_invalidates_mix_and_replacement(tmp_path, monkeypatch):
     assert app.state.jobs[job_id].result["replacedVocal"] == stashed["url"]
 
 
+async def test_resplit_without_active_replacement_keeps_previous_undo(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    monkeypatch.setattr("app.main.extract_waveforms", AsyncMock(return_value=split_waveforms()))
+    async with client(app) as http:
+        job_id = (await http.post("/api/generate", json={"prompt": "rock"})).json()["jobId"]
+        job = app.state.jobs[job_id]
+        job.deleted_replaced_vocals["0"] = {"url": "previously-deleted.wav"}
+        assert (await http.post(f"/api/jobs/{job_id}/split?song=0")).status_code == 202
+        await job.split_task
+    assert job.deleted_replaced_vocals["0"]["url"] == "previously-deleted.wav"
+
+
 async def test_job_title_is_listed_and_survives_restart(tmp_path):
     settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
