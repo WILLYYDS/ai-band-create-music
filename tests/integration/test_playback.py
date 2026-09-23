@@ -1,5 +1,9 @@
+import array
+import asyncio
+import math
 import os
 import shutil
+import subprocess
 import sys
 import wave
 from pathlib import Path
@@ -119,8 +123,86 @@ async def test_generation_and_split_publish_previews(tmp_path: Path) -> None:
         assert (await client.post(f"/api/jobs/{job_id}/split")).status_code == 202
         await app.state.jobs[job_id].split_task
         split = (await client.get(f"/api/jobs/{job_id}")).json()["result"]
-        assert "stems" not in split["playback"]
+        assert set(split["playback"]["stems"]) == set(split["stems"])
+        assert all(url.endswith(".mp3") for url in split["playback"]["stems"].values())
         assert all(url.endswith(".wav") for url in split["stems"].values())
+        preview_url = next(iter(split["playback"]["stems"].values()))
+        preview_response = await client.get(preview_url, headers={"Range": "bytes=0-2"})
+        assert preview_response.status_code == 206
+        assert preview_response.headers["content-type"].startswith("audio/mpeg")
+        assert (await client.delete(f"/api/jobs/{job_id}/stems/vocal")).status_code == 204
+        deleted = (await client.get(f"/api/jobs/{job_id}")).json()["result"]
+        assert "vocal" not in deleted["playback"]["stems"]
+        restored = (await client.put(f"/api/jobs/{job_id}/stems/vocal")).json()["result"]
+        assert restored["playback"]["stems"]["vocal"] == split["playback"]["stems"]["vocal"]
+
+
+async def test_failed_stem_preview_does_not_fail_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = make_settings(tmp_path, mock_full_song_path=tmp_path / "source.wav")
+    orchestrator = make_orchestrator(settings)
+    wav(settings.mock_full_song_path)
+    app = create_app(settings, orchestrator)
+    encoding_started = asyncio.Event()
+    release_encoder = asyncio.Event()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://testserver"
+    ) as client:
+        started = await client.post("/api/jobs", json={"prompt": "test"})
+        job_id = started.json()["jobId"]
+        await app.state.jobs[job_id].task
+
+        async def fail_preview(*_args: object) -> None:
+            encoding_started.set()
+            await release_encoder.wait()
+            raise RuntimeError("encoding failed")
+
+        monkeypatch.setattr("app.main.make_playback_mp3", fail_preview)
+        assert (await client.post(f"/api/jobs/{job_id}/split")).status_code == 202
+        await encoding_started.wait()
+        waiting = (await client.get(f"/api/jobs/{job_id}")).json()
+        assert waiting["splitStatus"] == "running"
+        assert orchestrator.capacity.active == 0
+        release_encoder.set()
+        await app.state.jobs[job_id].split_task
+        completed = (await client.get(f"/api/jobs/{job_id}")).json()
+        assert completed["splitStatus"] == "succeeded"
+        assert all(url.endswith(".wav") for url in completed["result"]["stems"].values())
+        assert "stems" not in completed["result"]["playback"]
+
+
+async def test_mp3_stem_transients_stay_aligned_after_seeks(tmp_path: Path) -> None:
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg unavailable")
+    rate = 48_000
+    previews = []
+    for index in range(4):
+        source = tmp_path / f"stem{index}.wav"
+        samples = array.array("h", [0]) * (rate * 4)
+        for second in (0.25, 1.0, 2.0, 3.5):
+            start = int(second * rate)
+            for offset in range(96):
+                samples[start + offset] = int(20_000 * math.exp(-offset / 24))
+        with wave.open(str(source), "wb") as audio:
+            audio.setparams((1, 2, rate, 0, "NONE", "not compressed"))
+            audio.writeframes(samples.tobytes())
+        preview = await make_playback_mp3(source, tmp_path)
+        assert preview
+        previews.append(tmp_path / preview)
+
+    for seek in (0, 0.8, 1.8, 3.3):
+        onsets = []
+        for preview in previews:
+            command = ["ffmpeg", "-v", "error"]
+            if seek:
+                command += ["-ss", str(seek)]
+            command += ["-i", str(preview), "-t", "0.55", "-f", "f32le", "-ac", "1", "-"]
+            decoded = subprocess.run(command, check=True, capture_output=True).stdout
+            samples = array.array("f")
+            samples.frombytes(decoded)
+            onsets.append(next(i for i, sample in enumerate(samples) if abs(sample) > 0.15))
+        assert max(onsets) - min(onsets) <= rate // 1000
 
 
 async def test_failed_encoding_leaves_wav_and_no_preview(
@@ -140,8 +222,6 @@ async def test_failed_encoding_leaves_wav_and_no_preview(
 
 
 async def test_encoder_timeout_kills_child_and_removes_temp(tmp_path: Path, monkeypatch) -> None:
-    import asyncio
-
     source = tmp_path / "full.wav"
     wav(source)
     original = source.read_bytes()

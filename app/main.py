@@ -886,6 +886,8 @@ def create_app(
                     queue.put_nowait(None)
 
         async def execute() -> None:
+            wav_ready = False
+            capacity_released = False
             try:
                 job.split_status = "running"
                 publish()
@@ -971,15 +973,48 @@ def create_app(
                             )
                         del job.deleted_stems[key]
                 job.save(application_settings.output_dir)
+                wav_ready = True
+                await active_orchestrator.capacity.release()
+                capacity_released = True
+                job.split_stage = "preview"
+                job.split_message = "正在生成试听音频"
+                publish()
+                try:
+                    encoded = await asyncio.gather(*(
+                        make_playback_mp3(
+                            application_settings.output_dir / stem,
+                            application_settings.output_dir,
+                        )
+                        for stem in stems.values()
+                    ))
+                    previews = {
+                        name: preview
+                        for name, preview in zip(stems, encoded, strict=True)
+                        if preview
+                    }
+                    if previews:
+                        playback["stems"] = previews
+                        job.save(application_settings.output_dir)
+                except (Exception, asyncio.CancelledError):
+                    playback.pop("stems", None)
+                    logger.warning(
+                        "stem previews skipped job_id=%s song=%s", job_id, song, exc_info=True
+                    )
                 job.split_status = "succeeded"
                 job.split_stage = "completed"
                 job.split_progress = SPLIT_COMPLETE_PROGRESS
                 job.split_message = "音轨分离完成"
             except asyncio.CancelledError:
-                job.split_status = "cancelled"
-                job.split_stage = "cancelled"
-                job.split_progress = None
-                job.split_message = "音轨分离已取消"
+                if wav_ready:
+                    job.split_status = "succeeded"
+                    job.split_stage = "completed"
+                    job.split_progress = SPLIT_COMPLETE_PROGRESS
+                    job.split_message = "音轨分离完成"
+                else:
+                    job.split_status = "cancelled"
+                    job.split_stage = "cancelled"
+                    job.split_progress = None
+                    job.split_message = "音轨分离已取消"
             except Exception:
                 logger.exception("history split failed job_id=%s song=%s", job_id, song)
                 job.split_status = "failed"
@@ -988,7 +1023,8 @@ def create_app(
                 job.split_message = "音轨分离失败"
                 job.split_error = "音轨分离失败，请检查服务配置后重试。"
             finally:
-                await active_orchestrator.capacity.release()
+                if not capacity_released:
+                    await active_orchestrator.capacity.release()
                 publish()
 
         job.split_task = asyncio.create_task(execute(), name=f"split-{job_id}-{song}")
