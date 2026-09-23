@@ -977,39 +977,62 @@ def create_app(
                 await active_orchestrator.capacity.release()
                 capacity_released = True
                 job.split_stage = "preview"
+                job.split_progress = WAVEFORM_PROGRESS
                 job.split_message = "正在生成试听音频"
                 publish()
-                try:
-                    encoded = await asyncio.gather(*(
-                        make_playback_mp3(
-                            application_settings.output_dir / stem,
+                total_previews = len(stems)
+                finished_previews = 0
+
+                async def encode_preview(stem_path: str) -> str | None:
+                    # 编码是本阶段唯一的长活（每轨最长 PLAYBACK_ENCODE_TIMEOUT_SECONDS）：把
+                    # 进度在 90→100 之间随完成的轨道往前走，前端才不会整段看成卡死。
+                    nonlocal finished_previews
+                    try:
+                        return await make_playback_mp3(
+                            application_settings.output_dir / stem_path,
                             application_settings.output_dir,
                         )
-                        for stem in stems.values()
-                    ))
+                    finally:
+                        finished_previews += 1
+                        span = SPLIT_COMPLETE_PROGRESS - WAVEFORM_PROGRESS
+                        job.split_progress = WAVEFORM_PROGRESS + round(
+                            span * finished_previews / total_previews
+                        )
+                        publish()
+
+                try:
+                    # 单轨编码失败（返回 None）或异常都只丢掉那一轨的试听：WAV 分轨已经落盘，
+                    # 不能因为试听拖垮整个分轨结果。return_exceptions 同时保证没有编码任务会
+                    # 在 gather 提前抛出后继续孤独地写 playtrack/。
+                    encoded = await asyncio.gather(
+                        *(encode_preview(stem) for stem in stems.values()),
+                        return_exceptions=True,
+                    )
+                    errors = [item for item in encoded if isinstance(item, BaseException)]
+                    if errors:
+                        logger.warning(
+                            "stem previews failed job_id=%s song=%s errors=%r",
+                            job_id,
+                            song,
+                            errors,
+                        )
                     previews = {
                         name: preview
                         for name, preview in zip(stems, encoded, strict=True)
-                        if preview
+                        if isinstance(preview, str) and preview
                     }
                     if previews:
                         playback["stems"] = previews
                         job.save(application_settings.output_dir)
-                except (Exception, asyncio.CancelledError):
+                except asyncio.CancelledError:
+                    # PATCH 在 preview 阶段只取消编码器（见 README 状态契约）：WAV 分轨保留，
+                    # 任务照常按 succeeded 收尾，不把取消写成终态。
                     playback.pop("stems", None)
-                    logger.warning(
-                        "stem previews skipped job_id=%s song=%s", job_id, song, exc_info=True
-                    )
-                job.split_status = "succeeded"
-                job.split_stage = "completed"
-                job.split_progress = SPLIT_COMPLETE_PROGRESS
-                job.split_message = "音轨分离完成"
+                    logger.info("stem previews cancelled job_id=%s song=%s", job_id, song)
+                _mark_split_succeeded(job)
             except asyncio.CancelledError:
                 if wav_ready:
-                    job.split_status = "succeeded"
-                    job.split_stage = "completed"
-                    job.split_progress = SPLIT_COMPLETE_PROGRESS
-                    job.split_message = "音轨分离完成"
+                    _mark_split_succeeded(job)
                 else:
                     job.split_status = "cancelled"
                     job.split_stage = "cancelled"
@@ -1670,10 +1693,16 @@ def create_app(
             )
         if job.split_task is not None and not job.split_task.done():
             job.split_task.cancel()
-            job.split_status = "cancelled"
-            job.split_stage = "cancelled"
-            job.split_progress = None
-            job.split_message = "音轨分离已取消"
+            # 取消只有在 WAV 落盘之前（Demucs 分离、波形提取）才是终态：那时没有任何分轨
+            # 产物对外可见。preview 阶段的取消只作用于编码器——WAV 分轨与波形都已落盘，任务
+            # 本身会照常按 succeeded 收尾（见 README 状态契约）。此处改写 split_status 会让
+            # PATCH 的响应与随后的最终状态互相矛盾：客户端把 "cancelled" 当终态就再也看不到
+            # 已经生成的 WAV 分轨。收尾（stage=completed）期间同样不改写，避免同样的矛盾。
+            if job.split_stage in {"splitting", "waveform"}:
+                job.split_status = "cancelled"
+                job.split_stage = "cancelled"
+                job.split_progress = None
+                job.split_message = "音轨分离已取消"
         if (
             job.mix_status in {"pending", "running"}
             and job.mix_task is not None
@@ -1741,6 +1770,13 @@ def create_app(
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"success": False, "message": "该任务正在合轨，请稍后重试。"},
+            )
+        if job.split_status in {"pending", "running"}:
+            # 分轨期间（含 preview 编码窗口）result["stems"] 已经对外可见，但文件仍在被编码器
+            # 读写：此时删除会丢播放引用、恢复会永久降级成 WAV，一律先拒绝。
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "该歌曲正在拆轨，请稍后重试。"},
             )
 
         stems = result.get("stems", {})
@@ -1876,6 +1912,12 @@ def create_app(
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"success": False, "message": "该任务正在合轨，请稍后重试。"},
+            )
+        if job.split_status in {"pending", "running"}:
+            # 与删除分轨同一理由：编码器还在写 playtrack/，恢复出来的引用会指向被顶替的文件。
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"success": False, "message": "该歌曲正在拆轨，请稍后重试。"},
             )
         if stem_name in stems:
             return await _async_job_response(job, request, application_settings)
@@ -2052,6 +2094,14 @@ def _operation_status_override(job: GenerationJob) -> str | None:
     if job.replace_status in {"pending", "running"}:
         return job.replace_status
     return _split_status_override(job)
+
+
+def _mark_split_succeeded(job: GenerationJob) -> None:
+    """分轨成功收尾的四个字段：WAV 落盘后正常结束与"编码中被取消"两条路径共用。"""
+    job.split_status = "succeeded"
+    job.split_stage = "completed"
+    job.split_progress = SPLIT_COMPLETE_PROGRESS
+    job.split_message = "音轨分离完成"
 
 
 def _mark_replace_cancelled(job: GenerationJob) -> None:

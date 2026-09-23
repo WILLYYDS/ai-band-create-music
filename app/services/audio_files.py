@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import tempfile
+import weakref
 from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
@@ -15,6 +16,22 @@ from app.core.errors import GenerationError
 
 logger = logging.getLogger(__name__)
 PLAYBACK_ENCODE_TIMEOUT_SECONDS = 120
+# 试听编码是纯 CPU 的 ffmpeg 子进程：分轨任务的容量配额在编码前就让给了下一个 Demucs
+# 任务，所以这里必须自己限并发，否则 4–6 个 ffmpeg 会和 Demucs 抢同一批核。
+PLAYBACK_ENCODE_CONCURRENCY = os.cpu_count() or 2
+_encoder_gates: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _encoder_gate() -> asyncio.Semaphore:
+    """按事件循环懒建编码闸门（模块级信号量跨循环复用会绑定到已关闭的循环）。"""
+    loop = asyncio.get_running_loop()
+    gate = _encoder_gates.get(loop)
+    if gate is None:
+        gate = asyncio.Semaphore(PLAYBACK_ENCODE_CONCURRENCY)
+        _encoder_gates[loop] = gate
+    return gate
 
 
 def _playback_name(source: Path) -> str:
@@ -26,6 +43,11 @@ async def make_playback_mp3(source: Path, output_dir: Path) -> str | None:
     """Encode one WAV version; a failed preview never changes the source or its result."""
     if source.suffix.lower() != ".wav":
         return None
+    async with _encoder_gate():
+        return await _encode_playback_mp3(source, output_dir)
+
+
+async def _encode_playback_mp3(source: Path, output_dir: Path) -> str | None:
     temporary = None
     process = None
     try:
@@ -84,11 +106,13 @@ async def make_playback_mp3(source: Path, output_dir: Path) -> str | None:
         logger.warning("playback encoding skipped source=%s", source, exc_info=True)
         return None
     finally:
+        # 临时文件先清掉再回收子进程：取消（PATCH 在 preview 阶段就是取消编码器）会在下面的
+        # await 上再抛一次 CancelledError，把清理留在后面就会在 playtrack/ 里留下残渣。
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
         if process is not None and process.returncode is None:
             process.kill()
             await process.wait()
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
 
 
 def playback_matches(source: Path, preview: Path) -> bool:

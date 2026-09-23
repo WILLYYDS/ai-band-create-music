@@ -6,14 +6,18 @@ import shutil
 import subprocess
 import sys
 import wave
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from app.main import GenerationJob, _render_result_urls, create_app
 from app.services.audio_files import make_playback_mp3
 from app.services.job_files import capture_mix_artifact, drop_mix_artifact, restore_mix_artifact
+from app.services.orchestrator import GenerationOrchestrator
 from tests.helpers import make_orchestrator, make_settings
 
 
@@ -154,9 +158,10 @@ async def test_failed_stem_preview_does_not_fail_split(
         await app.state.jobs[job_id].task
 
         async def fail_preview(*_args: object) -> None:
+            # 线上编码失败就是 make_playback_mp3 返回 None（它自己吞掉异常），这里照样复现。
             encoding_started.set()
             await release_encoder.wait()
-            raise RuntimeError("encoding failed")
+            return None
 
         monkeypatch.setattr("app.main.make_playback_mp3", fail_preview)
         assert (await client.post(f"/api/jobs/{job_id}/split")).status_code == 202
@@ -170,6 +175,120 @@ async def test_failed_stem_preview_does_not_fail_split(
         assert completed["splitStatus"] == "succeeded"
         assert all(url.endswith(".wav") for url in completed["result"]["stems"].values())
         assert "stems" not in completed["result"]["playback"]
+
+
+async def test_partial_stem_preview_failure_keeps_split_successful(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = make_settings(tmp_path, mock_full_song_path=tmp_path / "source.wav")
+    orchestrator = make_orchestrator(settings)
+    wav(settings.mock_full_song_path)
+    app = create_app(settings, orchestrator)
+    encode = make_playback_mp3
+
+    async def flaky_preview(source: Path, output_dir: Path) -> str | None:
+        if source.stem.endswith("_vocal"):
+            return None
+        if source.stem.endswith("_drums"):
+            raise RuntimeError("encoding failed")
+        return await encode(source, output_dir)
+
+    monkeypatch.setattr("app.main.make_playback_mp3", flaky_preview)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://testserver"
+    ) as client:
+        started = await client.post("/api/jobs", json={"prompt": "test"})
+        job_id = started.json()["jobId"]
+        await app.state.jobs[job_id].task
+        assert (await client.post(f"/api/jobs/{job_id}/split")).status_code == 202
+        await app.state.jobs[job_id].split_task
+        completed = (await client.get(f"/api/jobs/{job_id}")).json()
+
+    assert completed["splitStatus"] == "succeeded"
+    assert completed["stage"] == "completed"
+    assert orchestrator.capacity.active == 0
+    stems = completed["result"]["stems"]
+    previews = completed["result"]["playback"]["stems"]
+    assert set(stems) == {"vocal", "drums", "bass", "other"}
+    assert all(url.endswith(".wav") for url in stems.values())
+    assert set(previews) == set(stems) - {"vocal", "drums"}
+    assert all(url.endswith(".mp3") for url in previews.values())
+
+
+@asynccontextmanager
+async def blocked_preview_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[tuple[FastAPI, httpx.AsyncClient, str, GenerationOrchestrator]]:
+    """把分轨卡在 preview 阶段：所有编码任务挂起，由调用方决定此时发什么请求。"""
+    settings = make_settings(tmp_path, mock_full_song_path=tmp_path / "source.wav")
+    orchestrator = make_orchestrator(settings)
+    wav(settings.mock_full_song_path)
+    app = create_app(settings, orchestrator)
+    encoding_started = asyncio.Event()
+
+    async def blocked_preview(*_args: object) -> str | None:
+        encoding_started.set()
+        await asyncio.Event().wait()
+        return None
+
+    monkeypatch.setattr("app.main.make_playback_mp3", blocked_preview)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://testserver"
+    ) as client:
+        started = await client.post("/api/jobs", json={"prompt": "test"})
+        job_id = started.json()["jobId"]
+        await app.state.jobs[job_id].task
+        assert (await client.post(f"/api/jobs/{job_id}/split")).status_code == 202
+        await encoding_started.wait()
+        try:
+            yield app, client, job_id, orchestrator
+        finally:
+            split_task = app.state.jobs[job_id].split_task
+            if split_task is not None and not split_task.done():
+                split_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await split_task
+
+
+async def test_cancel_during_preview_only_stops_encoders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with blocked_preview_split(tmp_path, monkeypatch) as (app, client, job_id, orchestrator):
+        encoding = (await client.get(f"/api/jobs/{job_id}")).json()
+        assert encoding["splitStatus"] == "running"
+        assert encoding["stage"] == "preview"
+        # 容量在编码前就让给了下一个 Demucs 任务（分支 reduce-audio-stress 的既定取舍），
+        # 编码并发由 app.services.audio_files 的信号量单独限制。
+        assert orchestrator.capacity.active == 0
+        cancelled = (await client.patch(f"/api/jobs/{job_id}", json={"status": "cancelled"})).json()
+        # preview 阶段的取消不写终态：PATCH 的响应与随后的最终状态必须一致。
+        assert cancelled["splitStatus"] == "running"
+        assert cancelled["stage"] == "preview"
+        await app.state.jobs[job_id].split_task
+        completed = (await client.get(f"/api/jobs/{job_id}")).json()
+
+    assert completed["splitStatus"] == "succeeded"
+    assert completed["stage"] == "completed"
+    assert all(url.endswith(".wav") for url in completed["result"]["stems"].values())
+    assert "stems" not in completed["result"]["playback"]
+
+
+async def test_stem_delete_and_restore_rejected_while_preview_encodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with blocked_preview_split(tmp_path, monkeypatch) as (app, client, job_id, _):
+        rejected = await client.delete(f"/api/jobs/{job_id}/stems/vocal")
+        assert rejected.status_code == 409
+        assert rejected.json()["message"] == "该歌曲正在拆轨，请稍后重试。"
+        assert (await client.put(f"/api/jobs/{job_id}/stems/vocal")).status_code == 409
+        await client.patch(f"/api/jobs/{job_id}", json={"status": "cancelled"})
+        await app.state.jobs[job_id].split_task
+        assert (await client.delete(f"/api/jobs/{job_id}/stems/vocal")).status_code == 204
+        restored = (await client.put(f"/api/jobs/{job_id}/stems/vocal")).json()
+
+    assert set(restored["result"]["stems"]) == {"vocal", "drums", "bass", "other"}
+    # 试听编码被取消过，恢复出来的分轨只有 WAV，没有可回填的 preview。
+    assert "stems" not in restored["result"]["playback"]
 
 
 async def test_mp3_stem_transients_stay_aligned_after_seeks(tmp_path: Path) -> None:
@@ -198,11 +317,16 @@ async def test_mp3_stem_transients_stay_aligned_after_seeks(tmp_path: Path) -> N
             if seek:
                 command += ["-ss", str(seek)]
             command += ["-i", str(preview), "-t", "0.55", "-f", "f32le", "-ac", "1", "-"]
-            decoded = subprocess.run(command, check=True, capture_output=True).stdout
+            # 16 次解码都在子进程里，但仍然会卡住事件循环，交给线程池跑。
+            decoded = await asyncio.to_thread(
+                subprocess.run, command, check=True, capture_output=True
+            )
             samples = array.array("f")
-            samples.frombytes(decoded)
+            samples.frombytes(decoded.stdout)
             onsets.append(next(i for i, sample in enumerate(samples) if abs(sample) > 0.15))
-        assert max(onsets) - min(onsets) <= rate // 1000
+        # 5 ms：LAME 的 encoder delay/priming 与不同 ffmpeg 构建的取整差异都在这之内，
+        # 而真正的错位（整帧/整段填充，几十毫秒）依然会被抓住。
+        assert max(onsets) - min(onsets) <= rate // 200
 
 
 async def test_failed_encoding_leaves_wav_and_no_preview(
@@ -236,6 +360,35 @@ async def test_encoder_timeout_kills_child_and_removes_temp(tmp_path: Path, monk
     monkeypatch.setattr("app.services.audio_files.PLAYBACK_ENCODE_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr("app.services.audio_files.asyncio.create_subprocess_exec", sleeping_encoder)
     assert await make_playback_mp3(source, tmp_path) is None
+    assert spawned[0].returncode is not None
+    assert source.read_bytes() == original
+    assert not list((tmp_path / "playtrack").iterdir())
+
+
+async def test_cancelled_encoder_kills_child_and_removes_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """preview 阶段的取消就是取消编码器：子进程和临时 MP3 都不许留下。"""
+    source = tmp_path / "full.wav"
+    wav(source)
+    original = source.read_bytes()
+    spawned = []
+    process_started = asyncio.Event()
+    create = asyncio.create_subprocess_exec
+
+    async def sleeping_encoder(*_args, **kwargs):
+        process = await create(sys.executable, "-c", "import time; time.sleep(10)", **kwargs)
+        spawned.append(process)
+        process_started.set()
+        return process
+
+    monkeypatch.setattr("app.services.audio_files.asyncio.create_subprocess_exec", sleeping_encoder)
+    encoding = asyncio.create_task(make_playback_mp3(source, tmp_path))
+    await process_started.wait()
+    assert list((tmp_path / "playtrack").iterdir())
+    encoding.cancel()
+    with suppress(asyncio.CancelledError):
+        await encoding
     assert spawned[0].returncode is not None
     assert source.read_bytes() == original
     assert not list((tmp_path / "playtrack").iterdir())
