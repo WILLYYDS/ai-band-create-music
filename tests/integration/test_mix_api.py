@@ -23,6 +23,8 @@ from starlette.requests import Request
 
 from app.core.errors import GenerationError
 from app.main import GenerationJob, create_app, load_jobs
+
+# 试听文件名必须与真实编码器一致，否则响应层的 playback_matches 会过滤它。
 from app.services.audio_files import _playback_name
 from app.services.voice import RVCConversionError
 from tests.helpers import make_orchestrator, make_settings
@@ -252,8 +254,9 @@ async def test_restart_derives_status_from_the_result(tmp_path, install_stubs):
     assert (both["mixStatus"], both["mixSong"]) == ("succeeded", None)
 
 
-async def test_mix_streams_progress_over_sse(tmp_path, install_stubs, monkeypatch):
-    """终态帧须在 MP3 试听生成后才发出，供揭晓页和历史页直接播放。"""
+@pytest.mark.parametrize("preview_outcome", ["ok", "none", "error"])
+async def test_mix_streams_progress_over_sse(tmp_path, install_stubs, monkeypatch, preview_outcome):
+    """试听成功或失败，终态帧都须在试听步骤结束后发出。"""
     mixer = install_stubs(StubMixer(blocking=True))
     settings = make_settings(tmp_path)
     app = build_app(settings)
@@ -261,9 +264,13 @@ async def test_mix_streams_progress_over_sse(tmp_path, install_stubs, monkeypatc
     preview_started = asyncio.Event()
     preview_release = asyncio.Event()
 
-    async def preview(source: Path, output_dir: Path) -> str:
+    async def preview(source: Path, output_dir: Path) -> str | None:
         preview_started.set()
         await preview_release.wait()
+        if preview_outcome == "none":
+            return None
+        if preview_outcome == "error":
+            raise RuntimeError("preview unavailable")
         target = source.parent / "playtrack" / _playback_name(source)
         target.parent.mkdir(exist_ok=True)
         target.write_bytes(b"ID3-preview")
@@ -302,7 +309,11 @@ async def test_mix_streams_progress_over_sse(tmp_path, install_stubs, monkeypatc
             assert (await asyncio.wait_for(accepted, 2)).status_code == 202
             await asyncio.wait_for(preview_started.wait(), 2)
             waiting = (await http.get(f"/api/jobs/{job.job_id}")).json()
-            assert (waiting["mixStatus"], waiting["stage"]) == ("running", "preview")
+            assert (waiting["mixStatus"], waiting["stage"], waiting["progress"]) == (
+                "running",
+                "preview",
+                95,
+            )
             preview_release.set()
             await job.mix_task
             done = await asyncio.wait_for(anext(stream.body_iterator), 2)
@@ -318,9 +329,13 @@ async def test_mix_streams_progress_over_sse(tmp_path, install_stubs, monkeypatc
     assert (completed["mixStatus"], completed["progress"]) == ("succeeded", 100)
     assert completed["result"]["waveforms"]["mix"] == MIX_WAVEFORM
     assert completed["result"]["mixedTrack"].endswith(".wav")
-    preview_url = completed["result"]["playback"]["mixedTrack"]
-    assert preview_url.endswith(".mp3")
-    assert history["result"]["playback"]["mixedTrack"] == preview_url
+    if preview_outcome == "ok":
+        preview_url = completed["result"]["playback"]["mixedTrack"]
+        assert preview_url.endswith(".mp3")
+        assert history["result"]["playback"]["mixedTrack"] == preview_url
+    else:
+        assert "mixedTrack" not in completed["result"].get("playback", {})
+        assert "mixedTrack" not in history["result"].get("playback", {})
     assert job.job_id not in app.state.job_subscribers
 
 
@@ -762,10 +777,11 @@ async def test_cancel_during_preview_keeps_published_mix_succeeded(
         accepted = await http.post(mix_url(job))
         assert accepted.status_code == 202
         await asyncio.wait_for(encoding.wait(), 2)
-        job.mix_task.cancel()
+        patched = (await http.patch(f"/api/jobs/{job.job_id}", json={"status": "cancelled"})).json()
         await job.mix_task
         detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
 
+    assert patched["mixStatus"] in {"running", "succeeded"}
     assert detail["mixStatus"] == "succeeded"
     assert detail["result"]["mixedTrack"].endswith(".wav")
     assert "mixedTrack" not in detail["result"].get("playback", {})

@@ -181,15 +181,21 @@ curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/mix?song=0'
   扩展名属于媒体白名单）；绝对 URL 按 `/output/` 之后的部分定位本地文件，与 `/split`、
   `/replace` 处理分轨 URL 的方式一致，不会发起任何请求。
 - 与生成、拆轨、人声替换共享同一并发额度：额度用满返回 429；同一任务已有音频操作在跑返回
-  409。合轨进行中会拒绝该任务的拆轨、替换人声、分轨删除/恢复与替换产物删除/恢复。
+  409。合轨进行中（含试听编码）会拒绝该任务的拆轨、替换人声、分轨删除/恢复与替换产物
+  删除/恢复。试听编码进入并发闸门前可能等待，此时仍占用合轨额度；编码本身最长 120 秒。
+- 合轨阶段依次为 `mixing`（`progress=76`）、`waveform`（`progress=90`）、
+  `preview`（`progress=95`）和 `completed`（`progress=100`）。`preview` 时 WAV 已发布，
+  但 `mixStatus` 仍为 `running`；试听 MP3 就绪或回退处理完成后才发送 SSE `done`。
+  前端应容忍 `stage=preview`；试听失败时 `playback.mixedTrack` 缺失，继续使用 WAV。
 - 入参不合法时返回 400（路径形状/任务 id）、404（输入文件不存在/不可读、歌曲不存在）、
   409（任务未完成、缺音轨、模型已变更、已有音频操作在跑）、429（额度用满）。超时阈值为
   `RVC_MIX_TIMEOUT_SECONDS`（默认 180 秒），也可从 `GET /api/health` 的
   `mixing.timeoutSeconds` 读取；同处还有 `mixing.modelGuardEnforced`，用于判断当前实例的
   模型指纹守卫是否真的生效（缺资产时为 false）。混音本身的失败或超时（含静音输入）不改变 HTTP
   状态：任务级入口已经返回 202，结果通过 `mixStatus=failed` 与 `mixError` 暴露，
-  错误只返回通用文案，细节写日志。`PATCH /api/jobs/<jobId>` 可取消：立即标记
-  `mixStatus=cancelled`，回收 FFmpeg 进程并丢弃半成品后再释放并发额度。
+  错误只返回通用文案，细节写日志。`PATCH /api/jobs/<jobId>` 在 `mixing`/`waveform`
+  阶段取消会标记 `mixStatus=cancelled`、回收 FFmpeg 进程并丢弃半成品；在 `preview`
+  阶段只取消试听编码，已发布的 WAV 保留，任务仍以 `succeeded` 收尾。
 - 波形提取失败不影响成品：成品照常落盘可播放，只是该歌曲没有 `mix` 车道，日志里会记一条
   warning。
 - 输入变了就作废引用，让"是否过期"机器可判定。以下四种情况都会清掉 `mixedTrack` 与该歌曲的

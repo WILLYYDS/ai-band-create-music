@@ -81,6 +81,7 @@ REPLACE_PROGRESS = 90
 # 混音是唯一的长耗时阶段，起手就报一个和拆轨同一量级的进度，
 # 免得运行期的 progress 恒为 null（波形阶段再跳到 WAVEFORM_PROGRESS）。
 MIX_PROGRESS = 76
+MIX_PREVIEW_PROGRESS = 95
 MIX_INPUT_SUFFIXES = frozenset({".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm"})
 # 合轨输入固定是"人声 + 其余分轨"，顺序即滤镜图里的 [0:a]..[3:a]；分轨名单以 stems 为准。
 MIX_VOCAL_STEM = "vocal"
@@ -1487,7 +1488,7 @@ def create_app(
                         raise
                 result.setdefault("playback", {}).pop("mixedTrack", None)
                 job.mix_stage = "preview"
-                job.mix_progress = WAVEFORM_PROGRESS
+                job.mix_progress = MIX_PREVIEW_PROGRESS
                 job.mix_message = "正在生成试听音频"
                 publish()
                 try:
@@ -1496,7 +1497,7 @@ def create_app(
                         result["playback"]["mixedTrack"] = preview
                     job.save(application_settings.output_dir)
                 except (Exception, asyncio.CancelledError):
-                    # The WAV is already published: cancellation can skip only the optional preview.
+                    # WAV 已发布；PATCH 此时只取消试听编码，不改写合轨终态。
                     result["playback"].pop("mixedTrack", None)
                     logger.warning("mix preview skipped job_id=%s", job.job_id, exc_info=True)
                 job.mix_status = "succeeded"
@@ -1711,15 +1712,14 @@ def create_app(
             and job.mix_task is not None
             and not job.mix_task.done()
         ):
-            # FFmpeg is a real child process: mark now, let the task kill and reap it,
-            # then drop the partial output instead of publishing it as a result.
-            job.mix_cancel_requested = True
-            job.mix_status = "cancelled"
-            job.mix_stage = "cancelled"
-            job.mix_progress = None
-            job.mix_message = "合轨已取消"
-            job.mix_error = None
             job.mix_task.cancel()
+            # preview 时 WAV 已发布，只中止编码器；之前的阶段才把取消作为终态。
+            if job.mix_stage in {"mixing", "waveform"}:
+                job.mix_cancel_requested = True
+                job.mix_status = job.mix_stage = "cancelled"
+                job.mix_progress = None
+                job.mix_message = "合轨已取消"
+                job.mix_error = None
             for queue in request.app.state.job_subscribers.get(job_id, ()):
                 if queue.empty():
                     queue.put_nowait(None)
@@ -2347,6 +2347,7 @@ def _render_result_urls(
             output["mixedTrack"] = _public_audio_url(mixed_track, base_url, settings)
         previews = output.get("playback")
         if isinstance(previews, dict):
+
             def valid_preview(source: object, preview: object) -> str | None:
                 if not isinstance(source, str) or not isinstance(preview, str):
                     return None
