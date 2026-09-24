@@ -53,6 +53,7 @@ class GenerateResponse(MusicOutput):
         default=None, exclude_if=lambda value: value is None
     )
     prompt: str
+    title: str | None = None
     durationMinutes: int | float | Literal["auto"]
     structuredPrompt: str
     lyrics: str

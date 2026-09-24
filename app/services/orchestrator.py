@@ -85,6 +85,7 @@ class GenerationOrchestrator:
         capacity_reserved: bool = False,
         provider: str | None = None,
         count: int = 1,
+        title: str | None = None,
     ) -> dict[str, Any]:
         job_id = job_id or f"job_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
         selected_provider = provider or self.settings.music_provider
@@ -127,6 +128,7 @@ class GenerationOrchestrator:
                 user_prompt,
                 effective_duration_minutes,
                 job_id=job_id,
+                title=title,
             )
             structured_prompt = prepared.structured_prompt
             lyrics = prepared.lyrics
@@ -227,6 +229,7 @@ class GenerationOrchestrator:
                 "success": True,
                 "jobId": job_id,
                 "prompt": user_prompt,
+                "title": title or prepared.title,
                 "durationMinutes": duration_minutes if duration_minutes is not None else "auto",
                 "structuredPrompt": structured_prompt,
                 "lyrics": lyrics,

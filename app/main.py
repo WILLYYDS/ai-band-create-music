@@ -516,7 +516,9 @@ def create_app(
                 content={"success": False, "message": str(exc)},
             )
         request_id = request.headers.get("X-Request-ID") or uuid4().hex
-        job = GenerationJob(job_id=f"job_{uuid4().hex}", prompt=prompt)
+        job = GenerationJob(
+            job_id=f"job_{uuid4().hex}", prompt=prompt, title=(payload.title or "").strip() or None
+        )
         job.save(application_settings.output_dir)
         request.app.state.jobs[job.job_id] = job
 
@@ -539,8 +541,10 @@ def create_app(
                 progress=report,
                 provider=payload.provider,
                 count=payload.count,
+                title=job.title,
             )
             job.result = result
+            job.title = result["title"]
             job.status, job.stage, job.progress = "succeeded", "completed", 100
             job.message = "音乐生成完成"
             result["createdAt"] = job.created_at
@@ -665,7 +669,9 @@ def create_app(
                     capacity_reserved=True,
                     provider=payload.provider,
                     count=payload.count,
+                    title=job.title,
                 )
+                job.title = job.result["title"]
                 job.status = "succeeded"
                 job.result["createdAt"] = job.created_at
                 job.stage = "completed"

@@ -20,13 +20,18 @@ class StubPromptExpander:
         duration_minutes: float | None = None,
         *,
         job_id: str | None = None,
+        title: str | None = None,
     ) -> PreparedPrompt:
         duration_seconds = duration_minutes * 60 if duration_minutes is not None else None
         structured_prompt = f"[Genre: Test], [Source: {user_prompt}]"
         if user_prompt.startswith("[歌词与创作内容]"):
             lyrics = user_prompt.split("\n\n[风格要求]", 1)[0].split("\n", 1)[1]
-            return PreparedPrompt(structured_prompt, f"[Verse]\n{lyrics}", duration_seconds)
-        return PreparedPrompt(structured_prompt, "[Verse]\n自动生成的测试歌词", duration_seconds)
+            return PreparedPrompt(
+                structured_prompt, f"[Verse]\n{lyrics}", duration_seconds, title or "测试歌名"
+            )
+        return PreparedPrompt(
+            structured_prompt, "[Verse]\n自动生成的测试歌词", duration_seconds, title or "测试歌名"
+        )
 
 
 class BlockingPromptExpander:
@@ -40,6 +45,7 @@ class BlockingPromptExpander:
         duration_minutes: float | None = None,
         *,
         job_id: str | None = None,
+        title: str | None = None,
     ) -> PreparedPrompt:
         self.started.set()
         await self.release.wait()
@@ -47,6 +53,7 @@ class BlockingPromptExpander:
             "[Genre: Test]",
             "[Verse]\n自动生成的测试歌词",
             duration_minutes * 60 if duration_minutes is not None else None,
+            title or "测试歌名",
         )
 
 

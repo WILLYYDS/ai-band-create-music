@@ -16,6 +16,10 @@ STYLE_TAG_MAX = 8
 STYLE_TAG_KEY_MAX_CHARS = 80
 STYLE_TAG_VALUE_MAX_CHARS = 800
 GENERATED_LYRICS_MAX_CHARS = 1000
+TITLE_REQUIREMENT = (
+    "根据歌词的主题意境拟一个文雅、贴切的简体中文歌名，限 2-10 个汉字，"
+    "不要书名号、引号、标点或风格标签；在 JSON 中增加字符串 title。"
+)
 REQUIRED_STYLE_CATEGORY_ALIASES = (
     ("genre", "style"),
     ("tempo", "rhythm", "meter"),
@@ -105,6 +109,7 @@ class PreparedPrompt:
     structured_prompt: str
     lyrics: str
     duration_seconds: int | None
+    title: str | None = None
 
 
 class PromptExpander(Protocol):
@@ -114,6 +119,7 @@ class PromptExpander(Protocol):
         duration_minutes: float | None = None,
         *,
         job_id: str | None = None,
+        title: str | None = None,
     ) -> PreparedPrompt: ...
 
 
@@ -396,6 +402,7 @@ class OpenAICompatiblePromptExpander:
         duration_minutes: float | None = None,
         *,
         job_id: str | None = None,
+        title: str | None = None,
     ) -> PreparedPrompt:
         if self._settings.llm_api_key is None:
             raise GenerationError("歌词与风格处理失败：缺少 LLM_API_KEY 环境变量。")
@@ -417,7 +424,8 @@ class OpenAICompatiblePromptExpander:
                         GENERATE_LYRICS_AND_STYLE_SYSTEM_PROMPT
                         if generate_lyrics
                         else LYRICS_AND_STYLE_SYSTEM_PROMPT
-                    ),
+                    )
+                    + ("\n" + TITLE_REQUIREMENT if title is None else ""),
                 },
                 {"role": "user", "content": request_content},
             ],
@@ -559,10 +567,20 @@ class OpenAICompatiblePromptExpander:
                     validation_error = music_prompt_validation_error(structured)
                     if validation_error:
                         raise ValueError(validation_error)
+                    generated_title = title
+                    if generated_title is None:
+                        generated_title = prepared.get("title")
+                        if (
+                            not isinstance(generated_title, str)
+                            or not 2 <= len(generated_title.strip()) <= 10
+                        ):
+                            raise ValueError("模型应返回 2-10 字的歌曲标题 title")
+                        generated_title = generated_title.strip()
                     return PreparedPrompt(
                         structured,
                         tagged,
                         round(duration_minutes * 60) if duration_minutes is not None else None,
+                        generated_title,
                     )
                 except (ValueError, KeyError, IndexError, TypeError) as exc:
                     rejection_reason = str(exc)

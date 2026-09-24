@@ -632,7 +632,8 @@ async def test_resplit_invalidates_mix_and_replacement(tmp_path, monkeypatch):
         completed = (await http.get(f"/api/jobs/{job_id}")).json()["result"]
         stashed = dict(app.state.jobs[job_id].deleted_replaced_vocals["0"])
         restored = await http.request(
-            "PUT", "/api/voice/result",
+            "PUT",
+            "/api/voice/result",
             data={"filename": stashed["url"], "job_id": job_id, "song": "0"},
         )
 
@@ -671,3 +672,14 @@ async def test_job_title_is_listed_and_survives_restart(tmp_path):
         history = (await http.get("/api/jobs")).json()["jobs"]
     assert history[0]["title"] == "毕业后的狂响"
     assert load_jobs(settings.output_dir)[job_id].title == "毕业后的狂响"
+
+
+async def test_generated_title_is_listed_and_survives_restart(tmp_path):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    async with client(app) as http:
+        job_id = (await http.post("/api/jobs", json={"prompt": "rock"})).json()["jobId"]
+        await app.state.jobs[job_id].task
+        history = (await http.get("/api/jobs")).json()["jobs"]
+    assert history[0]["title"] == "测试歌名"
+    assert load_jobs(settings.output_dir)[job_id].title == "测试歌名"

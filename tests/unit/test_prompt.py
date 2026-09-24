@@ -252,6 +252,7 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
                                 {
                                     "taggedLyrics": "[Verse]\n第一句\n[Chorus]\n第二句",
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                                    "title": "长街微光",
                                 }
                             )
                         }
@@ -273,6 +274,7 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
 
     assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
     assert prepared.lyrics == "[verse]\n第一句\n[chorus]\n第二句"
+    assert prepared.title == "长街微光"
     assert prepared.duration_seconds is None
     assert len(requests) == 1
     body = json.loads(requests[0].content)
@@ -280,6 +282,56 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
     assert body["max_tokens"] == 2048
     assert body["thinking"] == {"type": "disabled"}
     assert body["response_format"] == {"type": "json_object"}
+    assert "限 2-10 个汉字" in body["messages"][0]["content"]
+
+
+async def test_prepare_keeps_supplied_title_without_requesting_another(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        content = json.dumps(
+            {
+                "taggedLyrics": "[Verse]\n第一句",
+                "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+            }
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
+            "[歌词与创作内容]\n第一句\n\n[风格要求]\n摇滚", title="已有歌名"
+        )
+
+    assert prepared.title == "已有歌名"
+    assert "增加字符串 title" not in json.loads(requests[0].content)["messages"][0]["content"]
+
+
+async def test_prepare_retries_missing_title_in_same_llm_request(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        content = {
+            "taggedLyrics": ONE_MINUTE_LYRICS,
+            "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+        }
+        if len(requests) == 2:
+            content["title"] = "长街微光"
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": json.dumps(content)}}]}
+        )
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
+            "[风格要求]\n摇滚"
+        )
+
+    assert prepared.title == "长街微光"
+    assert len(requests) == 2
+    assert "歌曲标题 title" in json.loads(requests[1].content)["messages"][-1]["content"]
 
 
 @pytest.mark.parametrize(
@@ -310,7 +362,11 @@ async def test_prepare_normalizes_known_user_labels_without_changing_unknown_one
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         content = json.dumps(
-            {"taggedLyrics": tagged, "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT},
+            {
+                "taggedLyrics": tagged,
+                "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                "title": "长街微光",
+            },
             ensure_ascii=False,
         )
         return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
@@ -339,6 +395,7 @@ async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> 
                                 {
                                     "taggedLyrics": ONE_MINUTE_LYRICS,
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                                    "title": "长街微光",
                                 }
                             )
                         }
@@ -371,6 +428,7 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
                                 {
                                     "taggedLyrics": generated_lyrics(12),
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                                    "title": "长街微光",
                                 }
                             )
                         }
@@ -429,6 +487,7 @@ async def test_prepare_retries_generated_lyrics_with_custom_stage_directions(
                                 {
                                     "taggedLyrics": lyrics,
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                                    "title": "长街微光",
                                 }
                             )
                         }
@@ -450,6 +509,7 @@ async def test_prepare_extracts_json_surrounded_by_commentary(tmp_path: Path) ->
         {
             "taggedLyrics": ONE_MINUTE_LYRICS,
             "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+            "title": "长街微光",
         },
         ensure_ascii=False,
     )
@@ -487,6 +547,7 @@ async def test_prepare_retries_once_after_invalid_json(tmp_path: Path) -> None:
                 {
                     "taggedLyrics": ONE_MINUTE_LYRICS,
                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                    "title": "长街微光",
                 },
                 ensure_ascii=False,
             )
@@ -516,6 +577,7 @@ async def test_prepare_retry_skips_empty_assistant_message(tmp_path: Path) -> No
                 {
                     "taggedLyrics": ONE_MINUTE_LYRICS,
                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                    "title": "长街微光",
                 },
                 ensure_ascii=False,
             )
@@ -565,6 +627,7 @@ async def test_prepare_retries_concise_style_and_adds_missing_verse_tag(tmp_path
                             "content": json.dumps(
                                 {
                                     "lyrics": ONE_MINUTE_LYRICS.removeprefix("[verse]\n"),
+                                    "title": "长街微光",
                                     "style": (
                                         "[Genre: Rock]"
                                         if len(requests) == 1
@@ -599,7 +662,8 @@ async def test_prepare_retry_reports_missing_style_category(tmp_path: Path) -> N
         requests.append(request)
         style_tags = missing_negative if len(requests) == 1 else EXPANDED_MANDARIN_ROCK_PROMPT
         content = json.dumps(
-            {"taggedLyrics": ONE_MINUTE_LYRICS, "styleTags": style_tags}, ensure_ascii=False
+            {"taggedLyrics": ONE_MINUTE_LYRICS, "styleTags": style_tags, "title": "长街微光"},
+            ensure_ascii=False,
         )
         return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
@@ -619,7 +683,11 @@ async def test_prepare_retries_generated_lyrics_over_character_budget(tmp_path: 
         requests.append(request)
         lyrics = "[Verse]\n" + ("唱" * 1001) if len(requests) == 1 else ONE_MINUTE_LYRICS
         content = json.dumps(
-            {"taggedLyrics": lyrics, "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT},
+            {
+                "taggedLyrics": lyrics,
+                "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                "title": "长街微光",
+            },
             ensure_ascii=False,
         )
         return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
@@ -654,6 +722,7 @@ async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(
                                 {
                                     "taggedLyrics": "[Verse]\n被模型改写的歌词",
                                     "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                                    "title": "长街微光",
                                 }
                             )
                         }
@@ -689,6 +758,7 @@ async def test_prepare_accepts_style_tags_as_json_array(tmp_path: Path) -> None:
                             "content": json.dumps(
                                 {
                                     "taggedLyrics": "[Verse]\n第一句\n第二句",
+                                    "title": "长街微光",
                                     "styleTags": [
                                         tag if tag.startswith("[") else f"[{tag}" for tag in tags
                                     ],
@@ -723,7 +793,9 @@ async def test_prepare_accepts_unbracketed_style_tag_array(tmp_path: Path) -> No
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        content = json.dumps({"taggedLyrics": "[Verse]\n第一句\n第二句", "styleTags": tags})
+        content = json.dumps(
+            {"taggedLyrics": "[Verse]\n第一句\n第二句", "styleTags": tags, "title": "长街微光"}
+        )
         return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
     settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
