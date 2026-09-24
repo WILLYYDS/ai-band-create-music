@@ -517,17 +517,27 @@ def create_app(
             )
         request_id = request.headers.get("X-Request-ID") or uuid4().hex
         job = GenerationJob(
-            job_id=f"job_{uuid4().hex}", prompt=prompt, title=(payload.title or "").strip() or None
+            job_id=f"job_{uuid4().hex}", prompt=prompt, title=payload.title
         )
         job.save(application_settings.output_dir)
         request.app.state.jobs[job.job_id] = job
 
-        async def report(stage, progress, message, structured, lyrics, step, total, title):
+        async def report(
+            stage,
+            progress,
+            message,
+            *,
+            structured_prompt=None,
+            lyrics=None,
+            step=None,
+            total_steps=None,
+            title=None,
+        ):
             job.status = "running"
             job.stage, job.progress, job.message = stage, progress, message
-            job.step, job.total_steps = step, total
-            if structured is not None:
-                job.structured_prompt = structured
+            job.step, job.total_steps = step, total_steps
+            if structured_prompt is not None:
+                job.structured_prompt = structured_prompt
             if lyrics is not None:
                 job.lyrics = lyrics
             if title is not None:
@@ -615,7 +625,7 @@ def create_app(
         job = GenerationJob(
             job_id=job_id,
             prompt=prompt,
-            title=(payload.title or "").strip() or None,
+            title=payload.title,
         )
 
         def publish() -> None:
@@ -639,8 +649,9 @@ def create_app(
             stage: str,
             progress: int | None,
             message: str,
-            structured_prompt: str | None,
-            lyrics: str | None,
+            *,
+            structured_prompt: str | None = None,
+            lyrics: str | None = None,
             step: int | None = None,
             total_steps: int | None = None,
             title: str | None = None,

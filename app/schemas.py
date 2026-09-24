@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class GenerateRequest(BaseModel):
@@ -16,6 +16,11 @@ class GenerateRequest(BaseModel):
     title: str | None = Field(default=None, max_length=100)
     provider: Literal["minimax_music", "elevenlabs_music"] | None = None
     count: Literal[1, 2] = 1
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
 
 
 class ErrorResponse(BaseModel):

@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 from app.core.config import Settings
@@ -20,10 +20,21 @@ from app.services.stems import StemSeparator
 from app.services.waveforms import extract_waveforms
 
 logger = logging.getLogger(__name__)
-ProgressCallback = Callable[
-    [str, int | None, str, str | None, str | None, int | None, int | None, str | None],
-    Awaitable[None],
-]
+
+
+class ProgressCallback(Protocol):
+    async def __call__(
+        self,
+        stage: str,
+        progress: int | None,
+        message: str,
+        *,
+        structured_prompt: str | None = None,
+        lyrics: str | None = None,
+        step: int | None = None,
+        total_steps: int | None = None,
+        title: str | None = None,
+    ) -> None: ...
 
 
 class GenerationCapacity:
@@ -99,6 +110,7 @@ class GenerationOrchestrator:
             stage: str,
             value: int | None,
             message: str,
+            *,
             structured_prompt: str | None = None,
             lyrics: str | None = None,
             step: int | None = None,
@@ -107,7 +119,14 @@ class GenerationOrchestrator:
         ) -> None:
             if progress is not None:
                 await progress(
-                    stage, value, message, structured_prompt, lyrics, step, total_steps, title
+                    stage,
+                    value,
+                    message,
+                    structured_prompt=structured_prompt,
+                    lyrics=lyrics,
+                    step=step,
+                    total_steps=total_steps,
+                    title=title,
                 )
 
         async def execute() -> dict[str, Any]:
@@ -134,6 +153,7 @@ class GenerationOrchestrator:
                 job_id=job_id,
                 title=title,
             )
+            song_title = title or prepared.title
             structured_prompt = prepared.structured_prompt
             lyrics = prepared.lyrics
             duration_seconds = prepared.duration_seconds
@@ -177,9 +197,9 @@ class GenerationOrchestrator:
                     "generating_music",
                     None,
                     f"音乐模型正在生成第 {song_number}/{effective_count} 首",
-                    structured_prompt,
-                    lyrics,
-                    title=title or prepared.title,
+                    structured_prompt=structured_prompt,
+                    lyrics=lyrics,
+                    title=song_title,
                 )
 
                 async def provider_progress(
@@ -234,7 +254,7 @@ class GenerationOrchestrator:
                 "success": True,
                 "jobId": job_id,
                 "prompt": user_prompt,
-                "title": title or prepared.title,
+                "title": song_title,
                 "durationMinutes": duration_minutes if duration_minutes is not None else "auto",
                 "structuredPrompt": structured_prompt,
                 "lyrics": lyrics,

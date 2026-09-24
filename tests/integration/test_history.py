@@ -7,6 +7,7 @@ from starlette.requests import Request
 
 from app.core.errors import CapacityExceededError
 from app.main import GenerationJob, create_app, load_jobs
+from app.services.prompt import PreparedPrompt
 from tests.helpers import make_orchestrator, make_settings
 
 
@@ -723,8 +724,26 @@ async def test_generated_title_is_listed_and_survives_restart(tmp_path):
     settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
     async with client(app) as http:
-        job_id = (await http.post("/api/jobs", json={"prompt": "rock"})).json()["jobId"]
+        job_id = (
+            await http.post("/api/jobs", json={"prompt": "rock", "title": "   "})
+        ).json()["jobId"]
         await app.state.jobs[job_id].task
         history = (await http.get("/api/jobs")).json()["jobs"]
     assert history[0]["title"] == "测试歌名"
     assert load_jobs(settings.output_dir)[job_id].title == "测试歌名"
+
+
+async def test_job_succeeds_when_expander_has_no_valid_title(tmp_path):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    orchestrator.prompt_expander.prepare = AsyncMock(
+        return_value=PreparedPrompt("[Genre: Test]", "[Verse]\n测试歌词", None)
+    )
+    app = create_app(settings, orchestrator)
+    async with client(app) as http:
+        job_id = (await http.post("/api/jobs", json={"prompt": "rock"})).json()["jobId"]
+        await app.state.jobs[job_id].task
+        job = (await http.get(f"/api/jobs/{job_id}")).json()
+    assert job["status"] == "succeeded"
+    assert job["title"] is None
+    assert load_jobs(settings.output_dir)[job_id].title is None

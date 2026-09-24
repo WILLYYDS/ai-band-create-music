@@ -308,8 +308,11 @@ async def test_prepare_keeps_supplied_title_without_requesting_another(tmp_path:
     assert "增加字符串 title" not in json.loads(requests[0].content)["messages"][0]["content"]
 
 
-@pytest.mark.parametrize("invalid_title", [None, "《长街微光》", "Rock", "长街 微光", "春" * 11])
-async def test_prepare_retries_invalid_title_in_same_llm_request(
+@pytest.mark.parametrize(
+    "invalid_title",
+    [None, "《长街微光》", "长街·微光", "Rock", "长街 微光", "二〇二六", "㐀春", "春" * 11],
+)
+async def test_prepare_ignores_invalid_title_without_retry(
     tmp_path: Path, invalid_title: str | None
 ) -> None:
     requests: list[httpx.Request] = []
@@ -320,10 +323,8 @@ async def test_prepare_retries_invalid_title_in_same_llm_request(
             "taggedLyrics": ONE_MINUTE_LYRICS,
             "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
         }
-        if len(requests) == 1 and invalid_title is not None:
+        if invalid_title is not None:
             content["title"] = invalid_title
-        elif len(requests) == 2:
-            content["title"] = "长街微光"
         return httpx.Response(
             200, json={"choices": [{"message": {"content": json.dumps(content)}}]}
         )
@@ -334,9 +335,39 @@ async def test_prepare_retries_invalid_title_in_same_llm_request(
             "[风格要求]\n摇滚"
         )
 
-    assert prepared.title == "长街微光"
+    assert prepared.title is None
+    assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
+    assert len(requests) == 1
+
+
+async def test_prepare_succeeds_after_core_retry_even_if_both_titles_are_invalid(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        content = {
+            "taggedLyrics": ONE_MINUTE_LYRICS,
+            "styleTags": (
+                "[Genre: Rock]" if len(requests) == 1 else EXPANDED_MANDARIN_ROCK_PROMPT
+            ),
+            "title": "《长街微光》" if len(requests) == 1 else "Midnight Drive",
+        }
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": json.dumps(content)}}]}
+        )
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
+            "[风格要求]\n摇滚"
+        )
+
     assert len(requests) == 2
-    assert "不含标点的汉字标题 title" in json.loads(requests[1].content)["messages"][-1]["content"]
+    assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
+    assert prepared.lyrics == ONE_MINUTE_LYRICS
+    assert prepared.title is None
 
 
 @pytest.mark.parametrize(

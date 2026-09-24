@@ -16,8 +16,14 @@ STYLE_TAG_MAX = 8
 STYLE_TAG_KEY_MAX_CHARS = 80
 STYLE_TAG_VALUE_MAX_CHARS = 800
 GENERATED_LYRICS_MAX_CHARS = 1000
+GENERATED_TITLE_MIN_CHARS = 2
+GENERATED_TITLE_MAX_CHARS = 10
+GENERATED_TITLE_PATTERN = re.compile(
+    rf"[\u4e00-\u9fff]{{{GENERATED_TITLE_MIN_CHARS},{GENERATED_TITLE_MAX_CHARS}}}"
+)
 TITLE_REQUIREMENT = (
-    "根据歌词的主题意境拟一个文雅、贴切的简体中文歌名，限 2-10 个汉字，"
+    f"根据歌词的主题意境拟一个文雅、贴切的简体中文歌名，"
+    f"限 {GENERATED_TITLE_MIN_CHARS}-{GENERATED_TITLE_MAX_CHARS} 个汉字，"
     "不要书名号、引号、标点或风格标签；在 JSON 中增加字符串 title。"
 )
 REQUIRED_STYLE_CATEGORY_ALIASES = (
@@ -569,12 +575,11 @@ class OpenAICompatiblePromptExpander:
                         raise ValueError(validation_error)
                     generated_title = title
                     if generated_title is None:
-                        generated_title = prepared.get("title")
-                        if not isinstance(generated_title, str) or not re.fullmatch(
-                            r"[\u4e00-\u9fff]{2,10}", generated_title.strip()
-                        ):
-                            raise ValueError("模型应返回 2-10 个不含标点的汉字标题 title")
-                        generated_title = generated_title.strip()
+                        candidate = prepared.get("title")
+                        candidate = candidate.strip() if isinstance(candidate, str) else ""
+                        generated_title = (
+                            candidate if GENERATED_TITLE_PATTERN.fullmatch(candidate) else None
+                        )
                     return PreparedPrompt(
                         structured,
                         tagged,
