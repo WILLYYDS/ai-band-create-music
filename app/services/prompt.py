@@ -570,11 +570,10 @@ class OpenAICompatiblePromptExpander:
                     generated_title = title
                     if generated_title is None:
                         generated_title = prepared.get("title")
-                        if (
-                            not isinstance(generated_title, str)
-                            or not 2 <= len(generated_title.strip()) <= 10
+                        if not isinstance(generated_title, str) or not re.fullmatch(
+                            r"[\u4e00-\u9fff]{2,10}", generated_title.strip()
                         ):
-                            raise ValueError("模型应返回 2-10 字的歌曲标题 title")
+                            raise ValueError("模型应返回 2-10 个不含标点的汉字标题 title")
                         generated_title = generated_title.strip()
                     return PreparedPrompt(
                         structured,

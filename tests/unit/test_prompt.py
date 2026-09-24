@@ -308,7 +308,10 @@ async def test_prepare_keeps_supplied_title_without_requesting_another(tmp_path:
     assert "增加字符串 title" not in json.loads(requests[0].content)["messages"][0]["content"]
 
 
-async def test_prepare_retries_missing_title_in_same_llm_request(tmp_path: Path) -> None:
+@pytest.mark.parametrize("invalid_title", [None, "《长街微光》", "Rock", "长街 微光", "春" * 11])
+async def test_prepare_retries_invalid_title_in_same_llm_request(
+    tmp_path: Path, invalid_title: str | None
+) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -317,7 +320,9 @@ async def test_prepare_retries_missing_title_in_same_llm_request(tmp_path: Path)
             "taggedLyrics": ONE_MINUTE_LYRICS,
             "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
         }
-        if len(requests) == 2:
+        if len(requests) == 1 and invalid_title is not None:
+            content["title"] = invalid_title
+        elif len(requests) == 2:
             content["title"] = "长街微光"
         return httpx.Response(
             200, json={"choices": [{"message": {"content": json.dumps(content)}}]}
@@ -331,7 +336,7 @@ async def test_prepare_retries_missing_title_in_same_llm_request(tmp_path: Path)
 
     assert prepared.title == "长街微光"
     assert len(requests) == 2
-    assert "歌曲标题 title" in json.loads(requests[1].content)["messages"][-1]["content"]
+    assert "不含标点的汉字标题 title" in json.loads(requests[1].content)["messages"][-1]["content"]
 
 
 @pytest.mark.parametrize(

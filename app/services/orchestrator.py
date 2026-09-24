@@ -21,7 +21,8 @@ from app.services.waveforms import extract_waveforms
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[
-    [str, int | None, str, str | None, str | None, int | None, int | None], Awaitable[None]
+    [str, int | None, str, str | None, str | None, int | None, int | None, str | None],
+    Awaitable[None],
 ]
 
 
@@ -102,9 +103,12 @@ class GenerationOrchestrator:
             lyrics: str | None = None,
             step: int | None = None,
             total_steps: int | None = None,
+            title: str | None = None,
         ) -> None:
             if progress is not None:
-                await progress(stage, value, message, structured_prompt, lyrics, step, total_steps)
+                await progress(
+                    stage, value, message, structured_prompt, lyrics, step, total_steps, title
+                )
 
         async def execute() -> dict[str, Any]:
             update_job_diagnostics(
@@ -175,6 +179,7 @@ class GenerationOrchestrator:
                     f"音乐模型正在生成第 {song_number}/{effective_count} 首",
                     structured_prompt,
                     lyrics,
+                    title=title or prepared.title,
                 )
 
                 async def provider_progress(

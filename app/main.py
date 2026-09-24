@@ -522,7 +522,7 @@ def create_app(
         job.save(application_settings.output_dir)
         request.app.state.jobs[job.job_id] = job
 
-        async def report(stage, progress, message, structured, lyrics, step, total):
+        async def report(stage, progress, message, structured, lyrics, step, total, title):
             job.status = "running"
             job.stage, job.progress, job.message = stage, progress, message
             job.step, job.total_steps = step, total
@@ -530,6 +530,8 @@ def create_app(
                 job.structured_prompt = structured
             if lyrics is not None:
                 job.lyrics = lyrics
+            if title is not None:
+                job.title = title
             job.save(application_settings.output_dir)
 
         try:
@@ -544,7 +546,6 @@ def create_app(
                 title=job.title,
             )
             job.result = result
-            job.title = result["title"]
             job.status, job.stage, job.progress = "succeeded", "completed", 100
             job.message = "音乐生成完成"
             result["createdAt"] = job.created_at
@@ -642,6 +643,7 @@ def create_app(
             lyrics: str | None,
             step: int | None = None,
             total_steps: int | None = None,
+            title: str | None = None,
         ) -> None:
             job.status = "running"
             job.stage = stage
@@ -653,6 +655,8 @@ def create_app(
                 job.structured_prompt = structured_prompt
             if lyrics is not None:
                 job.lyrics = lyrics
+            if title is not None:
+                job.title = title
             save_and_publish()
 
         async def execute() -> None:
@@ -671,7 +675,6 @@ def create_app(
                     count=payload.count,
                     title=job.title,
                 )
-                job.title = job.result["title"]
                 job.status = "succeeded"
                 job.result["createdAt"] = job.created_at
                 job.stage = "completed"
