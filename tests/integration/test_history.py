@@ -7,6 +7,7 @@ from starlette.requests import Request
 
 from app.core.errors import CapacityExceededError
 from app.main import GenerationJob, create_app, load_jobs
+from app.services.prompt import PreparedPrompt
 from tests.helpers import make_orchestrator, make_settings
 
 
@@ -477,9 +478,54 @@ async def test_job_forwards_actual_provider_counts(tmp_path):
             90,
             None,
         )
+        assert row["title"] == "测试歌名"
+        assert (await http.get("/api/jobs")).json()["jobs"][0]["title"] == "测试歌名"
+        assert load_jobs(settings.output_dir)[job_id].title == "测试歌名"
+        endpoint = next(
+            route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
+        )
+        events = await endpoint(job_id, events_request(app, f"/api/jobs/{job_id}/events"))
+        frame = await anext(events.body_iterator)
+        assert json.loads(frame.removeprefix("data: "))["title"] == "测试歌名"
+        await events.body_iterator.aclose()
         release.set()
         await app.state.jobs[job_id].task
         assert load_jobs(settings.output_dir)[job_id].status == "succeeded"
+
+
+async def test_generated_title_survives_music_failure(tmp_path):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    orchestrator.music_provider.generate = AsyncMock(side_effect=RuntimeError("provider died"))
+    app = create_app(settings, orchestrator)
+    async with client(app) as http:
+        job_id = (await http.post("/api/jobs", json={"prompt": "rock"})).json()["jobId"]
+        await app.state.jobs[job_id].task
+        row = (await http.get(f"/api/jobs/{job_id}")).json()
+    assert row["status"] == "failed"
+    assert row["title"] == "测试歌名"
+    assert load_jobs(settings.output_dir)[job_id].title == "测试歌名"
+
+
+async def test_generated_title_survives_music_cancellation(tmp_path):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    reached = asyncio.Event()
+
+    async def generate(*args, **kwargs):
+        reached.set()
+        await asyncio.Event().wait()
+
+    orchestrator.music_provider.generate = generate
+    app = create_app(settings, orchestrator)
+    async with client(app) as http:
+        job_id = (await http.post("/api/jobs", json={"prompt": "rock"})).json()["jobId"]
+        await asyncio.wait_for(reached.wait(), 2)
+        cancelled = await http.patch(f"/api/jobs/{job_id}", json={"status": "cancelled"})
+        await app.state.jobs[job_id].task
+    assert cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["title"] == "测试歌名"
+    assert load_jobs(settings.output_dir)[job_id].title == "测试歌名"
 
 
 async def test_history_preserves_failed_jobs_and_events_send_done(tmp_path):
@@ -632,7 +678,8 @@ async def test_resplit_invalidates_mix_and_replacement(tmp_path, monkeypatch):
         completed = (await http.get(f"/api/jobs/{job_id}")).json()["result"]
         stashed = dict(app.state.jobs[job_id].deleted_replaced_vocals["0"])
         restored = await http.request(
-            "PUT", "/api/voice/result",
+            "PUT",
+            "/api/voice/result",
             data={"filename": stashed["url"], "job_id": job_id, "song": "0"},
         )
 
@@ -671,3 +718,32 @@ async def test_job_title_is_listed_and_survives_restart(tmp_path):
         history = (await http.get("/api/jobs")).json()["jobs"]
     assert history[0]["title"] == "毕业后的狂响"
     assert load_jobs(settings.output_dir)[job_id].title == "毕业后的狂响"
+
+
+async def test_generated_title_is_listed_and_survives_restart(tmp_path):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    async with client(app) as http:
+        job_id = (
+            await http.post("/api/jobs", json={"prompt": "rock", "title": "   "})
+        ).json()["jobId"]
+        await app.state.jobs[job_id].task
+        history = (await http.get("/api/jobs")).json()["jobs"]
+    assert history[0]["title"] == "测试歌名"
+    assert load_jobs(settings.output_dir)[job_id].title == "测试歌名"
+
+
+async def test_job_succeeds_when_expander_has_no_valid_title(tmp_path):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    orchestrator.prompt_expander.prepare = AsyncMock(
+        return_value=PreparedPrompt("[Genre: Test]", "[Verse]\n测试歌词", None)
+    )
+    app = create_app(settings, orchestrator)
+    async with client(app) as http:
+        job_id = (await http.post("/api/jobs", json={"prompt": "rock"})).json()["jobId"]
+        await app.state.jobs[job_id].task
+        job = (await http.get(f"/api/jobs/{job_id}")).json()
+    assert job["status"] == "succeeded"
+    assert job["title"] is None
+    assert load_jobs(settings.output_dir)[job_id].title is None

@@ -109,6 +109,7 @@ async def test_generate_returns_full_track_without_splitting(tmp_path: Path) -> 
         )
         assert response.status_code == 200
         body = response.json()
+        assert body["title"] == "测试歌名"
         assert body["durationMinutes"] == 3
         assert body["requestedDurationSeconds"] == 180
         assert body["debug"]["music"]["durationSeconds"] == 180
