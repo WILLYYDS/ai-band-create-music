@@ -1486,10 +1486,9 @@ def create_app(
                             )
                         raise
                 result.setdefault("playback", {}).pop("mixedTrack", None)
-                job.mix_status = "succeeded"
-                job.mix_stage = "completed"
-                job.mix_progress = 100
-                job.mix_message = "合轨完成"
+                job.mix_stage = "preview"
+                job.mix_progress = WAVEFORM_PROGRESS
+                job.mix_message = "正在生成试听音频"
                 publish()
                 try:
                     preview = await make_playback_mp3(result_path, application_settings.output_dir)
@@ -1500,6 +1499,10 @@ def create_app(
                     # The WAV is already published: cancellation can skip only the optional preview.
                     result["playback"].pop("mixedTrack", None)
                     logger.warning("mix preview skipped job_id=%s", job.job_id, exc_info=True)
+                job.mix_status = "succeeded"
+                job.mix_stage = "completed"
+                job.mix_progress = 100
+                job.mix_message = "合轨完成"
                 if not fresh_waveforms:
                     # 波形只是编辑器的绘制数据，提取失败不影响已经落盘的成品。
                     logger.warning(
