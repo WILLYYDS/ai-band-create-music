@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     port: int = Field(default=8010, ge=1, le=65535)
     public_base_url: str = ""
     output_dir: Path = PROJECT_ROOT / "output"
+    song_retention_enabled: bool = False
+    song_retention_dry_run: bool = True
+    song_retention_days: int = Field(default=3, ge=1)
 
     prompt_max_chars: int = Field(default=2000, ge=100, le=20_000)
     request_max_bytes: int = Field(default=16_384, ge=1024, le=1_048_576)

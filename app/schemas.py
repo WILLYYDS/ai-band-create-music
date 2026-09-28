@@ -82,6 +82,11 @@ class UpdateGenerationJobRequest(BaseModel):
 class GenerationJobResponse(BaseModel):
     jobId: str
     createdAt: str
+    expiresAt: str | None = None
+    retentionState: Literal[
+        "disabled", "dry_run", "unmanaged", "retained", "expired_active", "expired"
+    ] = "disabled"
+    audioAvailable: bool = False
     title: str | None = None
     prompt: str
     structuredPrompt: str | None = None

@@ -85,6 +85,43 @@ docker compose build --pull
 docker compose up -d
 ```
 
+### 安全启用歌曲保留策略
+
+`output` 树内（含 `jobs`、`.expired`、`.trash`）不支持符号链接：保留清理拒绝沿链接操作，
+跨出 `output` 的音频路径返回 404。多卷部署请直接挂载到 `OUTPUT_DIR` 或真实子目录。
+启动时后台检查 `jobs`/`.expired`，不支持的布局会记录 WARNING `unsupported_layout`，
+health 中 `unsupportedLayout=true` 并列出相对目录名 `unsupportedLayoutDirectories`。
+启用前确认该标志为 `false`；`null` 表示检查尚未完成或无法确认。修复后等待下一次清单刷新。
+
+**正式启用后，第一次启动会永久删除所有超过 `SONG_RETENTION_DAYS`（默认 3 天）的既有历史、
+歌曲与回收区内容；策略追溯旧任务，无法恢复。** `output/` 可能是唯一副本，先备份：
+
+```bash
+tar -czf ai-band-output-before-retention.tar.gz output
+```
+
+先在 `.env` 设置 `SONG_RETENTION_ENABLED=true`，保持默认的 `SONG_RETENTION_DRY_RUN=true`，
+重建/重启服务。dry-run 不删除、不移动文件，也不限制历史访问。检查
+`output/logs/retention.log` 中的 `wouldDeleteJobIds` 和跳过原因，以及 `/api/health` 的
+`retention.orphanJobIds`、`pendingDeletionJobIds`、`expiredActiveJobIds`。日志不可写时检查应用日志。
+确认备份与删除范围后，再设置 `SONG_RETENTION_DRY_RUN=false` 并重启，执行正式清理。
+关闭开关会停止删除，但 `.expired` 残留仍列在 health/启动日志中，重新正式启用后会重试。
+
+health 的清单来自后台快照（启动、每小时及清理后刷新），先确认 `inventoryUpdatedAt` 非空、
+`inventoryStale=false` 且 `inventoryError=null`，并核对快照时间。`inventoryAttemptedAt` 只表示
+尝试时间；失败不会推进成功时间，失败类别保留旧数据（或首次扫描时计数为 `null`），
+对应的 `*Stale=true`。不能把旧计数为 0 当作本次已确认无残留。
+每类最多展示 20 个 id；`Count` 为总数，`Truncated=true` 表示汇总并不完整。审查全部删除范围
+时查看逐任务 `job_would_delete` 日志。`unmanagedJobs` 给出元数据异常原因，修复后需重启重新加载。
+
+另核对 `lastCleanupAt/Reason/Result/Error`；它们反映最近一轮清理的结束时间、触发原因、
+结果和脱敏错误，与清单扫描状态独立。`cleanupRunning=false` 和 `remainingJobs=0` 不代表清理成功。
+dry-run 的 `lastCleanupResult=success` 只表示审计完成，未执行删除；同时核对 `dryRun` 和
+`deletedJobIds/wouldDeleteJobIds`。只有正式模式才能实际删除文件。
+日志的 `cleanup_failed` 带 `stage`（`pendingDeletionScan` 或 `run`），`cleanup_finished` 带
+`result/error/pendingDeletionScanFailed`。暂存区扫描失败仍尝试处理已知过期任务；若暂存区
+损坏或不可写，逐任务失败会列入 `failedJobIds`，修复后再重试，不能视为空批次。
+
 ## 5. 离线服务器打包镜像
 
 在可联网、CPU 架构与目标服务器一致的机器上构建：
