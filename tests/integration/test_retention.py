@@ -106,6 +106,95 @@ async def test_cleanup_logging_busy_tasks_and_retry_after_restart(tmp_path, capl
     assert records[-1]["deletedJobIds"] == ["busy", "old"]
 
 
+@pytest.mark.parametrize("failure", ["jobs", ".trash", "target_symlink", "target_conflict"])
+async def test_staging_validates_all_paths_before_creating_or_moving(tmp_path, caplog, failure):
+    settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
+    app = create_app(settings, make_orchestrator(settings))
+    add_job(app, "victim", (datetime.now(timezone.utc) - timedelta(days=5)).isoformat())
+    root = settings.output_dir
+    pending = root / ".expired/victim"
+    if failure in {"jobs", ".trash"}:
+        outside = tmp_path / "outside"
+        (root / failure).rename(outside)
+        (root / failure).symlink_to(outside, target_is_directory=True)
+    else:
+        pending.mkdir(parents=True)
+        if failure == "target_symlink":
+            outside = tmp_path / "outside"
+            outside.mkdir()
+            (pending / "trash").symlink_to(outside, target_is_directory=True)
+        else:
+            (pending / "trash").mkdir()
+        (pending / "trash/keep.mp3").write_bytes(b"keep")
+    caplog.set_level(logging.INFO, logger="app.services.retention")
+    await cleanup_expired_jobs(app, reason="test")
+    assert (root / "jobs/victim/song_1/full.mp3").read_bytes() == b"audio"
+    assert (root / ".trash/victim/song_1/vocal.wav").read_bytes() == b"deleted audio"
+    assert "victim" in app.state.jobs and not (pending / "job").exists()
+    if failure in {"jobs", ".trash"}:
+        assert not pending.exists()
+    else:
+        assert (pending / "trash/keep.mp3").read_bytes() == b"keep"
+    assert json.loads(caplog.records[-1].message)["failedJobIds"] == ["victim"]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("invalid_timestamp", [False, True])
+async def test_pending_entry_cannot_expire_loaded_job_after_policy_change(
+    tmp_path, caplog, dry_run, invalid_timestamp
+):
+    settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=dry_run)
+    app = create_app(settings, make_orchestrator(settings))
+    now = datetime.now(timezone.utc)
+    created_at = "invalid" if invalid_timestamp else (now - timedelta(days=5)).isoformat()
+    add_job(app, "victim", created_at)
+    pending = settings.output_dir / ".expired/victim"
+    pending.mkdir(parents=True)  # Simulate an empty staging directory from the old implementation.
+    settings.song_retention_days = 7
+    restarted = create_app(settings, make_orchestrator(settings))
+    caplog.set_level(logging.INFO, logger="app.services.retention")
+    await cleanup_expired_jobs(restarted, reason="restart", now=now)
+    assert "victim" in restarted.state.jobs
+    assert (settings.output_dir / "jobs/victim/song_1/full.mp3").read_bytes() == b"audio"
+    assert (settings.output_dir / ".trash/victim/song_1/vocal.wav").is_file()
+    summary = json.loads(caplog.records[-1].message)
+    assert summary["deletedJobIds"] == summary["wouldDeleteJobIds"] == []
+    assert summary["skippedCount"] == 1
+    expected_reason = "invalid_created_at" if invalid_timestamp else "not_expired"
+    assert any(
+        json.loads(record.message).get("reason") == expected_reason for record in caplog.records
+    )
+
+
+async def test_partial_staging_retry_survives_longer_policy_after_restart(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
+    app = create_app(settings, make_orchestrator(settings))
+    now = datetime.now(timezone.utc)
+    add_job(app, "victim", (now - timedelta(days=5)).isoformat())
+    root = settings.output_dir
+    original_rename = Path.rename
+
+    def fail_trash_move(path, target):
+        if path == root / ".trash/victim":
+            raise PermissionError("cannot move trash")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_trash_move)
+    await cleanup_expired_jobs(app, reason="test", now=now)
+    assert not (root / "jobs/victim").exists()
+    assert (root / ".expired/victim/job/job.json").is_file()
+    assert (root / ".trash/victim").is_dir()
+    monkeypatch.undo()
+    settings.song_retention_days = 7
+    restarted = create_app(settings, make_orchestrator(settings))
+    assert "victim" not in restarted.state.jobs
+    await cleanup_expired_jobs(restarted, reason="restart", now=now)
+    assert not (root / ".expired/victim").exists()
+    assert not (root / ".trash/victim").exists()
+
+
 async def test_expired_access_cache_lifecycle_and_persistent_audit(tmp_path):
     settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
     app = create_app(settings, make_orchestrator(settings))

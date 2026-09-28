@@ -265,13 +265,16 @@ def _stage_job(root: Path, job_id: str) -> Path:
     # Reuse the existing job id validation before constructing deletion paths.
     job_song_dir(root, job_id)
     pending = _safe_path(root, ".expired", job_id)
+    moves = [
+        (_safe_path(root, directory, job_id), _safe_path(root, ".expired", job_id, name))
+        for directory, name in (("jobs", "job"), (".trash", "trash"))
+    ]
+    for source, target in moves:
+        if source.exists() and target.exists():
+            raise ValueError(f"Cleanup destination already exists: {target}")
     pending.mkdir(parents=True, exist_ok=True)
-    for directory, name in (("jobs", "job"), (".trash", "trash")):
-        source = _safe_path(root, directory, job_id)
-        target = _safe_path(root, ".expired", job_id, name)
+    for source, target in moves:
         if source.exists():
-            if target.exists():
-                raise ValueError(f"Cleanup destination already exists: {target}")
             source.rename(target)
     return pending
 
@@ -300,6 +303,7 @@ async def cleanup_expired_jobs(application, *, reason: str, now: datetime | None
             _audit("cleanup_failed", stage="pendingDeletionScan", error=str(exc))
         for job_id, job in list(application.state.jobs.items()):
             if expires_at(job, settings.song_retention_days) is None:
+                candidates.discard(job_id)
                 skipped.append(job_id)
                 _audit("job_skipped", jobId=job_id, reason="invalid_created_at")
             elif is_expired(job, settings.song_retention_days, now):
@@ -311,6 +315,10 @@ async def cleanup_expired_jobs(application, *, reason: str, now: datetime | None
             if job is not None and is_job_active(job):
                 skipped.append(job_id)
                 _audit("job_skipped", jobId=job_id, reason="active_task")
+                continue
+            if job is not None and not is_expired(job, settings.song_retention_days, now):
+                skipped.append(job_id)
+                _audit("job_skipped", jobId=job_id, reason="not_expired")
                 continue
             try:
                 if settings.song_retention_dry_run:
