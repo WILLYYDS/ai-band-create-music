@@ -40,7 +40,10 @@ def retention_enforced(settings) -> bool:
 
 
 def is_job_active(job) -> bool:
-    return job.status in {"pending", "running"} or any(
+    return any(
+        status in {"pending", "running"}
+        for status in (job.status, job.split_status, job.replace_status, job.mix_status)
+    ) or any(
         task is not None and not task.done()
         for task in (job.task, job.split_task, job.replace_task, job.mix_task)
     )
@@ -279,7 +282,13 @@ def _stage_job(root: Path, job_id: str) -> Path:
     return pending
 
 
-async def cleanup_expired_jobs(application, *, reason: str, now: datetime | None = None) -> None:
+async def cleanup_expired_jobs(
+    application,
+    *,
+    reason: str,
+    now: datetime | None = None,
+    stop: asyncio.Event | None = None,
+) -> None:
     settings = application.state.settings
     if not settings.song_retention_enabled:
         return
@@ -310,6 +319,9 @@ async def cleanup_expired_jobs(application, *, reason: str, now: datetime | None
                 candidates.add(job_id)
         application.state.retention_cleanup_remaining = len(candidates)
         for index, job_id in enumerate(sorted(candidates)):
+            if stop is not None and stop.is_set():
+                result = "cancelled"
+                return
             application.state.retention_cleanup_remaining = len(candidates) - index
             job = application.state.jobs.get(job_id)
             if job is not None and is_job_active(job):
@@ -392,18 +404,26 @@ async def retention_lifecycle(application):
     stop = asyncio.Event()
 
     async def monitor():
-        await refresh_retention_inventory(application)
+        async def run_step(step, **kwargs):
+            try:
+                await step(application, **kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Retention background step failed: %s", step.__name__)
+
+        await run_step(refresh_retention_inventory)
         if application.state.settings.song_retention_enabled:
-            await cleanup_expired_jobs(application, reason="startup")
-            await refresh_retention_inventory(application)
+            await run_step(cleanup_expired_jobs, reason="startup", stop=stop)
+            await run_step(refresh_retention_inventory)
         while not stop.is_set():
             delay = seconds_until_cleanup(datetime.now(timezone.utc))
             try:
                 await asyncio.wait_for(stop.wait(), min(delay, INVENTORY_REFRESH_SECONDS))
             except asyncio.TimeoutError:
                 if delay <= INVENTORY_REFRESH_SECONDS:
-                    await cleanup_expired_jobs(application, reason="scheduled")
-                await refresh_retention_inventory(application)
+                    await run_step(cleanup_expired_jobs, reason="scheduled", stop=stop)
+                await run_step(refresh_retention_inventory)
 
     task = None
     try:

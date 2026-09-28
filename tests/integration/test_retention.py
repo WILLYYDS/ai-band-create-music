@@ -1089,3 +1089,150 @@ async def test_audio_io_errors_preserve_server_failure_status(
     if status_code >= 500:
         assert any(record.exc_info and record.exc_info[1] is error for record in caplog.records)
     assert all(handle.closed for handle in handles)
+
+
+@pytest.mark.parametrize("operation", ["split", "replace", "mix"])
+@pytest.mark.parametrize("status", ["pending", "running"])
+@pytest.mark.parametrize("task_done", [False, True])
+async def test_active_operation_status_preserves_expired_job(
+    tmp_path, operation, status, task_done
+):
+    settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
+    app = create_app(settings, make_orchestrator(settings))
+    job = add_job(app, "busy", (datetime.now(timezone.utc) - timedelta(days=4)).isoformat())
+    setattr(job, f"{operation}_status", status)
+    if task_done:
+        task = asyncio.create_task(asyncio.sleep(0))
+        await task
+        setattr(job, f"{operation}_task", task)
+    await cleanup_expired_jobs(app, reason="test")
+    await refresh_retention_inventory(app)
+    assert app.state.jobs["busy"] is job
+    assert (settings.output_dir / "jobs/busy/song_1/full.mp3").is_file()
+    assert retention_status(app)["expiredActiveJobIds"] == ["busy"]
+    setattr(job, f"{operation}_status", "succeeded")
+    await cleanup_expired_jobs(app, reason="test")
+    assert "busy" not in app.state.jobs
+
+
+async def test_cleanup_with_stop_already_set_preserves_candidates(tmp_path, caplog):
+    settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
+    app = create_app(settings, make_orchestrator(settings))
+    add_job(app, "old", (datetime.now(timezone.utc) - timedelta(days=4)).isoformat())
+    stop = asyncio.Event()
+    stop.set()
+    caplog.set_level(logging.INFO, logger="app.services.retention")
+    await cleanup_expired_jobs(app, reason="test", stop=stop)
+    assert "old" in app.state.jobs
+    assert (settings.output_dir / "jobs/old/song_1/full.mp3").is_file()
+    assert retention_status(app)["lastCleanupResult"] == "cancelled"
+    summary = json.loads(caplog.records[-1].message)
+    assert summary["deletedCount"] == 0
+
+
+@pytest.mark.parametrize("reason", ["startup", "scheduled"])
+async def test_shutdown_finishes_current_deletion_and_preserves_remaining_jobs(
+    tmp_path, monkeypatch, caplog, reason
+):
+    from app.services.retention import retention_lifecycle, shutil
+
+    settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
+    app = create_app(settings, make_orchestrator(settings))
+    started, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    original = shutil.rmtree
+
+    def slow_remove(path):
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(timeout=2)
+        original(path)
+
+    monkeypatch.setattr("app.services.retention.shutil.rmtree", slow_remove)
+    monkeypatch.setattr("app.services.retention.seconds_until_cleanup", lambda now: 0.02)
+    lifecycle = retention_lifecycle(app)
+    await lifecycle.__aenter__()
+    closing = None
+    try:
+        if reason == "scheduled":
+            await wait_for_inventory(app)
+        old = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+        for job_id in ("first", "second"):
+            add_job(app, job_id, old)
+        await asyncio.wait_for(started.wait(), timeout=2)
+        closing = asyncio.create_task(lifecycle.__aexit__(None, None, None))
+        await asyncio.sleep(0)  # Let shutdown signal the monitor while deletion is blocked.
+        assert not closing.done()
+    finally:
+        release.set()
+        if closing is None:
+            await lifecycle.__aexit__(None, None, None)
+        else:
+            await asyncio.wait_for(closing, timeout=2)
+    assert "first" not in app.state.jobs and "second" in app.state.jobs
+    assert not (settings.output_dir / ".expired/first").exists()
+    assert (settings.output_dir / "jobs/second/song_1/full.mp3").is_file()
+    policy = retention_status(app)
+    assert policy["lastCleanupReason"] == reason
+    assert policy["lastCleanupResult"] == "cancelled"
+    assert policy["cleanupRunning"] is False and policy["remainingJobs"] == 0
+    summaries = [
+        json.loads(record.message)
+        for record in caplog.records
+        if '"event": "cleanup_finished"' in record.message
+    ]
+    assert summaries[-1]["deletedJobIds"] == ["first"]
+
+
+@pytest.mark.parametrize("failed_step", range(5))
+async def test_monitor_recovers_after_each_startup_and_scheduled_step(
+    tmp_path, monkeypatch, caplog, failed_step
+):
+    from app.services.retention import retention_lifecycle
+
+    settings = make_settings(tmp_path, song_retention_enabled=True)
+    app = create_app(settings, make_orchestrator(settings))
+    calls = []
+    recovered = asyncio.Event()
+    error = RuntimeError("unexpected background failure")
+
+    def record(step):
+        calls.append(step)
+        if len(calls) == failed_step + 1:
+            raise error
+        if len(calls) >= 7:
+            recovered.set()
+
+    async def cleanup(application, *, reason, stop):
+        assert isinstance(stop, asyncio.Event)
+        record(reason)
+
+    async def refresh(application):
+        record("refresh")
+
+    monkeypatch.setattr("app.services.retention.cleanup_expired_jobs", cleanup)
+    monkeypatch.setattr("app.services.retention.refresh_retention_inventory", refresh)
+    monkeypatch.setattr("app.services.retention.seconds_until_cleanup", lambda now: 0.01)
+    async with retention_lifecycle(app):
+        await asyncio.wait_for(recovered.wait(), timeout=2)
+    assert calls[:7] == [
+        "refresh", "startup", "refresh", "scheduled", "refresh", "scheduled", "refresh"
+    ]
+    assert any(record.exc_info and record.exc_info[1] is error for record in caplog.records)
+
+
+@pytest.mark.parametrize("step", ["cleanup_expired_jobs", "refresh_retention_inventory"])
+async def test_monitor_propagates_step_cancellation(tmp_path, monkeypatch, step):
+    from app.services.retention import retention_lifecycle
+
+    settings = make_settings(tmp_path, song_retention_enabled=True)
+    app = create_app(settings, make_orchestrator(settings))
+    cancelled = asyncio.Event()
+
+    async def cancel(*args, **kwargs):
+        cancelled.set()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(f"app.services.retention.{step}", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        async with retention_lifecycle(app):
+            await asyncio.wait_for(cancelled.wait(), timeout=2)
