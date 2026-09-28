@@ -106,6 +106,38 @@ async def test_cleanup_logging_busy_tasks_and_retry_after_restart(tmp_path, capl
     assert records[-1]["deletedJobIds"] == ["busy", "old"]
 
 
+async def test_capacity_lock_waiter_remains_protected_after_expiry(tmp_path):
+    settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
+    orchestrator = make_orchestrator(settings)
+    app = create_app(settings, orchestrator)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://testserver"
+    ) as client:
+        job_id = (await client.post("/api/generate", json={"prompt": "rock"})).json()["jobId"]
+        job = app.state.jobs[job_id]
+        await orchestrator.capacity._lock.acquire()
+        request = asyncio.create_task(client.post(f"/api/jobs/{job_id}/split"))
+        try:
+
+            async def pending():
+                while job.split_status != "pending":
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(pending(), timeout=2)
+            assert job.split_task is None
+            job.created_at = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+            await cleanup_expired_jobs(app, reason="test")
+            assert job_id in app.state.jobs
+            assert (settings.output_dir / "jobs" / job_id / "job.json").is_file()
+        finally:
+            request.cancel()
+            try:
+                await request
+            except asyncio.CancelledError:
+                pass
+            orchestrator.capacity._lock.release()
+
+
 @pytest.mark.parametrize("failure", ["jobs", ".trash", "target_symlink", "target_conflict"])
 async def test_staging_validates_all_paths_before_creating_or_moving(tmp_path, caplog, failure):
     settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
@@ -423,8 +455,18 @@ async def test_retention_disabled_by_default_preserves_history_and_files(tmp_pat
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app), base_url="http://testserver"
         ) as client:
-            assert (await client.get("/api/jobs")).json()["jobs"][0]["expiresAt"] is None
-            assert (await client.get("/api/jobs/old")).json()["expiresAt"] is None
+            history = (await client.get("/api/jobs")).json()["jobs"][0]
+            detail = (await client.get("/api/jobs/old")).json()
+            for row in (history, detail):
+                assert not {"expiresAt", "retentionState", "audioAvailable"} & row.keys()
+                assert {"warning", "title", "createdAt", "result"} <= row.keys()
+            route = next(route for route in app.routes if route.path == "/api/jobs/{job_id}/events")
+            response = await route.endpoint("old", events_request(app, "/api/jobs/old/events"))
+            frame = await anext(response.body_iterator)
+            assert frame.startswith("event: done\n")
+            payload = json.loads(frame.split("data: ", 1)[1])
+            assert not {"expiresAt", "retentionState", "audioAvailable"} & payload.keys()
+            await response.body_iterator.aclose()
             assert (await client.get("/output/jobs/old/song_1/full.mp3")).content == b"audio"
             policy = (await client.get("/api/health")).json()["retention"]
             assert policy["enabled"] is False and policy["nextCleanupAt"] is None
@@ -492,6 +534,7 @@ async def test_file_logging_failure_does_not_block_startup(tmp_path, caplog, fai
     with patch("app.services.retention.RotatingFileHandler") as constructor:
         constructor.side_effect = PermissionError("log unavailable")
         async with app.router.lifespan_context(app):
+            await wait_for_inventory(app)
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app), base_url="http://testserver"
             ) as client:
@@ -530,6 +573,87 @@ async def test_cancelled_shutdown_always_removes_and_closes_handler(tmp_path, mo
         await task
     assert logger.handlers == baseline and handler.stream is None
     assert not any(task.get_name() == "song-retention" for task in asyncio.all_tasks())
+
+
+async def test_shutdown_finishes_current_deletion_and_leaves_rest_of_batch(tmp_path, monkeypatch):
+    from app.services.retention import shutil
+
+    settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
+    app = create_app(settings, make_orchestrator(settings))
+    for job_id in ("a", "b"):
+        add_job(app, job_id, (datetime.now(timezone.utc) - timedelta(days=4)).isoformat())
+    started, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    original_remove = shutil.rmtree
+    calls = []
+
+    def blocked_remove(path):
+        calls.append(path.name)
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(timeout=2)
+        original_remove(path)
+
+    monkeypatch.setattr("app.services.retention.shutil.rmtree", blocked_remove)
+    context = app.router.lifespan_context(app)
+    await context.__aenter__()
+    shutdown = None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        shutdown = asyncio.create_task(context.__aexit__(None, None, None))
+        await asyncio.sleep(
+            0
+        )  # Let lifespan set the stop event before releasing the current delete.
+    finally:
+        release.set()
+        if shutdown is None:
+            await context.__aexit__(None, None, None)
+        else:
+            await asyncio.wait_for(shutdown, timeout=2)
+    assert calls == ["a"]
+    assert "a" not in app.state.jobs and "b" in app.state.jobs
+    assert (settings.output_dir / "jobs/b/song_1/full.mp3").is_file()
+    assert not (settings.output_dir / ".expired/b").exists()
+    assert retention_status(app)["lastCleanupResult"] == "stopped"
+    assert not any(task.get_name() == "song-retention" for task in asyncio.all_tasks())
+
+
+@pytest.mark.parametrize("operation", ["refresh_retention_inventory", "cleanup_expired_jobs"])
+async def test_monitor_recovers_from_unexpected_cycle_failure(
+    tmp_path, monkeypatch, caplog, operation
+):
+    from app.services import retention
+
+    settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
+    app = create_app(settings, make_orchestrator(settings))
+    original = getattr(retention, operation)
+    calls = 0
+
+    async def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("unexpected error with private path /app/output")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(retention, operation, fail_once)
+    monkeypatch.setattr(retention, "INVENTORY_REFRESH_SECONDS", 0.02)
+    caplog.set_level(logging.INFO, logger="app.services.retention")
+    async with app.router.lifespan_context(app):
+
+        async def recovered():
+            while calls < 2 or retention_status(app)["lastCleanupResult"] != "success":
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(recovered(), timeout=2)
+        assert any(
+            task.get_name() == "song-retention" and not task.done() for task in asyncio.all_tasks()
+        )
+    failures = [
+        json.loads(record.message)
+        for record in caplog.records
+        if '"event": "retention_monitor_failed"' in record.message
+    ]
+    assert len(failures) == 1 and failures[0]["error"] == "RuntimeError"
 
 
 async def test_slow_startup_cleanup_does_not_block_health(tmp_path, monkeypatch):
@@ -1015,8 +1139,11 @@ async def test_invalid_timestamp_is_explicit_and_metadata_errors_are_reported(
         history = (await client.get("/api/jobs")).json()["jobs"][0]
         detail = (await client.get("/api/jobs/invalid")).json()
         for row in (history, detail):
-            assert row["retentionState"] == expected and row["expiresAt"] is None
-            assert row["audioAvailable"] is (expected != "unmanaged")
+            if enabled:
+                assert row["retentionState"] == expected and row["expiresAt"] is None
+                assert row["audioAvailable"] is (expected != "unmanaged")
+            else:
+                assert not {"expiresAt", "retentionState", "audioAvailable"} & row.keys()
         policy = (await client.get("/api/health")).json()["retention"]
         assert policy["unmanagedCount"] == 4 and policy["unmanagedTruncated"] is False
         reasons = {item["jobId"]: item["reason"] for item in policy["unmanagedJobs"]}
@@ -1125,7 +1252,7 @@ async def test_cleanup_with_stop_already_set_preserves_candidates(tmp_path, capl
     await cleanup_expired_jobs(app, reason="test", stop=stop)
     assert "old" in app.state.jobs
     assert (settings.output_dir / "jobs/old/song_1/full.mp3").is_file()
-    assert retention_status(app)["lastCleanupResult"] == "cancelled"
+    assert retention_status(app)["lastCleanupResult"] == "stopped"
     summary = json.loads(caplog.records[-1].message)
     assert summary["deletedCount"] == 0
 
@@ -1173,7 +1300,7 @@ async def test_shutdown_finishes_current_deletion_and_preserves_remaining_jobs(
     assert (settings.output_dir / "jobs/second/song_1/full.mp3").is_file()
     policy = retention_status(app)
     assert policy["lastCleanupReason"] == reason
-    assert policy["lastCleanupResult"] == "cancelled"
+    assert policy["lastCleanupResult"] == "stopped"
     assert policy["cleanupRunning"] is False and policy["remainingJobs"] == 0
     summaries = [
         json.loads(record.message)
@@ -1199,7 +1326,7 @@ async def test_monitor_recovers_after_each_startup_and_scheduled_step(
         calls.append(step)
         if len(calls) == failed_step + 1:
             raise error
-        if len(calls) >= 7:
+        if len(calls) >= 7 and step in {"retry", "scheduled"}:
             recovered.set()
 
     async def cleanup(application, *, reason, stop):
@@ -1212,11 +1339,10 @@ async def test_monitor_recovers_after_each_startup_and_scheduled_step(
     monkeypatch.setattr("app.services.retention.cleanup_expired_jobs", cleanup)
     monkeypatch.setattr("app.services.retention.refresh_retention_inventory", refresh)
     monkeypatch.setattr("app.services.retention.seconds_until_cleanup", lambda now: 0.01)
+    monkeypatch.setattr("app.services.retention.INVENTORY_REFRESH_SECONDS", 0.01)
     async with retention_lifecycle(app):
         await asyncio.wait_for(recovered.wait(), timeout=2)
-    assert calls[:7] == [
-        "refresh", "startup", "refresh", "scheduled", "refresh", "scheduled", "refresh"
-    ]
+    assert "retry" in calls[failed_step + 1 :]
     assert any(record.exc_info and record.exc_info[1] is error for record in caplog.records)
 
 

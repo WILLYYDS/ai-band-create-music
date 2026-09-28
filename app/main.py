@@ -419,7 +419,6 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        configure_logging()
         async with retention_lifecycle(application):
             if orchestrator is not None:
                 application.state.orchestrator = orchestrator
@@ -2391,25 +2390,24 @@ def _job_response(
     fingerprint: str | None = None,
 ) -> dict[str, Any]:
     response = job.response()
-    expiry = (
-        expires_at(job, settings.song_retention_days) if retention_enforced(settings) else None
-    )
-    response["expiresAt"] = expiry.isoformat() if expiry else None
-    expired = expiry is not None and expiry <= datetime.now(timezone.utc)
-    if not settings.song_retention_enabled:
-        retention_state = "disabled"
-    elif settings.song_retention_dry_run:
-        retention_state = "dry_run"
-    elif expiry is None:
-        retention_state = "unmanaged"
-    elif expired:
-        retention_state = "expired_active" if is_job_active(job) else "expired"
-    else:
-        retention_state = "retained"
-    response["retentionState"] = retention_state
-    response["audioAvailable"] = bool(job.result) and (
-        not retention_enforced(settings) or (expiry is not None and not expired)
-    )
+    if settings.song_retention_enabled:
+        expiry = (
+            expires_at(job, settings.song_retention_days) if retention_enforced(settings) else None
+        )
+        response["expiresAt"] = expiry.isoformat() if expiry else None
+        expired = expiry is not None and expiry <= datetime.now(timezone.utc)
+        if settings.song_retention_dry_run:
+            retention_state = "dry_run"
+        elif expiry is None:
+            retention_state = "unmanaged"
+        elif expired:
+            retention_state = "expired_active" if is_job_active(job) else "expired"
+        else:
+            retention_state = "retained"
+        response["retentionState"] = retention_state
+        response["audioAvailable"] = bool(job.result) and (
+            not retention_enforced(settings) or (expiry is not None and not expired)
+        )
     if job.result is not None:
         response["result"] = _render_result_urls(
             job.result,

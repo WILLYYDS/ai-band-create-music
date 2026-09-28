@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
 
 class GenerateRequest(BaseModel):
@@ -80,6 +80,14 @@ class UpdateGenerationJobRequest(BaseModel):
 
 
 class GenerationJobResponse(BaseModel):
+    @model_serializer(mode="wrap")
+    def serialize_retention(self, handler):
+        response = handler(self)
+        if self.retentionState == "disabled":
+            for name in ("expiresAt", "retentionState", "audioAvailable"):
+                response.pop(name, None)
+        return response
+
     jobId: str
     createdAt: str
     expiresAt: str | None = None

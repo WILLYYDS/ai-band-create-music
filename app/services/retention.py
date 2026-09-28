@@ -283,11 +283,7 @@ def _stage_job(root: Path, job_id: str) -> Path:
 
 
 async def cleanup_expired_jobs(
-    application,
-    *,
-    reason: str,
-    now: datetime | None = None,
-    stop: asyncio.Event | None = None,
+    application, *, reason: str, now: datetime | None = None, stop: asyncio.Event | None = None
 ) -> None:
     settings = application.state.settings
     if not settings.song_retention_enabled:
@@ -311,6 +307,9 @@ async def cleanup_expired_jobs(
             cleanup_error = f"pendingDeletion: {public_error_reason(exc)}"
             _audit("cleanup_failed", stage="pendingDeletionScan", error=str(exc))
         for job_id, job in list(application.state.jobs.items()):
+            if stop is not None and stop.is_set():
+                result = "stopped"
+                return
             if expires_at(job, settings.song_retention_days) is None:
                 candidates.discard(job_id)
                 skipped.append(job_id)
@@ -320,7 +319,7 @@ async def cleanup_expired_jobs(
         application.state.retention_cleanup_remaining = len(candidates)
         for index, job_id in enumerate(sorted(candidates)):
             if stop is not None and stop.is_set():
-                result = "cancelled"
+                result = "stopped"
                 return
             application.state.retention_cleanup_remaining = len(candidates) - index
             job = application.state.jobs.get(job_id)
@@ -400,30 +399,39 @@ async def retention_lifecycle(application):
         logger.addHandler(handler)
     except OSError as exc:
         logger.warning("Retention file logging unavailable; using application logs: %s", exc)
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
     _audit("retention_policy", **retention_status(application))
     stop = asyncio.Event()
 
     async def monitor():
-        async def run_step(step, **kwargs):
-            try:
-                await step(application, **kwargs)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Retention background step failed: %s", step.__name__)
-
-        await run_step(refresh_retention_inventory)
-        if application.state.settings.song_retention_enabled:
-            await run_step(cleanup_expired_jobs, reason="startup", stop=stop)
-            await run_step(refresh_retention_inventory)
+        reason = "startup"
         while not stop.is_set():
-            delay = seconds_until_cleanup(datetime.now(timezone.utc))
+            failed = False
+            try:
+                await refresh_retention_inventory(application)
+                if stop.is_set():
+                    return
+                if reason is not None and application.state.settings.song_retention_enabled:
+                    await cleanup_expired_jobs(application, reason=reason, stop=stop)
+                    if stop.is_set():
+                        return
+                    await refresh_retention_inventory(application)
+                delay = seconds_until_cleanup(datetime.now(timezone.utc))
+            except Exception as exc:
+                failed = True
+                logger.exception("Retention monitor failed; retrying after the refresh interval")
+                _audit("retention_monitor_failed", error=public_error_reason(exc))
+                delay = INVENTORY_REFRESH_SECONDS
             try:
                 await asyncio.wait_for(stop.wait(), min(delay, INVENTORY_REFRESH_SECONDS))
             except asyncio.TimeoutError:
-                if delay <= INVENTORY_REFRESH_SECONDS:
-                    await run_step(cleanup_expired_jobs, reason="scheduled", stop=stop)
-                await run_step(refresh_retention_inventory)
+                reason = (
+                    "retry"
+                    if failed
+                    else ("scheduled" if delay <= INVENTORY_REFRESH_SECONDS else None)
+                )
 
     task = None
     try:

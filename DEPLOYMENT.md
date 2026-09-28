@@ -105,6 +105,9 @@ tar -czf ai-band-output-before-retention.tar.gz output
 `output/logs/retention.log` 中的 `wouldDeleteJobIds` 和跳过原因，以及 `/api/health` 的
 `retention.orphanJobIds`、`pendingDeletionJobIds`、`expiredActiveJobIds`。日志不可写时检查应用日志。
 确认备份与删除范围后，再设置 `SONG_RETENTION_DRY_RUN=false` 并重启，执行正式清理。
+正式启用前，必须由 PO 在 PR 或上线工单明确确认追溯删除，并由前端负责人确认新增字段、
+SSE `done/status=expired` 无结果载荷及音频 404 的兼容性。策略关闭时不返回新增任务字段，
+默认部署保持原有任务响应结构；开启 dry-run 才会暴露新增字段。
 关闭开关会停止删除，但 `.expired` 残留仍列在 health/启动日志中，重新正式启用后会重试。
 
 health 的清单来自后台快照（启动、每小时及清理后刷新），先确认 `inventoryUpdatedAt` 非空、
@@ -121,6 +124,8 @@ dry-run 的 `lastCleanupResult=success` 只表示审计完成，未执行删除�
 日志的 `cleanup_failed` 带 `stage`（`pendingDeletionScan` 或 `run`），`cleanup_finished` 带
 `result/error/pendingDeletionScanFailed`。暂存区扫描失败仍尝试处理已知过期任务；若暂存区
 损坏或不可写，逐任务失败会列入 `failedJobIds`，修复后再重试，不能视为空批次。
+关停只等待当前目录删除完成，批次剩余任务保留，结果为 `stopped`；意外循环异常记录
+`retention_monitor_failed` 并在下一次刷新间隔重试。
 
 ## 5. 离线服务器打包镜像
 

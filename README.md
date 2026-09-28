@@ -310,8 +310,11 @@ Uvicorn worker；需要多 worker 时再接入共享任务存储。
 重启，检查日志 `wouldDeleteJobIds`、跳过的任务以及 health 中的孤立目录；确认影响范围后，
 才将 `SONG_RETENTION_DRY_RUN=false` 并再次重启，正式执行删除。
 
-关闭或 dry-run 时不删除、不移动目录、不隐藏历史、不限制访问，`expiresAt` 为 `null`，
-试听缓存沿用原有策略。dry-run 启动时及每天凌晨 03:00 仅记录候选 `wouldDeleteJobIds`。
+关闭或 dry-run 时不删除、不移动目录、不隐藏历史、不限制访问，试听缓存沿用原有策略。
+关闭时任务 HTTP/SSE 响应不返回 `expiresAt`、`retentionState`、`audioAvailable`，保留原有响应结构；
+开启 dry-run 时返回这三个字段，`expiresAt=null`。dry-run 启动时及每天凌晨 03:00 仅记录候选
+`wouldDeleteJobIds`。正式启用前需 PO 在 PR 或上线工单明确确认追溯删除，并完成前端对新增字段、
+`done/status=expired`（无结果）和音频 404 的兼容验证。`SONG_RETENTION_DAYS` 范围为 1–3650 天。
 
 正式启用后，创作从任务 `createdAt` 起可访问连续 72 小时（`SONG_RETENTION_DAYS=3`），播放、
 拆轨、换声和合轨不延长访问期。历史、详情和 SSE 响应提供 `expiresAt`，用于前端提前提示。
@@ -331,7 +334,7 @@ RVC 推理线程无法强制停止，取消仅标记取消意图，并发额度�
 没有任务元数据的孤立文件不会按文件修改时间自动删除；正式启用时，这些任务及无法计算
 到期时间的任务音频返回 404。孤立目录列在启动日志和 health 中，需人工修复或处理。
 
-任务响应的 `retentionState` 明确区分 `disabled`（关闭）、`dry_run`（仅审计）、
+策略开启后的任务响应中，`retentionState` 明确区分 `dry_run`（仅审计）、
 `retained`（可访问）、`expired_active`（已过期但仍在执行）和 `unmanaged`（创建时间异常）。
 `audioAvailable` 表示任务是否已有结果且保留策略允许音频访问，不代表对每个音频文件做了
 磁盘校验。正式清理时，`unmanaged` 任务仍可查看以便修复，但 `audioAvailable=false`；
@@ -374,7 +377,8 @@ RVC 推理线程无法强制停止，取消仅标记取消意图，并发额度�
 任务，仅代表本轮待处理数量（本轮跳过/失败的任务见日志）。
 `lastCleanupAt` 是上一轮结束的 UTC 时间，`lastCleanupReason` 是触发原因，
 `lastCleanupResult` 为 `success`、`partial_failure`（有任务处理成功，但仍有错误）、`failed`
-或 `cancelled`；`lastCleanupError` 给出脱敏后的首个错误，`pendingDeletionScanFailed`
+或 `cancelled`；关停时完成当前删除后停止批次，剩余任务留待下次清理，结果为 `stopped`。
+`lastCleanupError` 给出脱敏后的首个错误，`pendingDeletionScanFailed`
 报告上一轮是否无法扫描暂存区。尚未执行时这些字段为 `null`；本轮执行期间继续显示上一轮结果。
 dry-run 下 `success` 仅表示审计完成，未删除或移动任何内容；`partial_failure` 也仅表示部分
 审计完成。正式模式的 `success` 表示本轮删除完成或无需删除。判断删除是否已执行必须同时
@@ -399,8 +403,9 @@ JSON 语法错误包含解析说明与行列，字段错误用点分隔字段名
 没有成功数据的类别，其 `Count` 和 `Truncated` 保持 `null`。其它类别仍刷新。
 计数、空列表或非空 `inventoryUpdatedAt` 均不能单独作为“确认没有残留”的依据。
 
-应用日志默认 INFO，httpx 默认 WARNING，避免出站轮询请求刷屏。需要网络调试明细时，
-可通过 `configure_logging(httpx_level=logging.DEBUG)` 显式调整。
+后台循环遇到意外异常会记录 `retention_monitor_failed` 和应用堆栈，在下次清单刷新间隔重试，
+不会因单轮异常永久停止调度；正常取消仍向上传递。此功能不更改全局日志或 httpx 日志级别；
+文件日志不可写时，仅 retention 自身增加 stderr handler，关停时释放。
 
 音频接口先非阻塞打开并确认普通文件，再恢复阻塞读取；FIFO、目录和 Unix socket 返回 404。
 普通文件不存在返回 404，权限不足返回 403，文件描述符耗尽返回 503（`Retry-After: 5`），
