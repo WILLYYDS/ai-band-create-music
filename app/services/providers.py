@@ -27,6 +27,8 @@ MINIMAX_LYRIC_LINE_LIMIT = 32
 # ElevenLabs /v1/music compose API documents a maximum prompt length of 4100 characters:
 # https://elevenlabs.io/docs/api-reference/music/compose
 ELEVENLABS_PROMPT_MAX_CHARS = 4100
+# Auto output validation follows the compose API's 3-second minimum song length.
+ELEVENLABS_AUTO_MIN_DURATION_SECONDS = 3
 # Live music_v2 pcm_44100 check (2026-09-23): a 3s request returned 529,200 bytes
 # (44,100 Hz × 2 channels × 2 bytes × 3s), with distinct signals in both channels.
 # This account received HTTP 200; the wrapped WAV decoded as 16-bit stereo, 3.000s.
@@ -38,11 +40,13 @@ ProviderProgressCallback = Callable[[str, int | None, int | None], Awaitable[Non
 
 def build_elevenlabs_prompt(
     structured_prompt: str,
-    duration_minutes: float,
+    duration_minutes: float | None,
     clear_chinese_vocal_mode: bool,
     lyrics: str = "",
 ) -> str:
-    requirements = [structured_prompt, f"Target duration: {duration_minutes:g} minutes."]
+    requirements = [structured_prompt]
+    if duration_minutes is not None:
+        requirements.append(f"Target duration: {duration_minutes:g} minutes.")
     if clear_chinese_vocal_mode:
         requirements.append(
             "Chinese clear vocal mode: Use Mandarin Chinese lead vocals with clear articulation "
@@ -343,23 +347,26 @@ class ElevenLabsMusicProvider:
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
     ) -> MusicResult:
-        music_length_ms = duration_seconds * 1000
         force_instrumental = self._settings.elevenlabs_force_instrumental
         clear_chinese = (
             self._settings.elevenlabs_clear_chinese_vocal_mode and not force_instrumental
         )
         lyrics, _ = split_generation_prompt(user_prompt)
         prompt = build_elevenlabs_prompt(
-            structured_prompt, duration_seconds / 60, clear_chinese, lyrics
+            structured_prompt,
+            duration_seconds / 60 if duration_seconds is not None else None,
+            clear_chinese,
+            lyrics,
         )
         output_format = self._settings.elevenlabs_music_output_format
         sample_rate = int(output_format.removeprefix("pcm_"))
         request_body = {
             "prompt": prompt,
-            "music_length_ms": music_length_ms,
             "model_id": self._settings.elevenlabs_music_model_id,
             "force_instrumental": force_instrumental,
         }
+        if duration_seconds is not None:
+            request_body["music_length_ms"] = duration_seconds * 1000
         url = f"{self._settings.elevenlabs_music_base_url}/v1/music"
         request_diagnostic = {
             "method": "POST",
@@ -432,7 +439,7 @@ class ElevenLabsMusicProvider:
         chunks: AsyncIterator[bytes],
         target: Path,
         sample_rate: int,
-        expected_duration_seconds: int,
+        expected_duration_seconds: int | None,
     ) -> float:
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f"{target.name}.{time.time_ns()}.part")
@@ -461,9 +468,19 @@ class ElevenLabsMusicProvider:
             if written % frame_size:
                 raise GenerationError("ElevenLabs 音乐生成接口返回了不完整的 PCM 音频帧。")
             actual_duration_seconds = written / (sample_rate * frame_size)
+            if (
+                expected_duration_seconds is None
+                and actual_duration_seconds < ELEVENLABS_AUTO_MIN_DURATION_SECONDS
+            ):
+                raise GenerationError(
+                    "ElevenLabs 音乐生成接口返回的自动时长音频过短："
+                    f"至少需要 {ELEVENLABS_AUTO_MIN_DURATION_SECONDS} 秒，"
+                    f"实际 {actual_duration_seconds:.3f} 秒。"
+                )
             # ponytail: ratio only catches severe mismatch; use provider metadata when available.
-            ratio = actual_duration_seconds / expected_duration_seconds
-            if not 0.6 <= ratio <= 1.6:
+            if expected_duration_seconds is not None and not (
+                0.6 <= actual_duration_seconds / expected_duration_seconds <= 1.6
+            ):
                 raise GenerationError(
                     "ElevenLabs 音乐生成接口返回的 PCM 时长异常："
                     f"期望 {expected_duration_seconds} 秒，实际 {actual_duration_seconds:.3f} 秒。"

@@ -89,7 +89,7 @@ class GenerationOrchestrator:
     async def generate(
         self,
         user_prompt: str,
-        duration_minutes: int | None,
+        duration_minutes: float | None,
         request_id: str,
         *,
         job_id: str | None = None,
@@ -157,7 +157,9 @@ class GenerationOrchestrator:
             structured_prompt = prepared.structured_prompt
             lyrics = prepared.lyrics
             duration_seconds = prepared.duration_seconds
-            if duration_seconds is None and selected_provider != "minimax_music":
+            if duration_seconds is None and selected_provider not in {
+                "minimax_music", "elevenlabs_music"
+            }:
                 duration_seconds = self.settings.default_duration_minutes * 60
             provider_prompt = f"[歌词与创作内容]\n{lyrics}"
             if style:
@@ -167,7 +169,8 @@ class GenerationOrchestrator:
                     "provider_override"
                     if selected_provider == "minimax_music" and duration_minutes is not None
                     else "provider"
-                    if selected_provider == "minimax_music"
+                    if selected_provider in {"minimax_music", "elevenlabs_music"}
+                    and duration_seconds is None
                     else "user"
                     if duration_minutes is not None
                     else "default"
