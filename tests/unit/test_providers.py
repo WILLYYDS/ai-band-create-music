@@ -160,6 +160,39 @@ async def test_elevenlabs_sends_complete_prompt_and_streams_audio(tmp_path: Path
     assert "composition_plan" not in music_body
 
 
+async def test_elevenlabs_auto_omits_fixed_duration(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    pcm = b"\0" * (8_000 * 3 * 4)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=pcm)
+
+    settings = make_settings(
+        tmp_path,
+        elevenlabs_api_key="secret",
+        elevenlabs_music_base_url="https://eleven.test",
+        elevenlabs_music_output_format="pcm_8000",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await ElevenLabsMusicProvider(settings, client).generate(
+            "[Genre: Rock]", None, MINIMAX_USER_PROMPT, job_id="auto-job"
+        )
+
+    body = json.loads(requests[0].content)
+    assert "music_length_ms" not in body
+    assert "Target duration:" not in body["prompt"]
+    assert "[Verse]\ntest lyrics" in body["prompt"]
+    assert "Mandarin Chinese lead vocals" in body["prompt"]
+    assert result.debug["durationSeconds"] == 3.0
+    with wave.open(str(result.audio_path), "rb") as audio:
+        assert audio.readframes(audio.getnframes()) == pcm
+    diagnostics = json.loads(
+        (settings.output_dir / "jobs/auto-job/prompts.json").read_text()
+    )
+    assert diagnostics["providerRequests"][0]["request"]["body"] == body
+
+
 async def test_elevenlabs_variations_preserve_the_same_prompt(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
     pcm = b"\0" * (8_000 * 3 * 4)
@@ -246,9 +279,15 @@ async def test_elevenlabs_instrumental_mode_omits_chinese_vocal_direction(tmp_pa
     assert result.debug["clearChineseVocalMode"] is False
 
 
-async def test_elevenlabs_empty_pcm_removes_temporary_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("duration_seconds", [3, None])
+@pytest.mark.parametrize(
+    ("pcm", "message"), [(b"", "返回空音频"), (b"\0", "不完整的 PCM 音频帧")]
+)
+async def test_elevenlabs_invalid_pcm_removes_temporary_file(
+    tmp_path: Path, duration_seconds: int | None, pcm: bytes, message: str
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"")
+        return httpx.Response(200, content=pcm)
 
     settings = make_settings(
         tmp_path,
@@ -258,9 +297,9 @@ async def test_elevenlabs_empty_pcm_removes_temporary_file(tmp_path: Path) -> No
         elevenlabs_music_output_format="pcm_8000",
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(GenerationError, match="返回空音频"):
+        with pytest.raises(GenerationError, match=message):
             await ElevenLabsMusicProvider(settings, client).generate(
-                "[Genre: Rock]", 3, "", job_id="empty-job"
+                "[Genre: Rock]", duration_seconds, "", job_id="empty-job"
             )
 
     song_dir = settings.output_dir / "jobs/empty-job/song_1"

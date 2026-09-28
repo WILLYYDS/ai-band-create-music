@@ -149,8 +149,9 @@ async def test_generate_accepts_exact_duration_seconds(tmp_path: Path) -> None:
     "duration_field",
     [{"durationMinutes": "auto"}, {"durationMinutes": None}, {}],
 )
+@pytest.mark.parametrize("provider", ["minimax_music", "elevenlabs_music"])
 async def test_generate_lets_provider_choose_duration_for_auto(
-    tmp_path: Path, duration_field: dict[str, object]
+    tmp_path: Path, duration_field: dict[str, object], provider: str
 ) -> None:
     settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
@@ -158,7 +159,7 @@ async def test_generate_lets_provider_choose_duration_for_auto(
     async with await _client(app) as client:
         response = await client.post(
             "/api/generate",
-            json={"prompt": "自动长度普通话歌曲", **duration_field},
+            json={"prompt": "自动长度普通话歌曲", "provider": provider, **duration_field},
         )
 
     assert response.status_code == 200
@@ -167,6 +168,13 @@ async def test_generate_lets_provider_choose_duration_for_auto(
     assert "requestedDurationSeconds" not in body
     assert body["debug"]["music"]["durationSeconds"] == 150
     assert orchestrator.music_provider.requested_durations == [None]
+    diagnostics = json.loads(
+        (settings.output_dir / "jobs" / body["jobId"] / "prompts.json").read_text()
+    )
+    assert diagnostics["provider"] == provider
+    assert diagnostics["durationSource"] == "provider"
+    assert "effectiveDurationSeconds" not in diagnostics
+    assert "effectiveDurationMinutes" not in diagnostics
 
 
 async def test_generate_selects_provider_per_request(tmp_path: Path) -> None:
