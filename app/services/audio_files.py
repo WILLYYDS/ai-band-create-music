@@ -125,10 +125,11 @@ def playback_matches(source: Path, preview: Path) -> bool:
     )
 
 
-def detect_audio_content_type(path: Path) -> str:
+def detect_audio_content_type(path: Path, *, header: bytes | None = None) -> str:
     try:
-        with path.open("rb") as audio:
-            header = audio.read(12)
+        if header is None:
+            with path.open("rb") as audio:
+                header = audio.read(12)
         if header[:4] == b"RIFF" and header[8:12] == b"WAVE":
             return "audio/wav"
         if header[:3] == b"ID3" or (len(header) >= 2 and header[0] == 0xFF):

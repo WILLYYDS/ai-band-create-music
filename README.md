@@ -264,6 +264,11 @@ curl -X POST http://127.0.0.1:8010/api/generate \
 
 当前没有完整替换任务资源的业务，因此不提供 `PUT`；未来需要整体替换任务配置时再增加。
 
+SSE 终态始终使用具名 `done` 事件，客户端收到后应主动关闭 EventSource。若已连接的任务
+在流中到期，`done` 的数据为 `{"success":false,"status":"expired","jobId":"...",
+"message":"歌曲已过期。"}`，不包含音频结果；`expired` 仅表示该 SSE 终态的原因，
+不会写入任务的持久化状态。连接前已过期的任务仍返回 HTTP 404。
+
 ```bash
 # 创建任务（返回 202 和 jobId）
 curl -X POST http://127.0.0.1:8010/api/jobs \
@@ -296,6 +301,116 @@ curl -X PUT http://127.0.0.1:8010/api/jobs/<jobId>/stems/vocal
 重启时仍为 `pending` 或 `running` 的任务会恢复为 `failed`，并标记“服务器重启，生成任务已中断”；
 不会自动续跑未完成的音乐生成。执行队列和并发计数仍为单进程状态，因此仍推荐单
 Uvicorn worker；需要多 worker 时再接入共享任务存储。
+
+### 创作保留与清理日志
+
+永久清理默认关闭（`SONG_RETENTION_ENABLED=false`），默认仅审计（`SONG_RETENTION_DRY_RUN=true`）。
+**正式启用会追溯全部历史：第一次启动就会永久删除所有超过 N 天的既有任务及音频，无法恢复。**
+先备份完整 `output/`，设置 `SONG_RETENTION_ENABLED=true` 并保持 `SONG_RETENTION_DRY_RUN=true`
+重启，检查日志 `wouldDeleteJobIds`、跳过的任务以及 health 中的孤立目录；确认影响范围后，
+才将 `SONG_RETENTION_DRY_RUN=false` 并再次重启，正式执行删除。
+
+关闭或 dry-run 时不删除、不移动目录、不隐藏历史、不限制访问，试听缓存沿用原有策略。
+关闭时任务 HTTP/SSE 响应不返回 `expiresAt`、`retentionState`、`audioAvailable`，保留原有响应结构；
+开启 dry-run 时返回这三个字段，`expiresAt=null`。dry-run 启动时及每天凌晨 03:00 仅记录候选
+`wouldDeleteJobIds`。正式启用前需 PO 在 PR 或上线工单明确确认追溯删除，并完成前端对新增字段、
+`done/status=expired`（无结果）和音频 404 的兼容验证。`SONG_RETENTION_DAYS` 范围为 1–3650 天。
+
+正式启用后，创作从任务 `createdAt` 起可访问连续 72 小时（`SONG_RETENTION_DAYS=3`），播放、
+拆轨、换声和合轨不延长访问期。历史、详情和 SSE 响应提供 `expiresAt`，用于前端提前提示。
+到期且执行结束后任务不再出现在历史中，详情、编辑和新音频下载请求返回 404；试听 MP3 的缓存时间
+不超过剩余访问期。已经开始的下载可完成，已下载或此前已缓存到客户端的内容无法追回。
+
+正式启用后，服务启动时在后台清理一次，不阻塞 API 就绪；随后每天北京时间凌晨 03:00 清理。
+正常情况下文件在创建后 72–96 小时内删除，容量规划应按接近 4 天计算；仍在执行的任务
+或删除失败的目录可能保留更久。访问期为 72 小时，磁盘释放时间取决于清理执行。
+清理包含整个任务目录 `output/jobs/<jobId>/` 和回收区 `output/.trash/<jobId>/`，
+一次任务中的所有歌曲一并永久删除。
+仍在生成、拆轨、换声或合轨的任务跳过本轮，实际执行结束后在下次清理时删除；换声超时
+但推理线程仍在运行时也不会删除。创建时间缺失、无时区或格式异常的历史记录不会被猜测删除，
+需要根据日志人工修复。过期但仍在执行的任务继续出现在历史中，详情、SSE 和 PATCH 取消
+仍可使用，SSE 不会提前发送 `done/expired`；新编辑和音频下载仍被拒绝，实际执行结束后再清理。
+RVC 推理线程无法强制停止，取消仅标记取消意图，并发额度仍等到实际线程退出后释放。
+没有任务元数据的孤立文件不会按文件修改时间自动删除；正式启用时，这些任务及无法计算
+到期时间的任务音频返回 404。孤立目录列在启动日志和 health 中，需人工修复或处理。
+
+策略开启后的任务响应中，`retentionState` 明确区分 `dry_run`（仅审计）、
+`retained`（可访问）、`expired_active`（已过期但仍在执行）和 `unmanaged`（创建时间异常）。
+`audioAvailable` 表示任务是否已有结果且保留策略允许音频访问，不代表对每个音频文件做了
+磁盘校验。正式清理时，`unmanaged` 任务仍可查看以便修复，但 `audioAvailable=false`；
+前端应显示“元数据异常，需修复”，禁用播放/下载，不能把 `expiresAt=null` 当作无限期可播放。
+修复 `job.json` 后重启服务重新加载；不会猜测时间，也不会自动删除这些任务。
+
+删除前先将目录移入不可访问的 `output/.expired/<jobId>/`；删除失败会保留目录，下一次清理
+（含服务重启）重试，避免把部分删除的任务重新加载到历史中。
+暂存前先校验全部源路径、目标路径及目标冲突。重试暂存区条目时，若任务仍被加载且按当前
+保留天数尚未过期（或创建时间不可解析），跳过删除；已移走元数据的任务仍可继续重试。
+
+`output` 树内（包括 `jobs`、`.expired`、`.trash` 和任务目录）不支持符号链接。
+保留清理拒绝沿符号链接操作；指向 `output` 之外的链接，其 `/output` 音频请求返回 404。
+音频放在其它卷时，请将卷直接挂载到 `OUTPUT_DIR` 或其真实子目录，不要用符号链接转接。
+后台首轮清单检查 `jobs` 和 `.expired` 布局，发现链接时记录一次 WARNING 的
+`unsupported_layout`；重复刷新同一问题不重复该告警。health 的缓存字段 `unsupportedLayout`
+为 `true`，`unsupportedLayoutDirectories` 只列 `jobs`/`.expired` 相对名称；错误原因明确包含
+`refusing symlinked directory`。首次检查前或无法确认布局时为 `null`，修复后下一次刷新恢复
+`false`；这些根目录检查不代表完整扫描了树内所有符号链接。
+
+清理日志保存到 `output/logs/retention.log`，同时接入现有应用日志；每行是一个 JSON 对象，
+`time` 使用带时区的 UTC 时间。启动时记录开关、天数、清理时区和下次计划清理时间；
+文件日志初始化失败时告警并降级到应用日志，不阻止 API 启动。
+日志记录清理开始、删除尝试、每个任务删除成功/失败或跳过的
+时间与原因，结束时汇总 `deletedJobIds`、`failedJobIds` 和 `skippedJobIds`。没有过期任务时也
+记录开始和结束。单文件最大 5 MiB，保留 3 个轮转备份；日志不会随歌曲清理，也不通过
+`/output` 对外提供。仍须保持单 worker、单实例写入该 output 目录。
+
+`cleanup_failed` 记录扫描或整轮错误：`stage=pendingDeletionScan` 表示放弃暂存区残留重试，
+仍继续处理内存中的已知过期任务；`stage=run` 表示本轮中止。`cleanup_finished` 包含
+`result`、`error` 和 `pendingDeletionScanFailed`。暂存区本身损坏或无法写入时，无法安全移动
+目录，相应任务记录 `job_delete_failed` 并进入 `failedJobIds`，保留原文件以便修复后重试。
+
+批次汇总清单最多包含前 20 个 jobId，并附带对应的 `Count` 和 `Truncated`；dry-run 的
+`wouldDeleteJobIds` 也遵循这个限制。核对完整范围时查看逐任务 `job_would_delete`、
+`job_deleted`、`job_delete_failed` 和 `job_skipped` 记录，不能只依据截断后的汇总。
+
+`GET /api/health` 的 `retention` 返回 `enabled`、`days`、`cleanupTimezone`、`nextCleanupAt`、
+`cleanupRunning` 和 `remainingJobs`。关闭时下次清理时间为 `null`；剩余数量包含正在删除的
+任务，仅代表本轮待处理数量（本轮跳过/失败的任务见日志）。
+`lastCleanupAt` 是上一轮结束的 UTC 时间，`lastCleanupReason` 是触发原因，
+`lastCleanupResult` 为 `success`、`partial_failure`（有任务处理成功，但仍有错误）、`failed`
+或 `cancelled`；关停时完成当前删除后停止批次，剩余任务留待下次清理，结果为 `stopped`。
+`lastCleanupError` 给出脱敏后的首个错误，`pendingDeletionScanFailed`
+报告上一轮是否无法扫描暂存区。尚未执行时这些字段为 `null`；本轮执行期间继续显示上一轮结果。
+dry-run 下 `success` 仅表示审计完成，未删除或移动任何内容；`partial_failure` 也仅表示部分
+审计完成。正式模式的 `success` 表示本轮删除完成或无需删除。判断删除是否已执行必须同时
+核对 `dryRun`、`deletedJobIds` 和 `wouldDeleteJobIds`，不能只依据结果枚举。
+
+health 只读取缓存，不在请求中扫描目录或解析全部任务时间。后台线程在启动时、每小时、
+以及清理后刷新清单，策略关闭时也会刷新。`inventoryUpdatedAt` 仅在整轮扫描成功时推进，
+`inventoryAttemptedAt` 表示最近尝试时间。首次刷新前时间、计数和 `Truncated` 为 `null`，
+`inventoryStale=true`。正常刷新时清单最多滞后一小时，运行标志与本轮剩余数量仍实时返回。
+
+health 和清单日志报告 `dryRun`、`expiredActiveJobIds`、`orphanJobIds`、`pendingDeletionJobIds`
+及 `unmanagedJobIds`。每类清单最多 20 条，分别附有 `expiredActiveCount/Truncated`、
+`orphanCount/Truncated`、`pendingDeletionCount/Truncated` 和 `unmanagedCount/Truncated`。
+`unmanagedJobs` 给出前 20 个任务的具体原因，包括创建时间异常、元数据缺失或 `job.json`
+JSON/字段校验失败；health 的错误原因不包含原始作品内容或绝对路径，I/O 错误仅报告
+异常类型、errno 和标准说明。完整元数据加载错误及路径见应用日志。
+JSON 语法错误包含解析说明与行列，字段错误用点分隔字段名（如 `result.fullTrack: missing`），
+目录与 `jobId` 不一致明确报告 `jobId does not match directory`。
+关闭策略时 `.expired` 残留不会继续删除，但仍报告其摘要；重新正式启用后才重试。
+三类扫描（待删除目录、孤立/异常元数据任务、活跃任务）独立进行。失败时 `inventoryError`
+给出原因、`inventoryStale=true`，失败类别保留上次成功数据并标记对应的 `*Stale=true`；
+没有成功数据的类别，其 `Count` 和 `Truncated` 保持 `null`。其它类别仍刷新。
+计数、空列表或非空 `inventoryUpdatedAt` 均不能单独作为“确认没有残留”的依据。
+
+后台循环遇到意外异常会记录 `retention_monitor_failed` 和应用堆栈，在下次清单刷新间隔重试，
+不会因单轮异常永久停止调度；正常取消仍向上传递。此功能不更改全局日志或 httpx 日志级别；
+文件日志不可写时，仅 retention 自身增加 stderr handler，关停时释放。
+
+音频接口先非阻塞打开并确认普通文件，再恢复阻塞读取；FIFO、目录和 Unix socket 返回 404。
+普通文件不存在返回 404，权限不足返回 403，文件描述符耗尽返回 503（`Retry-After: 5`），
+其余读取前 I/O 故障返回 500 并记录堆栈。服务端故障不能作为“歌曲已过期”的信号；
+响应头已发送后发生的磁盘读取故障只能中断流，客户端应检查下载是否完整。
 
 成功响应继续包含：
 

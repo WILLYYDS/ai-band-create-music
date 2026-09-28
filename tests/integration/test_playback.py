@@ -31,7 +31,7 @@ def wav(path: Path) -> None:
 async def test_four_preview_urls_range_and_stale_versions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    settings = make_settings(tmp_path)
+    settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
     folder = settings.output_dir / "jobs/j/song_1"
     names = {
         "fullTrack": "full.wav",
@@ -72,9 +72,12 @@ async def test_four_preview_urls_range_and_stale_versions(
 
     with monkeypatch.context() as patch:
         patch.setattr(Path, "open", reject_wav_read)
-        assert _render_result_urls(result, "http://testserver", settings)["playback"] == rendered[
-            "playback"
-        ]
+        assert (
+            _render_result_urls(result, "http://testserver", settings)["playback"]
+            == rendered["playback"]
+        )
+    job = GenerationJob(job_id="j", prompt="rock", status="succeeded", stage="completed")
+    job.save(settings.output_dir)
     app = create_app(settings, make_orchestrator(settings))
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app), base_url="http://testserver"
@@ -86,7 +89,10 @@ async def test_four_preview_urls_range_and_stale_versions(
     assert response.headers["content-type"].startswith("audio/mpeg")
     assert response.headers["content-length"] == "3"
     assert response.headers["content-range"].startswith("bytes 0-2/")
-    assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
+    cache_control = response.headers["cache-control"]
+    assert cache_control.startswith("public, max-age=") and cache_control.endswith(", immutable")
+    max_age = int(cache_control.split("max-age=")[1].split(",")[0])
+    assert 3 * 86400 - 5 <= max_age <= 3 * 86400
     assert len(response.content) == 3
 
     previous_mtime = paths["replacedVocal"].stat().st_mtime_ns

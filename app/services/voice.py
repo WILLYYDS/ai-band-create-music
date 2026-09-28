@@ -22,6 +22,7 @@ from app.services.job_files import (
     restore_mix_artifact,
     stored_path_exists,
 )
+from app.services.retention import retained_job
 from app.services.stems import prepare_ffmpeg_environment
 
 logger = logging.getLogger(__name__)
@@ -190,7 +191,7 @@ def install_voice_api(
         job_id: Annotated[str, Form(min_length=1, max_length=100)],
         song: Annotated[int, Form(ge=0)] = 0,
     ) -> dict[str, bool]:
-        job = request.app.state.jobs.get(job_id)
+        job = retained_job(request, job_id)
         job_result = _job_song_result(request, job_id, song)
         if mix_busy(job):
             raise HTTPException(status_code=409, detail="正在合轨，请稍后重试。")
@@ -250,7 +251,7 @@ def install_voice_api(
         job_id: Annotated[str, Form(min_length=1, max_length=100)],
         song: Annotated[int, Form(ge=0)] = 0,
     ) -> dict[str, bool]:
-        job = request.app.state.jobs.get(job_id)
+        job = retained_job(request, job_id)
         job_result = _job_song_result(request, job_id, song)
         if mix_busy(job):
             raise HTTPException(status_code=409, detail="正在合轨，请稍后重试。")
@@ -305,7 +306,7 @@ def install_voice_api(
 
 
 def _job_song_result(request: Request, job_id: str, song: int) -> dict:
-    job = request.app.state.jobs.get(job_id)
+    job = retained_job(request, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Generation job not found")
     if not job.result:

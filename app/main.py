@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import errno
 import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import stat
 import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -23,11 +25,13 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import ValidationError
+from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.core.config import Settings
-from app.core.errors import CapacityExceededError, GenerationError
+from app.core.errors import CapacityExceededError, GenerationError, public_error_reason
 from app.infrastructure.cache import NullCache
 from app.infrastructure.events import NullEventPublisher
 from app.infrastructure.logging import configure_logging
@@ -60,6 +64,15 @@ from app.services.job_files import (
 from app.services.orchestrator import GenerationOrchestrator
 from app.services.prompt import OpenAICompatiblePromptExpander
 from app.services.providers import create_music_provider
+from app.services.retention import (
+    expires_at,
+    is_expired,
+    is_job_active,
+    retained_job,
+    retention_enforced,
+    retention_lifecycle,
+    retention_status,
+)
 from app.services.stems import STEM_NAMES, DemucsStemSeparator
 from app.services.voice import (
     RVCConversionError,
@@ -242,14 +255,18 @@ class GenerationJob:
             temporary.unlink(missing_ok=True)
 
 
-def load_jobs(output_dir: Path) -> dict[str, GenerationJob]:
+def load_jobs(
+    output_dir: Path, metadata_errors: dict[str, str] | None = None
+) -> dict[str, GenerationJob]:
     jobs = {}
     for target in (output_dir / "jobs").glob("*/job.json"):
+        safe_message = None
         try:
             data = json.loads(target.read_text(encoding="utf-8"))
             validated = GenerationJobResponse.model_validate(data)
             if validated.jobId != target.parent.name:
-                raise ValueError("jobId does not match directory")
+                safe_message = "jobId does not match directory"
+                raise ValueError(safe_message)
             job = GenerationJob(
                 job_id=validated.jobId,
                 prompt=validated.prompt,
@@ -307,7 +324,16 @@ def load_jobs(output_dir: Path) -> dict[str, GenerationJob]:
             if repaired:
                 job.save(output_dir)
             jobs[job.job_id] = job
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError) as exc:
+            if metadata_errors is not None:
+                if isinstance(exc, ValidationError):
+                    reason = "; ".join(
+                        f"{'.'.join(map(str, error['loc']))}: {error['type']}"
+                        for error in exc.errors(include_input=False, include_context=False)[:3]
+                    )
+                else:
+                    reason = public_error_reason(exc, safe_message=safe_message)
+                metadata_errors[target.parent.name] = reason[:160]
             logger.exception("Unable to load job metadata: %s", target)
     for leftover in sorted((output_dir / "jobs").glob("*/song_*/.mix-*")):
         # 进程被硬杀时，混音用的临时目录（内含体积不小的 premix.wav）会留在歌曲目录下；
@@ -393,21 +419,22 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        if orchestrator is not None:
-            application.state.orchestrator = orchestrator
-            yield
-            return
-        # Tolerate proxy environments httpx would otherwise reject at client
-        # construction (e.g. `socks://...` exported by common proxy clients).
-        _sanitize_proxy_environment()
-        async with (
-            httpx.AsyncClient() as client,
-            httpx.AsyncClient(trust_env=False) as direct_client,
-        ):
-            application.state.orchestrator = build_orchestrator(
-                application_settings, client, direct_client
-            )
-            yield
+        async with retention_lifecycle(application):
+            if orchestrator is not None:
+                application.state.orchestrator = orchestrator
+                yield
+                return
+            # Tolerate proxy environments httpx would otherwise reject at client
+            # construction (e.g. `socks://...` exported by common proxy clients).
+            _sanitize_proxy_environment()
+            async with (
+                httpx.AsyncClient() as client,
+                httpx.AsyncClient(trust_env=False) as direct_client,
+            ):
+                application.state.orchestrator = build_orchestrator(
+                    application_settings, client, direct_client
+                )
+                yield
 
     application = FastAPI(
         title="AI Band Music Generation API",
@@ -417,7 +444,10 @@ def create_app(
         lifespan=lifespan,
     )
     application.state.settings = application_settings
-    application.state.jobs = load_jobs(application_settings.output_dir)
+    application.state.job_metadata_errors = {}
+    application.state.jobs = load_jobs(
+        application_settings.output_dir, application.state.job_metadata_errors
+    )
     application.state.job_subscribers = {}
     # Startup runs before this app's event loop serves requests. Hash the large RVC assets
     # once here so request/SSE paths only read the cached value.
@@ -496,6 +526,7 @@ def create_app(
                 "cacheBackend": application_settings.cache_backend,
                 "eventBackend": application_settings.event_backend,
             },
+            "retention": retention_status(request.app),
         }
 
     @application.post(
@@ -714,6 +745,7 @@ def create_app(
 
     @application.get("/api/jobs")
     async def generation_history(request: Request):
+        now = datetime.now(timezone.utc)
         return {
             "jobs": [
                 _job_response(
@@ -727,12 +759,15 @@ def create_app(
                 for job in sorted(
                     request.app.state.jobs.values(), key=lambda job: job.created_at, reverse=True
                 )
+                if not retention_enforced(application_settings)
+                or not is_expired(job, application_settings.song_retention_days, now)
+                or is_job_active(job)
             ]
         }
 
     @application.get("/api/jobs/{job_id}/events")
     async def generation_job_events(job_id: str, request: Request):
-        job = request.app.state.jobs.get(job_id)
+        job = retained_job(request, job_id, allow_active=True)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -770,6 +805,17 @@ def create_app(
 
             try:
                 while True:
+                    if (
+                        retention_enforced(application_settings)
+                        and not is_job_active(job)
+                        and is_expired(job, application_settings.song_retention_days)
+                    ):
+                        body = json.dumps({
+                            "success": False, "status": "expired", "jobId": job_id,
+                            "message": "歌曲已过期。",
+                        }, ensure_ascii=False)
+                        yield f"event: done\ndata: {body}\n\n"
+                        return
                     final, body = frame()
                     if final:
                         yield f"event: done\ndata: {body}\n\n"
@@ -796,7 +842,7 @@ def create_app(
         responses={404: {"model": ErrorResponse}},
     )
     async def generation_job(job_id: str, request: Request):
-        job = request.app.state.jobs.get(job_id)
+        job = retained_job(request, job_id, allow_active=True)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -818,7 +864,7 @@ def create_app(
     async def split_generation_job(
         job_id: str, request: Request, response: Response, song: int = 0
     ):
-        job = request.app.state.jobs.get(job_id)
+        job = retained_job(request, job_id)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1105,7 +1151,7 @@ def create_app(
     async def replace_generation_vocal(
         job_id: str, request: Request, response: Response, song: int = 0
     ):
-        job = request.app.state.jobs.get(job_id)
+        job = retained_job(request, job_id)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1599,7 +1645,7 @@ def create_app(
     )
     async def mix_generation_job(job_id: str, request: Request, song: int = 0):
         """任务级合轨：与 /split、/replace 同构，进度走任务状态与 SSE。"""
-        job = request.app.state.jobs.get(job_id)
+        job = retained_job(request, job_id)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1709,7 +1755,7 @@ def create_app(
         payload: UpdateGenerationJobRequest,
         request: Request,
     ):
-        job = request.app.state.jobs.get(job_id)
+        job = retained_job(request, job_id, allow_active=True)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1772,7 +1818,7 @@ def create_app(
         responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
     )
     async def delete_generation_stem(job_id: str, stem_name: str, request: Request, song: int = 0):
-        job = request.app.state.jobs.get(job_id)
+        job = retained_job(request, job_id)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1917,7 +1963,7 @@ def create_app(
         responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
     )
     async def restore_generation_stem(job_id: str, stem_name: str, request: Request, song: int = 0):
-        job = request.app.state.jobs.get(job_id)
+        job = retained_job(request, job_id)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2033,26 +2079,68 @@ def create_app(
     @application.get("/output/{file_path:path}")
     async def audio_file(file_path: str, request: Request) -> StreamingResponse:
         root = application_settings.output_dir.resolve()
-        target = (root / file_path).resolve()
+        try:
+            target = (root / file_path).resolve()
+        except OSError as exc:
+            raise _audio_io_error(exc, root / file_path) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=404, detail="Audio file not found") from exc
         try:
             relative = target.relative_to(root)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="Audio file not found") from exc
         # 隐藏目录一律不对外：.trash 是软删除区，.mix-* 是合轨的中间产物。
-        if any(part.startswith(".") for part in relative.parts) or relative.parts[:1] == ("rvc",):
+        if any(part.startswith(".") for part in relative.parts) or relative.parts[:1] in {
+            ("rvc",),
+            ("logs",),
+        }:
             raise HTTPException(status_code=404, detail="Audio file not found")
-        if not target.is_file():
-            raise HTTPException(status_code=404, detail="Audio file not found")
-        file_size = target.stat().st_size
-        start, end = _parse_byte_range(request.headers.get("range"), file_size)
+        expiry = None
+        if len(relative.parts) >= 2 and relative.parts[0] == "jobs":
+            job = request.app.state.jobs.get(relative.parts[1])
+            if retention_enforced(application_settings):
+                if job is None:
+                    raise HTTPException(status_code=404, detail="任务元数据不可用。")
+                expiry = expires_at(job, application_settings.song_retention_days)
+                if expiry is None:
+                    raise HTTPException(status_code=404, detail="任务创建时间不可用。")
+                if is_expired(job, application_settings.song_retention_days):
+                    raise HTTPException(status_code=404, detail="歌曲已过期。")
+        try:
+            descriptor = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise HTTPException(status_code=404, detail="Audio file not found")
+                os.set_blocking(descriptor, True)
+                source = os.fdopen(descriptor, "rb")
+            except BaseException:
+                os.close(descriptor)
+                raise
+        except OSError as exc:
+            raise _audio_io_error(exc, target) from exc
+        try:
+            file_size = metadata.st_size
+            start, end = _parse_byte_range(request.headers.get("range"), file_size)
+            media_type = detect_audio_content_type(target, header=source.read(12))
+        except OSError as exc:
+            source.close()
+            raise _audio_io_error(exc, target) from exc
+        except BaseException:
+            source.close()
+            raise
         response_status = status.HTTP_206_PARTIAL_CONTENT if request.headers.get("range") else 200
+        cache_seconds = (
+            max(0, int((expiry - datetime.now(timezone.utc)).total_seconds())) if expiry else 0
+        )
         headers = {
             "Accept-Ranges": "bytes",
             "Cache-Control": (
-                "public, max-age=31536000, immutable"
+                f"public, max-age={cache_seconds if expiry else 31536000}, immutable"
                 if len(relative.parts) >= 2
                 and relative.parts[-2] == "playtrack"
                 and re.fullmatch(r".+\.playback-\d+-\d+\.mp3", target.name)
+                and (expiry is not None or not retention_enforced(application_settings))
                 else "no-store"
             ),
             "Content-Length": str(end - start + 1),
@@ -2060,9 +2148,10 @@ def create_app(
         if response_status == status.HTTP_206_PARTIAL_CONTENT:
             headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
         return StreamingResponse(
-            _stream_file(target, start, end),
+            _stream_file(source, start, end),
+            background=BackgroundTask(source.close),
             status_code=response_status,
-            media_type=detect_audio_content_type(target),
+            media_type=media_type,
             headers=headers,
         )
 
@@ -2074,6 +2163,19 @@ def _orchestrator(request: Request) -> GenerationOrchestrator:
     if active is None:
         raise HTTPException(status_code=503, detail="Application is not ready")
     return active
+
+
+def _audio_io_error(exc: OSError, path: Path) -> HTTPException:
+    if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.EISDIR, errno.ELOOP, errno.ENXIO}:
+        return HTTPException(status_code=404, detail="Audio file not found")
+    if isinstance(exc, PermissionError) or exc.errno in {errno.EACCES, errno.EPERM}:
+        return HTTPException(status_code=403, detail="Audio file access denied")
+    logger.error("Audio file IO failure path=%s errno=%s", path, exc.errno, exc_info=True)
+    if exc.errno in {errno.EMFILE, errno.ENFILE}:
+        return HTTPException(
+            status_code=503, detail="Audio service busy", headers={"Retry-After": "5"}
+        )
+    return HTTPException(status_code=500, detail="Audio file IO failure")
 
 
 def _generation_parameters(
@@ -2288,6 +2390,24 @@ def _job_response(
     fingerprint: str | None = None,
 ) -> dict[str, Any]:
     response = job.response()
+    if settings.song_retention_enabled:
+        expiry = (
+            expires_at(job, settings.song_retention_days) if retention_enforced(settings) else None
+        )
+        response["expiresAt"] = expiry.isoformat() if expiry else None
+        expired = expiry is not None and expiry <= datetime.now(timezone.utc)
+        if settings.song_retention_dry_run:
+            retention_state = "dry_run"
+        elif expiry is None:
+            retention_state = "unmanaged"
+        elif expired:
+            retention_state = "expired_active" if is_job_active(job) else "expired"
+        else:
+            retention_state = "retained"
+        response["retentionState"] = retention_state
+        response["audioAvailable"] = bool(job.result) and (
+            not retention_enforced(settings) or (expiry is not None and not expired)
+        )
     if job.result is not None:
         response["result"] = _render_result_urls(
             job.result,
@@ -2463,9 +2583,9 @@ def _parse_byte_range(value: str | None, file_size: int) -> tuple[int, int]:
     return start, min(end, file_size - 1)
 
 
-async def _stream_file(path, start: int, end: int) -> AsyncIterator[bytes]:
+async def _stream_file(source, start: int, end: int) -> AsyncIterator[bytes]:
     remaining = end - start + 1
-    with path.open("rb") as source:
+    with source:
         source.seek(start)
         while remaining > 0:
             chunk = source.read(min(64 * 1024, remaining))
