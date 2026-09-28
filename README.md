@@ -43,8 +43,10 @@ ELEVENLABS_API_KEY=...
 ```
 
 ElevenLabs 直接接收完整的结构化歌词和扩充风格标签，由模型自行安排段落与演唱节奏。
-`durationMinutes` 为 `auto`、`null` 或未传时，不发送 `music_length_ms` 或固定目标时长，
-由模型根据 Prompt 决定时长；显式指定时长时才发送 `music_length_ms`。
+未传 `durationSeconds`，且 `durationMinutes` 为 `auto`、`null` 或未传时，
+不发送 `music_length_ms` 或固定目标时长，由模型根据 Prompt 决定时长。
+`durationSeconds` 优先于 `durationMinutes`；显式指定时长时发送 `music_length_ms`。
+自动时长返回的音频须至少为 3 秒，低于该下限会报错，不保存为成功歌曲。
 后端不会裁剪歌词；组合后的 Prompt 超过接口的 4100 字符上限时会在
 调用前报错。歌词相对目标时长过长时可能无法完整唱完，调用方需要缩短歌词或增加目标时长。
 请求两首时后端会使用相同歌词和风格独立调用两次 ElevenLabs。音频固定请求
@@ -70,7 +72,7 @@ LLM_API_KEY=...
 后端将 LLM 生成的歌词作为 `input`，结构化音乐描述作为 `instructions`，并将返回的
 44.1 kHz WAV 直接保存到 `output`。MiniMax 始终使用自动时长，请求不包含
 `audio_duration`，由模型选择自然完整的时长；即使客户端传入固定时长也会被忽略。
-其他 Provider 在未指定时长时使用 `DEFAULT_DURATION_MINUTES`。
+除 MiniMax 和 ElevenLabs 外，其他 Provider 在未指定时长时使用 `DEFAULT_DURATION_MINUTES`。
 如果两个服务分别运行在 Docker 容器中，请将 `MINIMAX_BASE_URL` 改为可达的容器服务名
 或宿主机地址。
 

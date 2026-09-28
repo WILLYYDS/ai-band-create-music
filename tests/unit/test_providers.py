@@ -307,6 +307,18 @@ async def test_elevenlabs_invalid_pcm_removes_temporary_file(
     assert not list(song_dir.glob("*.wav"))
 
 
+@pytest.mark.parametrize("frame_count", [1, 8_000 * 3 - 1])
+async def test_elevenlabs_auto_rejects_complete_but_short_pcm(
+    tmp_path: Path, frame_count: int
+) -> None:
+    target = tmp_path / "short.wav"
+    chunks = ChunkedBody(b"\0" * (frame_count * 4))
+    with pytest.raises(GenerationError, match="自动时长音频过短"):
+        await ElevenLabsMusicProvider._write_pcm_wav(chunks.__aiter__(), target, 8_000, None)
+    assert not target.exists()
+    assert not list(tmp_path.glob("*.part"))
+
+
 async def test_elevenlabs_accepts_duration_variance_and_sample_rate(tmp_path: Path) -> None:
     pcm = b"\0" * (16_000 * 9 * 2)
 
