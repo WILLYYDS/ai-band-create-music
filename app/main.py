@@ -87,11 +87,10 @@ from app.services.voice import (
 from app.services.waveforms import extract_waveforms
 
 logger = logging.getLogger(__name__)
-SPLIT_PROGRESS = 76
+JOB_EVENT_QUEUE_SIZE = 16
 WAVEFORM_PROGRESS = 90
 SPLIT_COMPLETE_PROGRESS = 100
-REPLACE_PROGRESS = 90
-# 混音是唯一的长耗时阶段，起手就报一个和拆轨同一量级的进度，
+# 保留合轨现有进度契约。
 # 免得运行期的 progress 恒为 null（波形阶段再跳到 WAVEFORM_PROGRESS）。
 MIX_PROGRESS = 76
 MIX_PREVIEW_PROGRESS = 95
@@ -191,6 +190,8 @@ class GenerationJob:
     task: asyncio.Task[None] | None = None
     deleted_stems: dict[str, dict[str, Any]] = field(default_factory=dict)
     deleted_replaced_vocals: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Runtime operation metadata only; never changes the persisted generation state.
+    last_operation: str | None = field(default=None, repr=False)
     split_task: asyncio.Task[None] | None = field(default=None, repr=False)
     split_song: int | None = field(default=None, repr=False)
     split_status: str | None = field(default=None, repr=False)
@@ -618,9 +619,7 @@ def create_app(
                 job.title = title
             job.save(application_settings.output_dir)
 
-            for queue in request.app.state.job_subscribers.get(job.job_id, ()):
-                if queue.empty():
-                    queue.put_nowait(None)
+            _publish_job(job, request)
 
         try:
             result = await _orchestrator(request).generate(
@@ -681,9 +680,7 @@ def create_app(
             job.received_audio_seconds = job.expected_audio_seconds = None
             job.finish_generation()
             job.save(application_settings.output_dir)
-            for queue in request.app.state.job_subscribers.get(job.job_id, ()):
-                if queue.empty():
-                    queue.put_nowait(None)
+            _publish_job(job, request)
 
     @application.post(
         "/api/jobs",
@@ -718,9 +715,7 @@ def create_app(
         )
 
         def publish() -> None:
-            for queue in request.app.state.job_subscribers.get(job_id, ()):
-                if queue.empty():
-                    queue.put_nowait(None)
+            _publish_job(job, request)
 
         def save_and_publish() -> None:
             job.save(application_settings.output_dir)
@@ -826,7 +821,6 @@ def create_app(
                     job,
                     request,
                     application_settings,
-                    include_split=False,
                     include_operations=False,
                     include_waveforms=False,
                 )
@@ -851,30 +845,29 @@ def create_app(
         fingerprint = request.app.state.rvc_model_fingerprint
 
         async def events() -> AsyncIterator[str]:
-            queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+            # 操作阶段保存快照，避免快速阶段被后续状态覆盖；生成进度仍按现有方式合并。
+            queue: asyncio.Queue[GenerationJob | None] = asyncio.Queue(maxsize=JOB_EVENT_QUEUE_SIZE)
             subscribers = request.app.state.job_subscribers.setdefault(job_id, set())
             subscribers.add(queue)
 
-            def frame() -> tuple[bool, str]:
-                """按"即将推送给客户端的状态"生成一帧，并返回它是否为终态。
-
-                判据与帧体必须在同一次同步读取里定下来：分轨/换声会覆盖 job.status，若先判终态
-                再取帧体，操作恰好在本帧之前收尾时（例如 /replace 在客户端连上 SSE 前就跑完了）
-                就会推出 status="running" 与 replaceStatus="succeeded" 自相矛盾的 done 帧，
-                客户端要么误判失败、要么永远等不到终态。
-                """
-                status = _operation_status_override(job) or job.status
-                final = status not in {"pending", "running"}
-                # Ready songs remain available in every frame; unchanged waveforms are
-                # omitted between song completion and the terminal frame.
+            def frame(snapshot: GenerationJob) -> tuple[bool, str]:
                 payload = _job_response(
-                    job,
+                    snapshot,
                     request,
                     application_settings,
-                    include_waveforms=final or job.stage == "song_completed",
+                    include_waveforms=(
+                        (_operation_status(snapshot) or snapshot.status)
+                        not in {"pending", "running"}
+                        or snapshot.stage == "song_completed"
+                    ),
                     fingerprint=fingerprint,
                 )
-                return final, json.dumps(payload, ensure_ascii=False)
+                return (payload["operationStatus"] or payload["status"]) not in {
+                    "pending",
+                    "running",
+                }, json.dumps(payload, ensure_ascii=False)
+
+            snapshot = job
 
             try:
                 while True:
@@ -894,13 +887,16 @@ def create_app(
                         )
                         yield f"event: done\ndata: {body}\n\n"
                         return
-                    final, body = frame()
+                    # 失败/取消优先于缓冲的阶段快照，RVC 收尾不延迟终态通知。
+                    if _operation_status(job) in {"failed", "cancelled"}:
+                        snapshot = job
+                    final, body = frame(snapshot)
                     if final:
                         yield f"event: done\ndata: {body}\n\n"
                         return
                     yield f"data: {body}\n\n"
                     try:
-                        await asyncio.wait_for(queue.get(), timeout=15)
+                        snapshot = await asyncio.wait_for(queue.get(), timeout=15) or job
                     except asyncio.TimeoutError:
                         yield ": keep-alive\n\n"
             finally:
@@ -986,6 +982,10 @@ def create_app(
             )
         stems = result.get("stems")
         if isinstance(stems, dict) and stems:
+            job.last_operation = "split"
+            job.split_song = song
+            job.split_error = None
+            _mark_split_succeeded(job)
             response.status_code = status.HTTP_200_OK
             return await _async_job_response(job, request, application_settings)
         try:
@@ -1001,9 +1001,9 @@ def create_app(
         active_orchestrator = _orchestrator(request)
         job.split_song = song
         job.split_status = "pending"
-        job.split_stage = "splitting"
-        job.split_progress = SPLIT_PROGRESS
-        job.split_message = "Demucs 正在分离音轨"
+        job.split_stage = "starting_split"
+        job.split_progress = 0
+        job.split_message = "正在读取音频"
         job.split_error = None
         try:
             await active_orchestrator.capacity.acquire()
@@ -1025,10 +1025,10 @@ def create_app(
             job.split_message = None
             raise
 
+        job.last_operation = "split"
+
         def publish() -> None:
-            for queue in request.app.state.job_subscribers.get(job_id, ()):
-                if queue.empty():
-                    queue.put_nowait(None)
+            _publish_job(job, request, snapshot=True)
 
         async def execute() -> None:
             wav_ready = False
@@ -1042,17 +1042,27 @@ def create_app(
                     (result.get("songNumber") or song + 1) - 1,
                 )
                 relative_output = output_dir.relative_to(application_settings.output_dir)
+                await asyncio.to_thread(_read_operation_input, full_path)
+                job.split_stage = "splitting"
+                job.split_progress = 25
+                job.split_message = "正在分离音轨"
+                publish()
                 split_result = await active_orchestrator.stem_separator.split(full_path, output_dir)
                 stems = {
                     name: (relative_output / file_name).as_posix()
                     for name, file_name in split_result.files.items()
                 }
                 job.split_stage = "waveform"
-                job.split_progress = WAVEFORM_PROGRESS
-                job.split_message = "正在提取真实波形"
+                job.split_progress = 50
+                job.split_message = "正在提取波形"
                 publish()
+
                 # 连同完整混音一起重新提取：本 PR 之前的任务把 "full" 存成 64 个 bin，
                 # 直接与 640 个 bin 的分轨合并会让客户端拿到长度不一致的波形。
+                def waveform_progress(finished: int, total: int) -> None:
+                    job.split_progress = 50 + round(25 * finished / total)
+                    publish()
+
                 fresh_waveforms = await extract_waveforms(
                     {
                         "full": full_path,
@@ -1060,7 +1070,8 @@ def create_app(
                             name: application_settings.output_dir / relative_output / file_name
                             for name, file_name in split_result.files.items()
                         },
-                    }
+                    },
+                    progress=waveform_progress,
                 )
                 result["stems"] = stems
                 playback = result.setdefault("playback", {})
@@ -1129,15 +1140,14 @@ def create_app(
                 await active_orchestrator.capacity.release()
                 capacity_released = True
                 job.split_stage = "preview"
-                job.split_progress = WAVEFORM_PROGRESS
-                job.split_message = "正在生成试听音频"
+                job.split_progress = 75
+                job.split_message = "正在导出分轨结果"
                 publish()
                 total_previews = len(stems)
                 finished_previews = 0
 
                 async def encode_preview(stem_path: str) -> str | None:
-                    # 编码是本阶段唯一的长活（每轨最长 PLAYBACK_ENCODE_TIMEOUT_SECONDS）：把
-                    # 进度在 90→100 之间随完成的轨道往前走，前端才不会整段看成卡死。
+                    # 按已处理轨道数更新，100 只在结果可用且操作成功后发布。
                     nonlocal finished_previews
                     try:
                         return await make_playback_mp3(
@@ -1146,10 +1156,7 @@ def create_app(
                         )
                     finally:
                         finished_previews += 1
-                        span = SPLIT_COMPLETE_PROGRESS - WAVEFORM_PROGRESS
-                        job.split_progress = WAVEFORM_PROGRESS + round(
-                            span * finished_previews / total_previews
-                        )
+                        job.split_progress = 75 + round(24 * finished_previews / total_previews)
                         publish()
 
                 try:
@@ -1197,6 +1204,7 @@ def create_app(
                 job.split_progress = None
                 job.split_message = "音轨分离失败"
                 job.split_error = "音轨分离失败，请检查服务配置后重试。"
+                publish()
             finally:
                 if not capacity_released:
                     await active_orchestrator.capacity.release()
@@ -1329,6 +1337,13 @@ def create_app(
                     and cached_path.parent == output_dir.resolve()
                     and cached_path.is_file()
                 ):
+                    job.last_operation = "replace"
+                    job.replace_song = song
+                    job.replace_status = "succeeded"
+                    job.replace_stage = "completed"
+                    job.replace_progress = REPLACE_COMPLETE_PROGRESS
+                    job.replace_message = "人声替换完成"
+                    job.replace_error = None
                     response.status_code = status.HTTP_200_OK
                     return await _async_job_response(job, request, application_settings)
             except ValueError:
@@ -1337,9 +1352,9 @@ def create_app(
         active_orchestrator = _orchestrator(request)
         job.replace_song = song
         job.replace_status = "pending"
-        job.replace_stage = "replacing_vocal"
-        job.replace_progress = REPLACE_PROGRESS
-        job.replace_message = "RVC 正在替换人声"
+        job.replace_stage = "preparing_vocal"
+        job.replace_progress = 0
+        job.replace_message = "正在准备输入音频"
         job.replace_error = None
         job.replace_cancel_requested = False
         try:
@@ -1382,15 +1397,23 @@ def create_app(
             invalidate_mix_artifact(job, result)
             job.save(application_settings.output_dir)
 
+        job.last_operation = "replace"
+
         def publish() -> None:
-            for queue in request.app.state.job_subscribers.get(job_id, ()):
-                if queue.empty():
-                    queue.put_nowait(None)
+            _publish_job(job, request, snapshot=True)
 
         async def execute() -> None:
             try:
                 job.replace_status = "running"
                 publish()
+                # 输入准备作为第一阶段；RVC 是整体调用，不估算内部特征提取/推理百分比。
+                try:
+                    await asyncio.to_thread(_read_operation_input, vocal_path)
+                except (GenerationError, OSError):
+                    job.replace_error = "人声输入音频不可读，请检查音轨文件后重试。"
+                    raise
+                if job.replace_cancel_requested:
+                    raise asyncio.CancelledError
                 result_path = output_dir / replacement_filename(vocal_path.name)
                 # 这里刻意不用 TemporaryDirectory 上下文：它在 await 被取消时会立刻 rmtree，
                 # 而 RVC 推理线程无法强停、仍在写这个目录，清理与写文件会互相打架（真实 RVC 还会
@@ -1400,6 +1423,10 @@ def create_app(
                     output_path = temp_dir / "converted.wav"
                     if job.replace_cancel_requested:
                         raise asyncio.CancelledError
+                    job.replace_stage = "replacing_vocal"
+                    job.replace_progress = 25
+                    job.replace_message = "正在转换人声音色"
+                    publish()
                     conversion_task = asyncio.create_task(
                         request.app.state.voice_engine.convert(
                             vocal_path, output_path, rms_mix_rate=0.0
@@ -1415,6 +1442,8 @@ def create_app(
                         # 强停，这里必须等它真正退出，否则临时目录会被提前删除、线程后续写文件失败，
                         # 引擎锁也会在推理仍占用 GPU 时被释放。conversion_task 用 shield 保护，
                         # 所以拿到的异常只反映线程自身的失败，可以安全折叠。
+                        _mark_replace_cancelled(job)
+                        publish()
                         await _await_stuck_replacement_worker(
                             conversion_task, job_id=job_id, song=song, reason="cancelled"
                         )
@@ -1443,21 +1472,19 @@ def create_app(
                         return
                     if job.replace_cancel_requested:
                         raise asyncio.CancelledError
+                    job.replace_stage = "creating_replacement"
+                    job.replace_progress = 50
+                    job.replace_message = "正在创建替换音轨"
+                    publish()
+                    require_readable_file(output_path, "人声替换输出文件不可读")
                     output_path.replace(result_path)
                 finally:
                     # 走到这里 conversion_task 一定已经结束（成功/失败/两条收尾分支都等过它），
                     # 所以删除临时目录不会再和推理线程抢文件。
                     shutil.rmtree(temp_dir, ignore_errors=True)
-                result["replacedVocal"] = result_path.relative_to(
-                    application_settings.output_dir.resolve()
-                ).as_posix()
-                result.setdefault("playback", {}).pop("replacedVocal", None)
-                preview = await make_playback_mp3(result_path, application_settings.output_dir)
-                if preview:
-                    result["playback"]["replacedVocal"] = preview
-                result.setdefault("waveforms", {}).pop("replaced", None)
+                replacement_waveforms = {}
                 try:
-                    result["waveforms"].update(await extract_waveforms({"replaced": result_path}))
+                    replacement_waveforms = await extract_waveforms({"replaced": result_path})
                 except Exception:
                     logger.warning(
                         "replaced vocal waveform skipped job_id=%s song=%s",
@@ -1465,6 +1492,25 @@ def create_app(
                         song,
                         exc_info=True,
                     )
+                if job.replace_cancel_requested:
+                    raise asyncio.CancelledError
+                job.replace_stage = "exporting_replacement"
+                job.replace_progress = 75
+                job.replace_message = "正在导出替换结果"
+                publish()
+                preview = await make_playback_mp3(result_path, application_settings.output_dir)
+                if job.replace_cancel_requested:
+                    raise asyncio.CancelledError
+                job.replace_progress = 99
+                publish()
+                result["replacedVocal"] = result_path.relative_to(
+                    application_settings.output_dir.resolve()
+                ).as_posix()
+                result.setdefault("playback", {}).pop("replacedVocal", None)
+                if preview:
+                    result["playback"]["replacedVocal"] = preview
+                result.setdefault("waveforms", {}).pop("replaced", None)
+                result["waveforms"].update(replacement_waveforms)
                 result["_replacedVocalModel"] = fingerprint
                 job.deleted_replaced_vocals.pop(str(song), None)
                 # 人声内容已经不同，旧成品不再对应当前歌曲：作废引用，需要重新合轨。
@@ -1487,7 +1533,8 @@ def create_app(
                 job.replace_stage = "failed"
                 job.replace_progress = None
                 job.replace_message = "人声替换失败"
-                job.replace_error = "人声替换失败，请检查 RVC 配置后重试。"
+                job.replace_error = job.replace_error or "人声替换失败，请检查 RVC 配置后重试。"
+                publish()
                 _restore_stashed_mix(job, result)
             finally:
                 job.replace_cancel_requested = False
@@ -1563,10 +1610,10 @@ def create_app(
             job.mix_message = None
             raise
 
+        job.last_operation = "mix"
+
         def publish() -> None:
-            for queue in request.app.state.job_subscribers.get(job.job_id, ()):
-                if queue.empty():
-                    queue.put_nowait(None)
+            _publish_job(job, request, snapshot=True)
 
         def restore_result(
             previous_track: object, previous_waveforms: object, previous_playback: object
@@ -1857,11 +1904,12 @@ def create_app(
             # 本身会照常按 succeeded 收尾（见 README 状态契约）。此处改写 split_status 会让
             # PATCH 的响应与随后的最终状态互相矛盾：客户端把 "cancelled" 当终态就再也看不到
             # 已经生成的 WAV 分轨。收尾（stage=completed）期间同样不改写，避免同样的矛盾。
-            if job.split_stage in {"splitting", "waveform"}:
+            if job.split_stage in {"starting_split", "splitting", "waveform"}:
                 job.split_status = "cancelled"
                 job.split_stage = "cancelled"
                 job.split_progress = None
                 job.split_message = "音轨分离已取消"
+                _publish_job(job, request, snapshot=True)
         if (
             job.mix_status in {"pending", "running"}
             and job.mix_task is not None
@@ -1875,9 +1923,7 @@ def create_app(
                 job.mix_progress = None
                 job.mix_message = "合轨已取消"
                 job.mix_error = None
-            for queue in request.app.state.job_subscribers.get(job_id, ()):
-                if queue.empty():
-                    queue.put_nowait(None)
+            _publish_job(job, request, snapshot=True)
         if (
             job.replace_status in {"pending", "running"}
             and job.replace_task is not None
@@ -1886,9 +1932,7 @@ def create_app(
             # ponytail: RVC runs in a worker thread and has no safe stop API; mark cancellation
             # now, keep capacity reserved, then discard its output when inference returns.
             _mark_replace_cancelled(job)
-            for queue in request.app.state.job_subscribers.get(job_id, ()):
-                if queue.empty():
-                    queue.put_nowait(None)
+            _publish_job(job, request, snapshot=True)
         if job.task is not None and not job.task.done():
             job.task.cancel()
             job.status = "cancelled"
@@ -1898,9 +1942,7 @@ def create_app(
             job.received_audio_seconds = job.expected_audio_seconds = None
             job.finish_generation()
             job.save(application_settings.output_dir)
-            for queue in request.app.state.job_subscribers.get(job_id, ()):
-                if queue.empty():
-                    queue.put_nowait(None)
+            _publish_job(job, request)
         return await _async_job_response(job, request, application_settings)
 
     @application.delete(
@@ -2019,9 +2061,7 @@ def create_app(
                 and not job.replace_task.done()
             ):
                 _mark_replace_cancelled(job)
-                for queue in request.app.state.job_subscribers.get(job_id, ()):
-                    if queue.empty():
-                        queue.put_nowait(None)
+                _publish_job(job, request, snapshot=True)
             elif job.replace_song == song and (job.replace_task is None or job.replace_task.done()):
                 job.replace_song = None
                 job.replace_status = None
@@ -2293,25 +2333,40 @@ def _public_base_url(request: Request, settings: Settings) -> str:
     return settings.public_base_url or str(request.base_url).rstrip("/")
 
 
-def _split_status_override(job: GenerationJob) -> str | None:
-    """返回进行中的分轨强加给任务响应的状态；没有分轨在跑时返回 None。
-
-    分轨接口（`POST /api/jobs/{job_id}/split`）只在任务结束后才允许调用，所以 Demucs
-    工作期间任务自身早已是终态（"succeeded"），客户端——包括必须在整个分轨期间保持
-    打开的 SSE 流——要看到的是分轨的 "pending"/"running"。规则集中放在这里，避免各个
-    调用点各自推导。
-    """
-    if job.split_status in {"pending", "running"}:
-        return job.split_status
-    return None
+def _current_operation(job: GenerationJob) -> str | None:
+    for operation in ("mix", "replace", "split"):
+        if getattr(job, f"{operation}_status") in {"pending", "running"}:
+            return operation
+    return job.last_operation
 
 
-def _operation_status_override(job: GenerationJob) -> str | None:
-    if job.mix_status in {"pending", "running"}:
-        return job.mix_status
-    if job.replace_status in {"pending", "running"}:
-        return job.replace_status
-    return _split_status_override(job)
+def _operation_status(job: GenerationJob) -> str | None:
+    operation = _current_operation(job)
+    return getattr(job, f"{operation}_status") if operation else None
+
+
+def _publish_job(job: GenerationJob, request: Request, *, snapshot: bool = False) -> None:
+    queues = request.app.state.job_subscribers.get(job.job_id, ())
+    if not queues:
+        return
+    event = None
+    if snapshot:
+        event = copy.copy(job)
+        event.result = copy.deepcopy(job.result)
+    for queue in queues:
+        # A queued event already wakes the consumer; a generation sentinel can coalesce
+        # because it reads the live job. Operation snapshots always enqueue their state.
+        if not snapshot and not queue.empty():
+            continue
+        if queue.full():
+            queue.get_nowait()  # Bound memory for slow clients; keep the newest updates.
+        queue.put_nowait(event)
+
+
+def _read_operation_input(path: Path) -> None:
+    require_readable_file(path, "音频输入文件不可读")
+    with path.open("rb") as audio:
+        audio.read(12)
 
 
 def _mark_split_succeeded(job: GenerationJob) -> None:
@@ -2358,7 +2413,7 @@ def _reported_mix_status(job: GenerationJob) -> tuple[str | None, int | None]:
 
 def _reported_replace_status(
     job: GenerationJob, settings: Settings, *, fingerprint: str | None = None
-) -> str | None:
+) -> tuple[str | None, int | None]:
     """对外汇报的替换状态：有在途操作就报它，否则从结果里推导。
 
     只依赖 job.replace_status 会有两个洞：它不落盘（重启后回到 None），也不被"恢复被删除的
@@ -2372,20 +2427,29 @@ def _reported_replace_status(
       客户端去跑一个必然失败的 /replace，按 succeeded 汇报，与合轨入口的逃逸一致。
     """
     if job.replace_status is not None:
-        return job.replace_status
+        return job.replace_status, job.replace_song
     result = job.result
-    if not isinstance(result, dict) or not isinstance(result.get("replacedVocal"), str):
-        return None
-    recorded = result.get("_replacedVocalModel")
-    if isinstance(recorded, str) and recorded != fingerprint:
-        if _rvc_assets_present(settings):
-            return None
-        logger.warning(
-            "replacement model fingerprint is unverifiable (RVC assets missing); "
-            "reporting the stored replacement as usable job_id=%s",
-            job.job_id,
-        )
-    return "succeeded"
+    if not isinstance(result, dict):
+        return None, None
+    replaced_songs = []
+    for index, song in enumerate([result, *(result.get("alternatives") or [])]):
+        if not isinstance(song, dict) or not isinstance(song.get("replacedVocal"), str):
+            continue
+        recorded = song.get("_replacedVocalModel")
+        if isinstance(recorded, str) and recorded != fingerprint:
+            if _rvc_assets_present(settings):
+                continue
+            logger.warning(
+                "replacement model fingerprint is unverifiable (RVC assets missing); "
+                "reporting the stored replacement as usable job_id=%s song=%s",
+                job.job_id,
+                index,
+            )
+        replaced_songs.append(index)
+    if not replaced_songs:
+        return None, None
+    # Like mix, identify the song only when exactly one usable replacement survives.
+    return "succeeded", replaced_songs[0] if len(replaced_songs) == 1 else None
 
 
 async def _await_stuck_replacement_worker(
@@ -2460,16 +2524,9 @@ def _rvc_model_fingerprint(settings: Settings) -> str:
 async def _async_job_response(
     job: GenerationJob, request: Request, settings: Settings
 ) -> dict[str, Any]:
-    result = job.result
-    fingerprint = (
-        request.app.state.rvc_model_fingerprint
-        if job.replace_status is None
-        and isinstance(result, dict)
-        and isinstance(result.get("replacedVocal"), str)
-        and isinstance(result.get("_replacedVocalModel"), str)
-        else None
+    return _job_response(
+        job, request, settings, fingerprint=request.app.state.rvc_model_fingerprint
     )
-    return _job_response(job, request, settings, fingerprint=fingerprint)
 
 
 def _job_response(
@@ -2477,7 +2534,6 @@ def _job_response(
     request: Request,
     settings: Settings,
     *,
-    include_split: bool = True,
     include_operations: bool = True,
     include_waveforms: bool = True,
     fingerprint: str | None = None,
@@ -2511,42 +2567,66 @@ def _job_response(
     if not include_operations:
         return response
 
-    split_status = _split_status_override(job)
-    if include_split and split_status is not None:
+    response.update(
+        operation=None,
+        operationStatus=None,
+        operationSong=None,
+        operationStage=None,
+        operationProgress=None,
+        operationMessage=None,
+    )
+    operation = _current_operation(job)
+    if operation:
+        operation_status = getattr(job, f"{operation}_status")
+        if operation_status is not None:
+            response.update(
+                operation=operation,
+                operationStatus=operation_status,
+                operationSong=getattr(job, f"{operation}_song"),
+                operationStage=getattr(job, f"{operation}_stage"),
+                operationProgress=getattr(job, f"{operation}_progress"),
+                operationMessage=getattr(job, f"{operation}_message"),
+            )
+    if response["operationStatus"] in {"pending", "running"}:
+        # Keep the released clients' running-operation projection. Terminal operations
+        # never overwrite the persisted music generation task's success or failure.
         response.update(
-            status=split_status,
-            stage=job.split_stage,
-            progress=job.split_progress,
-            message=job.split_message,
+            status=response["operationStatus"],
+            stage=response["operationStage"],
+            progress=response["operationProgress"],
+            message=response["operationMessage"],
         )
     if job.split_status is not None:
         response["splitStatus"] = job.split_status
         response["splitSong"] = job.split_song
         response["splitError"] = job.split_error
-    replace_status = _reported_replace_status(job, settings, fingerprint=fingerprint)
-    if replace_status in {"pending", "running"}:
-        response.update(
-            status=replace_status,
-            stage=job.replace_stage,
-            progress=job.replace_progress,
-            message=job.replace_message,
-        )
+    replace_status, replace_song = _reported_replace_status(job, settings, fingerprint=fingerprint)
     if replace_status is not None:
         response["replaceStatus"] = replace_status
-        response["replaceSong"] = job.replace_song
+        response["replaceSong"] = replace_song
         response["replaceError"] = job.replace_error
     mix_status, mix_song = _reported_mix_status(job)
-    if mix_status in {"pending", "running"}:
-        response.update(
-            status=mix_status,
-            stage=job.mix_stage,
-            progress=job.mix_progress,
-            message=job.mix_message,
-        )
     if mix_status is not None:
         response["mixStatus"] = mix_status
         response["mixSong"] = mix_song
         response["mixError"] = job.mix_error
+    if response["operationStatus"] is None:
+        # No runtime operation survived restart. Reuse the existing artifact-derived
+        # statuses; a mix is downstream of replacement, so prefer it when both exist.
+        recovered = (
+            "mix"
+            if mix_status == "succeeded"
+            else ("replace" if replace_status == "succeeded" else None)
+        )
+        if recovered:
+            response.update(
+                operation=recovered,
+                operationStatus="succeeded",
+                operationSong=response[f"{recovered}Song"],
+                operationStage="completed",
+                operationProgress=100,
+                operationMessage="合轨完成" if recovered == "mix" else "人声替换完成",
+            )
     return response
 
 

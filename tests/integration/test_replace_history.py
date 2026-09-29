@@ -4,11 +4,16 @@ import asyncio
 import json
 from pathlib import Path
 
-import httpx
-from starlette.requests import Request
-
-from app.main import GenerationJob, create_app
-from tests.helpers import make_orchestrator, make_settings
+from app.main import create_app
+from tests.helpers import (
+    BlockingVoiceEngine,
+    ReadyVoiceEngine,
+    client,
+    events_request,
+    make_orchestrator,
+    make_settings,
+    seed_job,
+)
 
 
 class SlowVoiceEngine:
@@ -27,91 +32,6 @@ class SlowVoiceEngine:
         self.started.set()
         await self.release.wait()
         output_path.write_bytes(marker)
-
-
-def client(app):
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://testserver")
-
-
-def events_request(app, job_id: str) -> Request:
-    return Request(
-        {
-            "type": "http",
-            "app": app,
-            "headers": [],
-            "scheme": "http",
-            "server": ("testserver", 80),
-            "path": f"/api/jobs/{job_id}/events",
-            "root_path": "",
-            "query_string": b"",
-            "method": "GET",
-        }
-    )
-
-
-def seed_job(app, settings, job_id: str = "job-replace") -> tuple[GenerationJob, Path]:
-    song_dir = settings.output_dir / "jobs" / job_id / "song_1"
-    song_dir.mkdir(parents=True, exist_ok=True)
-    full_track = song_dir / "full_song.wav"
-    vocal = song_dir / "demo_vocal.mp3"
-    full_track.write_bytes(b"RIFF-full")
-    vocal.write_bytes(b"ID3-vocal")
-    job = GenerationJob(
-        job_id=job_id,
-        prompt="rock",
-        structured_prompt="[Genre: Rock]",
-        lyrics="[Verse]\ntest",
-        status="succeeded",
-        stage="completed",
-        progress=100,
-        message="音乐生成完成",
-        result={
-            "success": True,
-            "jobId": job_id,
-            "prompt": "rock",
-            "durationMinutes": "auto",
-            "structuredPrompt": "[Genre: Rock]",
-            "lyrics": "[Verse]\ntest",
-            "count": 1,
-            "alternatives": [],
-            "fullTrack": full_track.relative_to(settings.output_dir).as_posix(),
-            "stems": {"vocal": vocal.relative_to(settings.output_dir).as_posix()},
-            "stemUrls": [vocal.relative_to(settings.output_dir).as_posix()],
-            "waveforms": {"vocal": [0.5]},
-            "splitEnabled": True,
-            "debug": {},
-        },
-    )
-    app.state.jobs[job_id] = job
-    job.save(settings.output_dir)
-    return job, vocal
-
-
-class BlockingVoiceEngine:
-    loaded = True
-
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-        self.calls = 0
-        self.params = None
-
-    async def convert(self, input_path: Path, output_path: Path, **_params) -> None:
-        self.calls += 1
-        self.params = _params
-        assert input_path.name == "demo_vocal.mp3"
-        self.started.set()
-        await self.release.wait()
-        output_path.write_bytes(b"RIFF-replaced")
-
-
-class ReadyVoiceEngine:
-    """转换在 POST 返回后立刻完成，用来模拟"客户端连上 SSE 时替换已经收尾"。"""
-
-    loaded = True
-
-    async def convert(self, _input_path: Path, output_path: Path, **_params) -> None:
-        output_path.write_bytes(b"RIFF-replaced")
 
 
 class FailingVoiceEngine:
@@ -151,14 +71,23 @@ async def test_replace_runs_as_job_operation_and_caches_result(tmp_path: Path) -
         cached = await http.post(f"/api/jobs/{job.job_id}/replace?song=0")
 
     assert accepted.status_code == duplicate.status_code == 202
+    assert (
+        running["operationStatus"],
+        running["operationStage"],
+        running["operationProgress"],
+    ) == (
+        "running",
+        "replacing_vocal",
+        25,
+    )
+    assert running["replaceStatus"] == "running"
     assert (running["status"], running["stage"], running["progress"]) == (
         "running",
         "replacing_vocal",
-        90,
+        25,
     )
-    assert running["replaceStatus"] == "running"
-    assert running["replaceSong"] == 0
-    assert running["message"] == "RVC 正在替换人声"
+    assert running["replaceSong"] == running["operationSong"] == 0
+    assert running["operationMessage"] == "正在转换人声音色"
     assert history_running["status"] == "succeeded"
     assert "replaceStatus" not in history_running
     assert blocked_split.status_code == 409
@@ -221,9 +150,7 @@ async def test_deleting_vocal_cancels_active_replace(tmp_path: Path) -> None:
     assert completed["replaceStatus"] == "cancelled"
     assert "replacedVocal" not in completed["result"]
     assert job.replace_cancel_requested is False
-    replaced_file = (
-        settings.output_dir / "jobs" / job.job_id / "song_1" / "demo_rvc_vocal.wav"
-    )
+    replaced_file = settings.output_dir / "jobs" / job.job_id / "song_1" / "demo_rvc_vocal.wav"
     assert not replaced_file.exists()
 
 
@@ -250,9 +177,7 @@ async def test_deleted_replace_result_can_be_regenerated(tmp_path: Path) -> None
             data={"job_id": job.job_id, "filename": "wrong_rvc_vocal.wav"},
         )
         deleted_record = json.loads(
-            (settings.output_dir / "jobs" / job.job_id / "job.json").read_text(
-                encoding="utf-8"
-            )
+            (settings.output_dir / "jobs" / job.job_id / "job.json").read_text(encoding="utf-8")
         )
 
     restarted = create_app(settings, orchestrator, engine)
@@ -290,9 +215,7 @@ async def test_deleted_replace_result_can_be_regenerated(tmp_path: Path) -> None
     assert deleted.status_code == 200
     assert "replacedVocal" not in after_delete["result"]
     assert wrong_restore.status_code == 404
-    assert deleted_record["deletedReplacedVocals"]["0"]["url"].endswith(
-        "demo_rvc_vocal.wav"
-    )
+    assert deleted_record["deletedReplacedVocals"]["0"]["url"].endswith("demo_rvc_vocal.wav")
     assert restored.status_code == 200
     assert "replacedVocal" in after_restore["result"]
     # 恢复后结果里有 replacedVocal，replaceStatus 必须同为成功，不能是 None：
@@ -316,17 +239,13 @@ async def test_rvc_model_change_invalidates_cached_result(tmp_path: Path) -> Non
     async with client(app) as http:
         await http.post(f"/api/jobs/{job.job_id}/replace")
         await job.replace_task
-        old_url = (await http.get(f"/api/jobs/{job.job_id}")).json()["result"][
-            "replacedVocal"
-        ]
+        old_url = (await http.get(f"/api/jobs/{job.job_id}")).json()["result"]["replacedVocal"]
 
     changed_model = tmp_path / "changed-model.pth"
     changed_model.write_bytes(b"changed")
     changed_settings = make_settings(tmp_path, rvc_model_path=changed_model)
     changed_engine = SlowVoiceEngine()
-    restarted = create_app(
-        changed_settings, make_orchestrator(changed_settings), changed_engine
-    )
+    restarted = create_app(changed_settings, make_orchestrator(changed_settings), changed_engine)
     restored_job = restarted.state.jobs[job.job_id]
     async with client(restarted) as http:
         retried = await http.post(f"/api/jobs/{job.job_id}/replace")
@@ -373,6 +292,7 @@ async def test_replace_timeout_keeps_capacity_until_worker_finishes(tmp_path: Pa
         settled = (await http.get("/api/health")).json()
 
     assert failed["status"] == "succeeded"
+    assert failed["operationStatus"] == "failed"
     assert failed["replaceStatus"] == "failed"
     assert failed["replaceError"] == "人声替换超时，请重试。"
     assert patch.json()["replaceStatus"] == "failed"
@@ -384,9 +304,7 @@ async def test_replace_timeout_keeps_capacity_until_worker_finishes(tmp_path: Pa
     assert orchestrator.capacity.active == 0
     assert settled["replacement"]["workersHoldingCapacityAfterTerminal"] == 0
     assert job.replace_cancel_requested is False
-    replaced_file = (
-        settings.output_dir / "jobs" / job.job_id / "song_1" / "demo_rvc_vocal.wav"
-    )
+    replaced_file = settings.output_dir / "jobs" / job.job_id / "song_1" / "demo_rvc_vocal.wav"
     assert not replaced_file.exists()
     assert not list(replaced_file.parent.glob(".rvc-*"))
 
@@ -430,9 +348,7 @@ async def test_failed_rerun_keeps_previous_replaced_vocal(tmp_path: Path) -> Non
     # 重跑成功：新产物同名原子覆盖，链接恢复可用
     retry_engine = SlowVoiceEngine()
     retry_engine.release.set()
-    retrying = create_app(
-        changed_settings, make_orchestrator(changed_settings), retry_engine
-    )
+    retrying = create_app(changed_settings, make_orchestrator(changed_settings), retry_engine)
     retry_job = retrying.state.jobs[job.job_id]
     async with client(retrying) as http:
         assert (await http.post(f"/api/jobs/{job.job_id}/replace")).status_code == 202
@@ -458,6 +374,7 @@ async def test_replace_failure_and_cancel_preserve_generation(tmp_path: Path) ->
         history = (await http.get("/api/jobs")).json()["jobs"]
 
     assert failed["status"] == "succeeded"
+    assert failed["operationStatus"] == "failed"
     assert failed["replaceStatus"] == "failed"
     assert failed["replaceError"] == "人声替换失败，请检查 RVC 配置后重试。"
     assert "secret" not in json.dumps(failed)
@@ -477,6 +394,7 @@ async def test_replace_failure_and_cancel_preserve_generation(tmp_path: Path) ->
         after_cancel = (await http.get(f"/api/jobs/{job.job_id}")).json()
 
     assert cancelled.json()["status"] == "succeeded"
+    assert cancelled.json()["operationStatus"] == "cancelled"
     assert cancelled.json()["replaceStatus"] == "cancelled"
     assert after_cancel["replaceStatus"] == "cancelled"
     assert "replacedVocal" not in after_cancel["result"]
@@ -568,11 +486,8 @@ async def test_done_frame_reports_terminal_state_when_replace_finishes_first(
     assert payload["stage"] == "completed"
     assert payload["progress"] == 100
     assert payload["result"]["replacedVocal"].endswith("/demo_rvc_vocal.wav")
-    # 收尾后顶层 message 回落到生成任务自己的文案；替换完成的说明只在操作进行中覆盖。
-    # 客户端只以 replaceStatus 判定操作终态，因此这里固化"回到生成态"而不是替换文案。
     assert payload["message"] == "音乐生成完成"
-
-
+    assert payload["operationMessage"] == "人声替换完成"
 
 
 async def test_replace_status_survives_delete_and_undo(tmp_path: Path) -> None:
@@ -619,6 +534,8 @@ async def test_replace_status_survives_delete_and_undo(tmp_path: Path) -> None:
     assert retried.status_code == 200
     assert body["replaceStatus"] == "succeeded"
     assert body["result"]["replacedVocal"] == output_url
+
+
 async def test_replace_status_is_derived_after_restart(tmp_path: Path) -> None:
     """重启后 replace_status 会丢（不落盘），但结果还在，响应必须仍然自洽。"""
     settings = make_settings(tmp_path)
@@ -633,9 +550,24 @@ async def test_replace_status_is_derived_after_restart(tmp_path: Path) -> None:
     assert restored_job.replace_status is None
     async with client(restarted) as http:
         detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
+        event = await http.get(f"/api/jobs/{job.job_id}/events")
+        playable = await http.get(detail["result"]["replacedVocal"])
         cached = await http.post(f"/api/jobs/{job.job_id}/replace?song=0")
 
     assert detail["replaceStatus"] == "succeeded"
+    payload = json.loads(event.text.split("data: ", 1)[1])
+    assert event.text.startswith("event: done")
+    assert playable.status_code == 200
+    for row in (detail, payload, cached.json()):
+        assert (
+            row["operation"],
+            row["operationStatus"],
+            row["operationStage"],
+            row["operationProgress"],
+            row["operationSong"],
+            row["replaceSong"],
+        ) == ("replace", "succeeded", "completed", 100, 0, 0)
+        assert (row["status"], row["stage"], row["progress"]) == ("succeeded", "completed", 100)
     assert cached.status_code == 200
     assert cached.json()["replaceStatus"] == "succeeded"
     assert cached.json()["result"]["replacedVocal"].endswith("/demo_rvc_vocal.wav")

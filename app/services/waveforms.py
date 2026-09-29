@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -75,15 +76,24 @@ async def extract_waveform(path: Path, bin_count: int = WAVEFORM_BIN_COUNT) -> l
     return summarize_waveform(np.frombuffer(stdout, dtype="<f4"), bin_count)
 
 
-async def extract_waveforms(paths: dict[str, Path]) -> dict[str, list[float]]:
+async def extract_waveforms(
+    paths: dict[str, Path], *, progress: Callable[[int, int], None] | None = None
+) -> dict[str, list[float]]:
+    finished = 0
+
     async def extract(name: str, path: Path) -> tuple[str, list[float]] | None:
+        nonlocal finished
         try:
-            return name, await extract_waveform(path)
+            result = name, await extract_waveform(path)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("waveform extraction skipped file=%s error=%s", path, exc)
-            return None
+            result = None
+        finished += 1
+        if progress is not None:
+            progress(finished, len(paths))
+        return result
 
     results = await asyncio.gather(*(extract(name, path) for name, path in paths.items()))
     return {result[0]: result[1] for result in results if result is not None and result[1]}

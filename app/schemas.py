@@ -127,6 +127,13 @@ class GenerationJobResponse(BaseModel):
     warning: str | None = None
     result: GenerateResponse | None = None
     error: str | None = None
+    # Operation progress is independent of the music generation task above.
+    operation: Literal["split", "replace", "mix"] | None = None
+    operationStatus: Literal["pending", "running", "succeeded", "failed", "cancelled"] | None = None
+    operationSong: int | None = Field(default=None, ge=0)
+    operationStage: str | None = None
+    operationProgress: int | None = None
+    operationMessage: str | None = None
     splitStatus: Literal["pending", "running", "succeeded", "failed", "cancelled"] | None = None
     splitSong: int | None = None
     splitError: str | None = None
