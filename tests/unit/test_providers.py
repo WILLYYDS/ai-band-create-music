@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import time
 import wave
 from pathlib import Path
 
@@ -34,6 +36,16 @@ class ChunkedBody(httpx.AsyncByteStream):
     async def __aiter__(self):
         for chunk in self.chunks:
             yield chunk
+
+
+class Clock:
+    now = 0
+
+    def monotonic(self):
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
 
 
 MINIMAX_USER_PROMPT = "[歌词与创作内容]\n[Verse]\ntest lyrics\n\n[风格要求]\nrock"
@@ -150,7 +162,7 @@ async def test_elevenlabs_sends_complete_prompt_and_streams_audio(tmp_path: Path
     assert result.debug["mode"] == "prompt_pcm_wav"
     assert result.debug["durationSeconds"] == 3.0
     assert len(requests) == 1
-    assert requests[0].url.path == "/v1/music"
+    assert requests[0].url.path == "/v1/music/stream"
     assert requests[0].url.params["output_format"] == "pcm_8000"
     music_body = json.loads(requests[0].content)
     assert "[Genre: Rock]" in music_body["prompt"]
@@ -158,6 +170,202 @@ async def test_elevenlabs_sends_complete_prompt_and_streams_audio(tmp_path: Path
     assert "Mandarin Chinese lead vocals" in music_body["prompt"]
     assert music_body["music_length_ms"] == 3_000
     assert "composition_plan" not in music_body
+
+
+@pytest.mark.parametrize("duration_seconds", [3, None])
+async def test_elevenlabs_progress_throttles_and_flushes_final_bytes(
+    tmp_path, monkeypatch, duration_seconds
+):
+    reports = []
+
+    clock = Clock()
+    monkeypatch.setattr("app.services.providers.time", clock)
+
+    async def progress(stage, step, total, **values):
+        assert step is total is None
+        reports.append((stage, values))
+
+    pcm = b"\0" * 32_000
+
+    async def chunks():
+        for now in (0, 0.5, 1, 1.5):
+            clock.now = now
+            yield pcm
+
+    target = tmp_path / "stream.wav"
+    duration = await ElevenLabsMusicProvider._write_pcm_wav(
+        chunks(),
+        target,
+        8_000,
+        duration_seconds,
+        progress=progress,
+    )
+    assert duration == 4
+    assert reports == [
+        (
+            "receiving_audio",
+            {
+                "received_audio_seconds": seconds,
+                "expected_audio_seconds": duration_seconds,
+            },
+        )
+        for seconds in (1, 3, 4)
+    ]
+    with wave.open(str(target), "rb") as audio:
+        assert audio.readframes(audio.getnframes()) == pcm * 4
+
+
+async def test_elevenlabs_cancellation_during_final_report_preserves_complete_audio(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("app.services.providers.time", Clock())
+    target = tmp_path / "cancelled.wav"
+    reports = 0
+
+    async def progress(*args, **kwargs):
+        nonlocal reports
+        reports += 1
+        if reports == 2:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await ElevenLabsMusicProvider._write_pcm_wav(
+            ChunkedBody(b"\0" * 32_000, b"\0" * 64_000).__aiter__(),
+            target,
+            8_000,
+            3,
+            progress=progress,
+        )
+    with wave.open(str(target), "rb") as audio:
+        assert audio.getnframes() == 24_000
+    assert not list(tmp_path.glob("*.part"))
+
+
+@pytest.mark.parametrize("status", [402, 403, 404, 405])
+@pytest.mark.parametrize("duration", [3, None])
+async def test_elevenlabs_rejected_stream_falls_back_once_to_compose(
+    tmp_path, monkeypatch, caplog, status, duration
+):
+    monkeypatch.setattr("app.services.providers.time", Clock())
+    requests = []
+    reports = []
+    pcm = b"\0" * 96_000
+
+    async def progress(stage, step, total, **values):
+        assert step is total is None
+        reports.append((stage, values))
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(
+                status, json={"detail": "stream unavailable"}, headers={"x-request-id": "rejected"}
+            )
+        return httpx.Response(200, stream=ChunkedBody(pcm[:32_000], pcm[32_000:]))
+
+    settings = make_settings(
+        tmp_path, elevenlabs_api_key="test", elevenlabs_music_output_format="pcm_8000"
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await ElevenLabsMusicProvider(settings, client).generate(
+            "rock", duration, "", job_id="fallback", progress=progress
+        )
+    assert [request.url.path for request in requests] == ["/v1/music/stream", "/v1/music"]
+    assert requests[0].content == requests[1].content
+    assert requests[0].url.params == requests[1].url.params
+    assert requests[0].headers["xi-api-key"] == requests[1].headers["xi-api-key"]
+    assert result.debug["endpoint"].endswith("/v1/music")
+    assert [stage for stage, _ in reports] == [
+        "generating_music",
+        "receiving_audio",
+        "receiving_audio",
+    ]
+    assert [values["received_audio_seconds"] for _, values in reports] == [None, 1, 3]
+    assert all(values["expected_audio_seconds"] == duration for _, values in reports)
+    assert "falling back to compose" in caplog.text
+    assert f"status={status} job_id=fallback" in caplog.text
+    diagnostics = json.loads((settings.output_dir / "jobs/fallback/prompts.json").read_text())
+    assert diagnostics["providerRequests"][0]["streamFallbackStatus"] == status
+    rejection = diagnostics["providerRequests"][0]["streamFallbackResponse"]
+    assert rejection["statusCode"] == status
+    assert rejection["headers"]["x-request-id"] == "rejected"
+    assert rejection["body"] == {"detail": "stream unavailable"}
+    assert diagnostics["providerRequests"][0]["request"]["url"].endswith("/v1/music")
+    with wave.open(str(result.audio_path), "rb") as audio:
+        assert audio.readframes(audio.getnframes()) == pcm
+
+
+@pytest.mark.parametrize("status", [401, 422, 429, 500])
+async def test_elevenlabs_other_errors_do_not_retry(tmp_path, status):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(status, json={"detail": "rejected"})
+
+    settings = make_settings(tmp_path, elevenlabs_api_key="test")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError):
+            await ElevenLabsMusicProvider(settings, client).generate("rock", 3, "")
+    assert len(requests) == 1
+
+
+async def test_elevenlabs_compose_fallback_failure_does_not_retry(tmp_path):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(403, json={"detail": "rejected"})
+
+    settings = make_settings(tmp_path, elevenlabs_api_key="test")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match="Music API 权限"):
+            await ElevenLabsMusicProvider(settings, client).generate("rock", 3, "")
+    assert len(requests) == 2
+
+
+async def test_elevenlabs_progress_failure_never_discards_audio(tmp_path, caplog, monkeypatch):
+    monkeypatch.setattr("app.services.providers.time", Clock())
+    pcm = b"\0" * 96_000
+    stages = []
+
+    async def progress(stage, *args, **kwargs):
+        stages.append(stage)
+        raise OSError("metadata write failed")
+
+    settings = make_settings(
+        tmp_path, elevenlabs_api_key="test", elevenlabs_music_output_format="pcm_8000"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=ChunkedBody(pcm[:32_000], pcm[32_000:]))
+        )
+    ) as client:
+        result = await ElevenLabsMusicProvider(settings, client).generate(
+            "rock", 3, "", progress=progress
+        )
+    assert stages == ["generating_music", "receiving_audio", "receiving_audio"]
+    assert "progress report failed" in caplog.text
+    with wave.open(str(result.audio_path), "rb") as audio:
+        assert audio.readframes(audio.getnframes()) == pcm
+    assert not list(settings.output_dir.rglob("*.part"))
+
+
+@pytest.mark.parametrize("duration", [0, -1])
+async def test_elevenlabs_rejects_nonpositive_duration_before_request(tmp_path, duration):
+    settings = make_settings(tmp_path, elevenlabs_api_key="test")
+
+    def handler(request):
+        raise AssertionError("invalid duration must not be sent upstream")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match="目标时长必须大于 0"):
+            await ElevenLabsMusicProvider(settings, client).generate("rock", duration, "")
+    with pytest.raises(GenerationError, match="目标时长必须大于 0"):
+        await ElevenLabsMusicProvider._write_pcm_wav(
+            ChunkedBody(b"\0" * 96_000).__aiter__(), tmp_path / "invalid.wav", 8000, duration
+        )
+    assert not list(tmp_path.rglob("*.part"))
 
 
 async def test_elevenlabs_auto_omits_fixed_duration(tmp_path: Path) -> None:
@@ -187,9 +395,7 @@ async def test_elevenlabs_auto_omits_fixed_duration(tmp_path: Path) -> None:
     assert result.debug["durationSeconds"] == 3.0
     with wave.open(str(result.audio_path), "rb") as audio:
         assert audio.readframes(audio.getnframes()) == pcm
-    diagnostics = json.loads(
-        (settings.output_dir / "jobs/auto-job/prompts.json").read_text()
-    )
+    diagnostics = json.loads((settings.output_dir / "jobs/auto-job/prompts.json").read_text())
     assert diagnostics["providerRequests"][0]["request"]["body"] == body
 
 
@@ -280,9 +486,7 @@ async def test_elevenlabs_instrumental_mode_omits_chinese_vocal_direction(tmp_pa
 
 
 @pytest.mark.parametrize("duration_seconds", [3, None])
-@pytest.mark.parametrize(
-    ("pcm", "message"), [(b"", "返回空音频"), (b"\0", "不完整的 PCM 音频帧")]
-)
+@pytest.mark.parametrize(("pcm", "message"), [(b"", "返回空音频"), (b"\0", "不完整的 PCM 音频帧")])
 async def test_elevenlabs_invalid_pcm_removes_temporary_file(
     tmp_path: Path, duration_seconds: int | None, pcm: bytes, message: str
 ) -> None:

@@ -195,14 +195,15 @@ def install_voice_api(
         job_result = _job_song_result(request, job_id, song)
         if mix_busy(job):
             raise HTTPException(status_code=409, detail="正在合轨，请稍后重试。")
-        result_path = _result_path(settings, filename, job_id, song)
+        directory_song = (job_result.get("songNumber") or song + 1) - 1
+        result_path = _result_path(settings, filename, job_id, directory_song)
         # 这个入口只管理"派生音频"的软删除。母带删掉整首歌就没法播放了，所以明确拒绝
         # （与"完整混音不能作为分轨删除"同一考虑）。
         if _resolves_to(settings, job_result.get("fullTrack"), result_path):
             raise HTTPException(status_code=409, detail="完整音频不能作为替换产物删除。")
         if not result_path.is_file():
             raise HTTPException(status_code=404, detail="Converted audio not found")
-        trash_path = trash_result_path(settings, filename, job_id, song)
+        trash_path = trash_result_path(settings, filename, job_id, directory_song)
         trash_path.parent.mkdir(parents=True, exist_ok=True)
         trash_path.unlink(missing_ok=True)
         result_path.replace(trash_path)
@@ -255,9 +256,10 @@ def install_voice_api(
         job_result = _job_song_result(request, job_id, song)
         if mix_busy(job):
             raise HTTPException(status_code=409, detail="正在合轨，请稍后重试。")
-        result_path = _result_path(settings, filename, job_id, song)
+        directory_song = (job_result.get("songNumber") or song + 1) - 1
+        result_path = _result_path(settings, filename, job_id, directory_song)
         if not result_path.is_file():
-            trash_path = trash_result_path(settings, filename, job_id, song)
+            trash_path = trash_result_path(settings, filename, job_id, directory_song)
             if not trash_path.is_file():
                 raise HTTPException(status_code=404, detail="Deleted audio not found")
             result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -309,6 +311,8 @@ def _job_song_result(request: Request, job_id: str, song: int) -> dict:
     job = retained_job(request, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Generation job not found")
+    if job.status != "succeeded":
+        raise HTTPException(status_code=409, detail="生成任务尚未完成，无法编辑音频。")
     if not job.result:
         raise HTTPException(status_code=409, detail="Generation job has no audio result")
     results = [job.result, *(job.result.get("alternatives") or [])]
@@ -399,13 +403,7 @@ def trash_result_path(
     job_id: str,
     song: int = 0,
 ) -> Path:
-    return (
-        settings.output_dir
-        / ".trash"
-        / job_id
-        / f"song_{song + 1}"
-        / _result_filename(filename)
-    )
+    return settings.output_dir / ".trash" / job_id / f"song_{song + 1}" / _result_filename(filename)
 
 
 def mix_output_filename(vocal_filename: str) -> str:

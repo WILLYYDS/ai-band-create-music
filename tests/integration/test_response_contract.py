@@ -1,12 +1,7 @@
-"""固化「result / alternatives / count」的响应契约。
+"""固化可用歌曲的 result / alternatives / count 与独立歌曲状态的响应契约。
 
-前端 `availableSongIndex` 会把选中曲目夹到 `musicGenerationOutputs(result).length - 1`，
-也就是 `[result, ...alternatives]` 的长度。一旦出现「带 result 但 alternatives 缺失或偏短」的帧
-或响应，正在看第 2 首的用户会被静默拽回第 1 首并被写回存储。这里把该形状不可能出现这件事
-固化成测试。
-
-测试数据优先使用 output/ 里真实落盘的任务（含真实的 count=2 任务）；仓库里没有时按生成器
-实际写出的字段结构重建，保证结构本身不会漂移。
+生成中的任务也可携带已完成歌曲；count 始终是可用歌曲数，requestedCount 是请求数。
+前端按 songNumber 与 songStates 区分尚未完成、失败和已经可以播放的歌曲。
 """
 
 from __future__ import annotations
@@ -119,25 +114,23 @@ def test_every_persisted_result_declares_alternatives_and_matching_count():
         assert result["count"] == 1 + len(result["alternatives"]), job_id
 
 
-def test_running_job_frames_never_carry_a_partial_result(tmp_path):
-    """生成中的任务：result 恒为 null —— 前端因此不会夹取用户选择。
-
-    这也是「带 result 但 alternatives 缺失」这类帧不可能出现的根据：job.result 只在整套
-    orchestrator 生成结束后被一次性赋值，中途任何一帧都还没有 result。
-    """
+def test_running_job_can_publish_first_song_while_second_is_running(tmp_path):
     settings = make_settings(tmp_path)
-    job = _job("job_running", status="running", count=None, stage="generating_music")
-    # 模拟 orchestrator 内部 report() 推进阶段：只改状态字段，绝不动 result
-    for stage, message in (
-        ("generating_music", "音乐模型正在生成第 1/2 首"),
-        ("saving_audio", "正在保存第 1 首"),
-        ("generating_music", "音乐模型正在生成第 2/2 首"),
-    ):
-        job.status, job.stage, job.progress, job.message = "running", stage, None, message
-        payload = _job_response(job, fake_request(object()), settings, include_waveforms=False)
-        assert payload["status"] == "running"
-        assert payload["result"] is None, f"{stage} 阶段不应带 result"
-        assert "count" not in payload
+    job = _job("job_running", status="running", count=1, stage="generating_music")
+    job.result.update(requestedCount=2, songNumber=1)
+    job.current_song = 2
+    job.song_states = [
+        {"songNumber": 1, "status": "succeeded", "stage": "song_completed", "progress": 100},
+        {"songNumber": 2, "status": "running", "stage": "generating_music", "progress": None},
+    ]
+    payload = _job_response(job, fake_request(object()), settings)
+    assert payload["status"] == "running"
+    assert payload["currentSong"] == 2
+    assert payload["result"]["requestedCount"] == 2
+    assert payload["result"]["count"] == 1
+    assert payload["result"]["alternatives"] == []
+    assert payload["result"]["waveforms"] == {"full": [0.25, 0.5]}
+    assert payload["songStates"] == job.song_states
 
 
 def test_terminal_frame_always_carries_every_song(tmp_path):
@@ -156,7 +149,7 @@ def test_terminal_frame_always_carries_every_song(tmp_path):
 
 
 def test_successful_job_can_never_be_missing_alternatives(tmp_path):
-    """唯一的「带 result」来源是 orchestrator 的成功返回，它一定会写 alternatives 键。"""
+    """中途发布和最终返回的 result 都包含 alternatives 键。"""
     settings = make_settings(tmp_path)
     job = _job("job_two", status="succeeded", count=2)
     assert "alternatives" in job.result
