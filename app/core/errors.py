@@ -24,5 +24,9 @@ class GenerationError(RuntimeError):
     """A user-facing failure in the music generation pipeline."""
 
 
+class ProviderGlobalError(GenerationError):
+    """A provider-wide failure that must stop further song requests."""
+
+
 class CapacityExceededError(GenerationError):
     """Raised when all local generation slots are occupied."""

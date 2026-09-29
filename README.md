@@ -307,6 +307,9 @@ SSE 仅在 `song_completed` 帧及终态帧附带波形，其余中间帧的 `wa
 
 第二首失败不会撤回第一首：任务以 `status=succeeded` 收尾，`warning` 说明部分失败，
 `songStates[1].status=failed` 和 `error` 保存第二首的错误。两首都失败才令任务 `failed`。
+明确的 provider 全局错误例外：鉴权、套餐、配额或限流错误（HTTP 401/402/403/429）以及
+缺少必需配置会终止后续歌曲调用，任务标为 `failed`，但已经发布的歌曲仍可播放和下载。
+ElevenLabs 的 402/403 流式端点拒绝仍先单次回退 compose；回退也失败才按全局错误终止。
 生成被取消或服务器重启时，已经发布的歌曲也保留，未完成的歌曲分别标为 `cancelled` 或 `failed`。
 `result.count` 始终等于可用歌曲数（`1 + alternatives.length`），`requestedCount` 是请求数；
 每个输出的 `songNumber` 表示原始序号。因此第一首失败、第二首成功时，`result.count=1`、

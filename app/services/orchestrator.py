@@ -9,7 +9,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from app.core.config import Settings
-from app.core.errors import CapacityExceededError, GenerationError
+from app.core.errors import CapacityExceededError, GenerationError, ProviderGlobalError
 from app.infrastructure.events import EventPublisher, GenerationEvent
 from app.infrastructure.queue import TaskDispatcher
 from app.schemas import SongGenerationState
@@ -347,7 +347,7 @@ class GenerationOrchestrator:
                     if latest_result is not None:
                         latest_result = {**latest_result, "warning": "；".join(failures)}
                     await report("song_failed", task_progress, failures[-1])
-                    if effective_count == 1:
+                    if isinstance(exc, ProviderGlobalError) or effective_count == 1:
                         raise
                     continue
                 outputs.append(output)

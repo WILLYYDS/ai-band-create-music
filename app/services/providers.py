@@ -15,7 +15,7 @@ from uuid import NAMESPACE_URL, uuid5
 import httpx
 
 from app.core.config import PROJECT_ROOT, Settings
-from app.core.errors import GenerationError
+from app.core.errors import GenerationError, ProviderGlobalError
 from app.services.audio_files import download_audio, require_readable_file, write_stream_atomically
 from app.services.job_files import job_song_dir, update_provider_diagnostic
 from app.services.prompt import (
@@ -26,6 +26,7 @@ from app.services.prompt import (
 logger = logging.getLogger(__name__)
 
 MINIMAX_GENERATE_PATH = "/v1/audio/jobs"
+GLOBAL_PROVIDER_HTTP_STATUSES = {401, 402, 403, 429}
 MINIMAX_LYRIC_LINE_LIMIT = 32
 # The 4100-character prompt limit applies to both compose and stream endpoints:
 # https://elevenlabs.io/docs/api-reference/music/compose
@@ -350,7 +351,7 @@ class ElevenLabsMusicProvider:
     def _api_key(self) -> str:
         secret = self._settings.elevenlabs_api_key or self._settings.music_api_key
         if secret is None:
-            raise GenerationError("ElevenLabs 音乐生成失败：缺少 ELEVENLABS_API_KEY 环境变量。")
+            raise ProviderGlobalError("ElevenLabs 音乐生成失败：缺少 ELEVENLABS_API_KEY 环境变量。")
         return secret.get_secret_value()
 
     def _headers(self) -> dict[str, str]:
@@ -482,7 +483,12 @@ class ElevenLabsMusicProvider:
         except GenerationError:
             raise
         except httpx.HTTPStatusError as exc:
-            raise GenerationError(self._failure_message(exc)) from exc
+            error_type = (
+                ProviderGlobalError
+                if exc.response.status_code in GLOBAL_PROVIDER_HTTP_STATUSES
+                else GenerationError
+            )
+            raise error_type(self._failure_message(exc)) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise GenerationError(f"ElevenLabs 音乐生成失败：{_http_failure_message(exc)}") from exc
 
@@ -737,7 +743,7 @@ class MiniMaxMusicProvider:
         job_id: str | None = None,
     ) -> MusicResult:
         if not self._settings.minimax_base_url:
-            raise GenerationError("MiniMax 音乐生成失败：MINIMAX_BASE_URL 不能为空。")
+            raise ProviderGlobalError("MiniMax 音乐生成失败：MINIMAX_BASE_URL 不能为空。")
         # MiniMax decides its own natural duration; fixed values from shared callers are ignored.
         del duration_seconds
         try:
@@ -911,9 +917,12 @@ class MiniMaxMusicProvider:
                 "请求已绕过系统代理；请确认服务监听地址、端口和防火墙配置。"
             ) from exc
         except httpx.HTTPStatusError as exc:
-            raise GenerationError(
-                f"MiniMax Music 3 服务调用失败：{_http_failure_message(exc)}"
-            ) from exc
+            error_type = (
+                ProviderGlobalError
+                if exc.response.status_code in GLOBAL_PROVIDER_HTTP_STATUSES
+                else GenerationError
+            )
+            raise error_type(f"MiniMax Music 3 服务调用失败：{_http_failure_message(exc)}") from exc
         except (httpx.HTTPError, ValueError, wave.Error) as exc:
             raise GenerationError(
                 f"MiniMax Music 3 服务调用失败：{_http_failure_message(exc)}"

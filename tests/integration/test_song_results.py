@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from app.core.errors import GenerationError
+from app.core.errors import GenerationError, ProviderGlobalError
 from app.main import GenerationJob, create_app, load_jobs
 from tests.helpers import make_orchestrator, make_settings
 
@@ -149,3 +149,57 @@ async def test_voice_result_edits_require_completed_generation(tmp_path, status,
     assert "生成任务尚未完成" in response.json()["detail"]
     assert track.read_bytes() == b"ready audio"
     assert not (settings.output_dir / ".trash").exists()
+
+
+@pytest.mark.parametrize("endpoint", ["/api/generate", "/api/jobs"])
+@pytest.mark.parametrize("failed_song", [0, 1])
+async def test_global_provider_failure_stops_song_requests(
+    tmp_path, monkeypatch, endpoint, failed_song
+):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    original_generate = orchestrator.music_provider.generate
+    orchestrator.events.publish = AsyncMock()
+    monkeypatch.setattr("app.services.orchestrator.make_playback_mp3", AsyncMock(return_value=None))
+    monkeypatch.setattr("app.services.orchestrator.extract_waveforms", AsyncMock(return_value={}))
+    calls = []
+
+    async def generate(*args, variation=0, **kwargs):
+        calls.append(variation)
+        if variation == failed_song:
+            raise ProviderGlobalError("provider quota exhausted")
+        return await original_generate(*args, variation=variation, **kwargs)
+
+    orchestrator.music_provider.generate = generate
+    app = create_app(settings, orchestrator)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://testserver"
+    ) as client:
+        response = await client.post(endpoint, json={"prompt": "rock", "count": 2})
+        if endpoint == "/api/jobs":
+            assert response.status_code == 202
+            job_id = response.json()["jobId"]
+            await app.state.jobs[job_id].task
+        else:
+            assert response.status_code == 500
+            job_id = next(iter(app.state.jobs))
+        row = (await client.get(f"/api/jobs/{job_id}")).json()
+        assert calls == list(range(failed_song + 1))
+        assert row["status"] == "failed"
+        assert row["currentSong"] is None
+        assert row["error"] == "provider quota exhausted"
+        assert [song["status"] for song in row["songStates"]] == (
+            ["succeeded", "failed"] if failed_song else ["failed", "failed"]
+        )
+        if failed_song:
+            assert row["result"]["count"] == 1
+            assert row["result"]["songNumber"] == 1
+            assert (await client.get(row["result"]["fullTrack"])).content == b"ID3-full-audio"
+        else:
+            assert row["result"] is None
+        restored = load_jobs(settings.output_dir)[job_id]
+        assert restored.status == "failed"
+        assert restored.song_states == row["songStates"]
+        assert (restored.result is None) == (row["result"] is None)
+    events = [call.args[0].name for call in orchestrator.events.publish.await_args_list]
+    assert events == ["generation.started", "generation.failed"]

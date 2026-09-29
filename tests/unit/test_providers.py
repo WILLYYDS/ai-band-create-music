@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app.core.errors import GenerationError
+from app.core.errors import GenerationError, ProviderGlobalError
 from app.services.providers import (
     ElevenLabsMusicProvider,
     GenericMusicProvider,
@@ -322,6 +322,25 @@ async def test_elevenlabs_compose_fallback_failure_does_not_retry(tmp_path):
         with pytest.raises(GenerationError, match="Music API 权限"):
             await ElevenLabsMusicProvider(settings, client).generate("rock", 3, "")
     assert len(requests) == 2
+
+
+@pytest.mark.parametrize("provider_class", [ElevenLabsMusicProvider, MiniMaxMusicProvider])
+@pytest.mark.parametrize("status", [401, 402, 403, 429, 422, 500])
+async def test_providers_classify_global_http_errors(tmp_path, provider_class, status):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(status, json={"detail": "rejected"})
+
+    settings = make_settings(tmp_path, elevenlabs_api_key="test")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError) as caught:
+            await provider_class(settings, client).generate("rock", 3, MINIMAX_USER_PROMPT)
+    assert isinstance(caught.value, ProviderGlobalError) == (status in {401, 402, 403, 429})
+    assert len(requests) == (
+        2 if provider_class is ElevenLabsMusicProvider and status in {402, 403} else 1
+    )
 
 
 async def test_elevenlabs_progress_failure_never_discards_audio(tmp_path, caplog, monkeypatch):
