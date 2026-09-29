@@ -36,6 +36,7 @@ class PlaybackUrls(BaseModel):
 
 
 class MusicOutput(BaseModel):
+    songNumber: int | None = Field(default=None, ge=1, le=2, exclude_if=lambda value: value is None)
     fullTrack: str
     playback: PlaybackUrls | None = Field(default=None, exclude_if=lambda value: value is None)
     mixedTrack: str | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -79,6 +80,19 @@ class UpdateGenerationJobRequest(BaseModel):
     status: Literal["cancelled"]
 
 
+class SongGenerationState(BaseModel):
+    songNumber: int = Field(ge=1, le=2)
+    status: Literal["pending", "running", "succeeded", "failed", "cancelled"]
+    stage: str
+    message: str = ""
+    progress: int | None = Field(default=None, ge=0, le=100)
+    step: int | None = None
+    totalSteps: int | None = None
+    receivedAudioSeconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    expectedAudioSeconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    error: str | None = None
+
+
 class GenerationJobResponse(BaseModel):
     @model_serializer(mode="wrap")
     def serialize_retention(self, handler):
@@ -104,6 +118,10 @@ class GenerationJobResponse(BaseModel):
     progress: int | None = None
     step: int | None = None
     totalSteps: int | None = None
+    receivedAudioSeconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    expectedAudioSeconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    currentSong: int | None = Field(default=None, ge=1, le=2)
+    songStates: list[SongGenerationState] = Field(default_factory=list)
     message: str
     # Backward-compatible response field used by released clients.
     warning: str | None = None

@@ -178,6 +178,10 @@ class GenerationJob:
     progress: int | None = None
     step: int | None = None
     total_steps: int | None = None
+    received_audio_seconds: float | None = None
+    expected_audio_seconds: float | None = None
+    current_song: int | None = None
+    song_states: list[dict[str, Any]] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     message: str = "任务已创建"
     # Persisted response compatibility for jobs created by older releases.
@@ -220,6 +224,10 @@ class GenerationJob:
             "title": self.title,
             "step": self.step,
             "totalSteps": self.total_steps,
+            "receivedAudioSeconds": self.received_audio_seconds,
+            "expectedAudioSeconds": self.expected_audio_seconds,
+            "currentSong": self.current_song,
+            "songStates": self.song_states,
             "prompt": self.prompt,
             "structuredPrompt": self.structured_prompt,
             "lyrics": self.lyrics,
@@ -231,6 +239,22 @@ class GenerationJob:
             "result": self.result,
             "error": self.error,
         }
+
+    def finish_generation(self) -> None:
+        self.current_song = None
+        for song in self.song_states:
+            if song["status"] in {"pending", "running"}:
+                song.update(
+                    status=self.status,
+                    stage=self.stage,
+                    message=self.error or self.message,
+                    progress=None,
+                    step=None,
+                    totalSteps=None,
+                    receivedAudioSeconds=None,
+                    expectedAudioSeconds=None,
+                    error=self.error or self.message,
+                )
 
     def save(self, output_dir: Path) -> None:
         target = output_dir / "jobs" / self.job_id / "job.json"
@@ -279,6 +303,10 @@ def load_jobs(
                 progress=validated.progress,
                 step=validated.step,
                 total_steps=validated.totalSteps,
+                received_audio_seconds=validated.receivedAudioSeconds,
+                expected_audio_seconds=validated.expectedAudioSeconds,
+                current_song=validated.currentSong,
+                song_states=[song.model_dump() for song in validated.songStates],
                 message=validated.message,
                 warning=validated.warning,
                 error=validated.error,
@@ -319,7 +347,9 @@ def load_jobs(
             if job.status in {"pending", "running"}:
                 job.status = job.stage = "failed"
                 job.progress = job.step = job.total_steps = None
+                job.received_audio_seconds = job.expected_audio_seconds = None
                 job.error = job.message = "服务器重启，生成任务已中断。"
+                job.finish_generation()
                 repaired = True
             if repaired:
                 job.save(output_dir)
@@ -548,9 +578,7 @@ def create_app(
                 content={"success": False, "message": str(exc)},
             )
         request_id = request.headers.get("X-Request-ID") or uuid4().hex
-        job = GenerationJob(
-            job_id=f"job_{uuid4().hex}", prompt=prompt, title=payload.title
-        )
+        job = GenerationJob(job_id=f"job_{uuid4().hex}", prompt=prompt, title=payload.title)
         job.save(application_settings.output_dir)
         request.app.state.jobs[job.job_id] = job
 
@@ -564,10 +592,24 @@ def create_app(
             step=None,
             total_steps=None,
             title=None,
+            received_audio_seconds=None,
+            expected_audio_seconds=None,
+            current_song=None,
+            song_states=None,
+            result=None,
         ):
             job.status = "running"
             job.stage, job.progress, job.message = stage, progress, message
             job.step, job.total_steps = step, total_steps
+            job.received_audio_seconds = received_audio_seconds
+            job.expected_audio_seconds = expected_audio_seconds
+            job.current_song = current_song
+            if song_states is not None:
+                job.song_states = copy.deepcopy(song_states)
+            if result is not None:
+                job.result = copy.deepcopy(result)
+                job.result["createdAt"] = job.created_at
+                job.warning = result.get("warning")
             if structured_prompt is not None:
                 job.structured_prompt = structured_prompt
             if lyrics is not None:
@@ -575,6 +617,10 @@ def create_app(
             if title is not None:
                 job.title = title
             job.save(application_settings.output_dir)
+
+            for queue in request.app.state.job_subscribers.get(job.job_id, ()):
+                if queue.empty():
+                    queue.put_nowait(None)
 
         try:
             result = await _orchestrator(request).generate(
@@ -589,13 +635,19 @@ def create_app(
             )
             job.result = result
             job.status, job.stage, job.progress = "succeeded", "completed", 100
-            job.message = "音乐生成完成"
+            job.message = result.get("warning") or "音乐生成完成"
+            job.warning = result.get("warning")
             result["createdAt"] = job.created_at
             job.save(application_settings.output_dir)
             request.app.state.jobs[job.job_id] = job
             return _render_result_urls(
                 result, _public_base_url(request, application_settings), application_settings
             )
+        except asyncio.CancelledError:
+            job.status = job.stage = "cancelled"
+            job.progress = None
+            job.message = "任务已取消"
+            raise
         except HTTPException as exc:
             job.error = str(exc)
             raise
@@ -620,13 +672,18 @@ def create_app(
                 content={"success": False, "message": "生成失败，请查看后端日志。"},
             )
         finally:
-            if job.result is None:
+            if job.status in {"pending", "running"}:
                 job.status = job.stage = "failed"
                 job.progress = None
                 job.error = job.error or "生成任务已中断。"
                 job.message = job.error
             job.step = job.total_steps = None
+            job.received_audio_seconds = job.expected_audio_seconds = None
+            job.finish_generation()
             job.save(application_settings.output_dir)
+            for queue in request.app.state.job_subscribers.get(job.job_id, ()):
+                if queue.empty():
+                    queue.put_nowait(None)
 
     @application.post(
         "/api/jobs",
@@ -687,12 +744,26 @@ def create_app(
             step: int | None = None,
             total_steps: int | None = None,
             title: str | None = None,
+            received_audio_seconds: float | None = None,
+            expected_audio_seconds: float | None = None,
+            current_song: int | None = None,
+            song_states: list[dict[str, Any]] | None = None,
+            result: dict[str, Any] | None = None,
         ) -> None:
             job.status = "running"
             job.stage = stage
             job.progress = progress
             job.step = step
             job.total_steps = total_steps
+            job.received_audio_seconds = received_audio_seconds
+            job.expected_audio_seconds = expected_audio_seconds
+            job.current_song = current_song
+            if song_states is not None:
+                job.song_states = copy.deepcopy(song_states)
+            if result is not None:
+                job.result = copy.deepcopy(result)
+                job.result["createdAt"] = job.created_at
+                job.warning = result.get("warning")
             job.message = message
             if structured_prompt is not None:
                 job.structured_prompt = structured_prompt
@@ -722,7 +793,8 @@ def create_app(
                 job.result["createdAt"] = job.created_at
                 job.stage = "completed"
                 job.progress = 100
-                job.message = "音乐生成完成"
+                job.message = job.result.get("warning") or "音乐生成完成"
+                job.warning = job.result.get("warning")
             except asyncio.CancelledError:
                 job.status = "cancelled"
                 job.stage = "cancelled"
@@ -735,6 +807,8 @@ def create_app(
                 job.error = str(exc)
             finally:
                 job.step = job.total_steps = None
+                job.received_audio_seconds = job.expected_audio_seconds = None
+                job.finish_generation()
                 if job.status != "succeeded":
                     job.progress = None
                 await active_orchestrator.capacity.release()
@@ -791,14 +865,13 @@ def create_app(
                 """
                 status = _operation_status_override(job) or job.status
                 final = status not in {"pending", "running"}
-                # 任务结束前 result 不会变：分轨只在收尾那一刻一次性写入 stems 和波形，
-                # 紧接着 status 就变成终态。所以中间帧只推阶段进度，真实波形留给 done
-                # 帧——否则每次 15 秒保活超时都会重推一整份 640-bin 波形。
+                # Ready songs remain available in every frame; unchanged waveforms are
+                # omitted between song completion and the terminal frame.
                 payload = _job_response(
                     job,
                     request,
                     application_settings,
-                    include_waveforms=final,
+                    include_waveforms=final or job.stage == "song_completed",
                     fingerprint=fingerprint,
                 )
                 return final, json.dumps(payload, ensure_ascii=False)
@@ -810,10 +883,15 @@ def create_app(
                         and not is_job_active(job)
                         and is_expired(job, application_settings.song_retention_days)
                     ):
-                        body = json.dumps({
-                            "success": False, "status": "expired", "jobId": job_id,
-                            "message": "歌曲已过期。",
-                        }, ensure_ascii=False)
+                        body = json.dumps(
+                            {
+                                "success": False,
+                                "status": "expired",
+                                "jobId": job_id,
+                                "message": "歌曲已过期。",
+                            },
+                            ensure_ascii=False,
+                        )
                         yield f"event: done\ndata: {body}\n\n"
                         return
                     final, body = frame()
@@ -958,7 +1036,11 @@ def create_app(
             try:
                 job.split_status = "running"
                 publish()
-                output_dir = job_song_dir(application_settings.output_dir, job_id, song)
+                output_dir = job_song_dir(
+                    application_settings.output_dir,
+                    job_id,
+                    (result.get("songNumber") or song + 1) - 1,
+                )
                 relative_output = output_dir.relative_to(application_settings.output_dir)
                 split_result = await active_orchestrator.stem_separator.split(full_path, output_dir)
                 stems = {
@@ -1029,9 +1111,12 @@ def create_app(
                     if key.startswith(deleted_prefix):
                         try:
                             target = _output_path_from_url(deleted["url"], application_settings)
-                            _stem_trash_path(target, application_settings, job_id, song).unlink(
-                                missing_ok=True
-                            )
+                            _stem_trash_path(
+                                target,
+                                application_settings,
+                                job_id,
+                                (result.get("songNumber") or song + 1) - 1,
+                            ).unlink(missing_ok=True)
                         except (KeyError, OSError, ValueError):
                             logger.warning(
                                 "failed to clear replaced stem trash job_id=%s key=%s",
@@ -1217,7 +1302,9 @@ def create_app(
                 content={"success": False, "message": "该歌曲没有人声音轨，请先完成拆轨。"},
             )
         try:
-            output_dir = job_song_dir(application_settings.output_dir, job_id, song)
+            output_dir = job_song_dir(
+                application_settings.output_dir, job_id, (result.get("songNumber") or song + 1) - 1
+            )
             vocal_path = _output_path_from_url(vocal_url, application_settings)
             if vocal_path.parent != output_dir.resolve() or not vocal_path.is_file():
                 raise OSError("missing vocal stem")
@@ -1666,7 +1753,9 @@ def create_app(
         if conflict is not None:
             return conflict
         try:
-            directory = job_song_dir(application_settings.output_dir, job_id, song)
+            directory = job_song_dir(
+                application_settings.output_dir, job_id, (result.get("songNumber") or song + 1) - 1
+            )
         except ValueError:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1806,6 +1895,8 @@ def create_app(
             job.stage = "cancelled"
             job.message = "任务已取消"
             job.progress = job.step = job.total_steps = None
+            job.received_audio_seconds = job.expected_audio_seconds = None
+            job.finish_generation()
             job.save(application_settings.output_dir)
             for queue in request.app.state.job_subscribers.get(job_id, ()):
                 if queue.empty():
@@ -1867,13 +1958,14 @@ def create_app(
                 candidate = _output_path_from_url(replaced_url, application_settings)
                 if candidate.parent == target.parent and candidate.is_file():
                     replaced_path = candidate
-            trash = _stem_trash_path(target, application_settings, job_id, song)
+            directory_song = (result.get("songNumber") or song + 1) - 1
+            trash = _stem_trash_path(target, application_settings, job_id, directory_song)
             trash.parent.mkdir(parents=True, exist_ok=True)
             trash.unlink(missing_ok=True)
             replaced_trash = None
             if replaced_path is not None:
                 replaced_trash = trash_result_path(
-                    application_settings, replaced_path.name, job_id, song
+                    application_settings, replaced_path.name, job_id, directory_song
                 )
                 replaced_trash.parent.mkdir(parents=True, exist_ok=True)
                 replaced_trash.unlink(missing_ok=True)
@@ -2000,7 +2092,8 @@ def create_app(
 
         try:
             target = _output_path_from_url(deleted["url"], application_settings)
-            trash = _stem_trash_path(target, application_settings, job_id, song)
+            directory_song = (result.get("songNumber") or song + 1) - 1
+            trash = _stem_trash_path(target, application_settings, job_id, directory_song)
             if not trash.is_file():
                 del job.deleted_stems[deleted_key]
                 return JSONResponse(
@@ -2020,7 +2113,7 @@ def create_app(
                     deleted_replacement["url"], application_settings
                 )
                 replaced_trash = trash_result_path(
-                    application_settings, replaced_path.name, job_id, song
+                    application_settings, replaced_path.name, job_id, directory_song
                 )
                 if not replaced_trash.is_file():
                     return JSONResponse(
@@ -2525,11 +2618,9 @@ def _render_result_urls(
 def _without_waveforms(result: dict[str, Any]) -> dict[str, Any]:
     """浅拷贝一份任务结果，把波形包络清空。
 
-    两个调用方都只需要拿一次波形：`GET /api/jobs` 会投影每个已存任务（每个最多两首
-    歌），且不绘制分轨编辑器车道；SSE 流则因为任务进入终态前 result 不会变化，却在
-    整个分轨期间每 15 秒保活一次就重发一帧。这两处带上波形只会放大响应体和上面的
-    深拷贝。这里清空键而不是删除，是为了保持文档化的响应结构稳定；需要真实波形请走
-    `GET /api/jobs/{job_id}` 或终态 done 帧。拷贝是浅拷贝，不会改动任务自己存的波形。
+    列表不绘制编辑器车道，音频编辑操作的 SSE 中间帧也不需要重复发送波形。
+    生成中的 SSE 只在歌曲完成帧和终态携带波形，其余帧清空键以保持响应结构稳定。
+    需要真实波形时可查询 `GET /api/jobs/{job_id}`。浅拷贝不会改动持久化结果。
     """
     projected = {key: value for key, value in result.items() if key != "waveforms"}
     projected["waveforms"] = {}

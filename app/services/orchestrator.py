@@ -9,9 +9,10 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from app.core.config import Settings
-from app.core.errors import CapacityExceededError
+from app.core.errors import CapacityExceededError, GenerationError, ProviderGlobalError
 from app.infrastructure.events import EventPublisher, GenerationEvent
 from app.infrastructure.queue import TaskDispatcher
+from app.schemas import SongGenerationState
 from app.services.audio_files import ensure_file_under_root, make_playback_mp3
 from app.services.job_files import job_song_dir, update_job_diagnostics
 from app.services.prompt import PromptExpander, split_generation_prompt
@@ -34,6 +35,11 @@ class ProgressCallback(Protocol):
         step: int | None = None,
         total_steps: int | None = None,
         title: str | None = None,
+        received_audio_seconds: float | None = None,
+        expected_audio_seconds: float | None = None,
+        current_song: int | None = None,
+        song_states: list[dict[str, Any]] | None = None,
+        result: dict[str, Any] | None = None,
     ) -> None: ...
 
 
@@ -105,6 +111,14 @@ class GenerationOrchestrator:
             None if selected_provider == "minimax_music" else duration_minutes
         )
         effective_count = count if selected_provider in {"minimax_music", "elevenlabs_music"} else 1
+        current_song = None
+        latest_result = None
+        song_states = [
+            SongGenerationState(
+                songNumber=number, status="pending", stage="pending", message="等待生成"
+            ).model_dump()
+            for number in range(1, effective_count + 1)
+        ]
 
         async def report(
             stage: str,
@@ -116,7 +130,22 @@ class GenerationOrchestrator:
             step: int | None = None,
             total_steps: int | None = None,
             title: str | None = None,
+            received_audio_seconds: float | None = None,
+            expected_audio_seconds: float | None = None,
+            song_progress: int | None = None,
         ) -> None:
+            if current_song is not None:
+                song_state = song_states[current_song - 1]
+                song_state.update(
+                    stage=stage,
+                    message=message,
+                    step=step,
+                    totalSteps=total_steps,
+                    receivedAudioSeconds=received_audio_seconds,
+                    expectedAudioSeconds=expected_audio_seconds,
+                )
+                if song_progress is not None:
+                    song_state["progress"] = song_progress
             if progress is not None:
                 await progress(
                     stage,
@@ -127,9 +156,15 @@ class GenerationOrchestrator:
                     step=step,
                     total_steps=total_steps,
                     title=title,
+                    received_audio_seconds=received_audio_seconds,
+                    expected_audio_seconds=expected_audio_seconds,
+                    current_song=current_song,
+                    song_states=[state.copy() for state in song_states],
+                    result=latest_result,
                 )
 
         async def execute() -> dict[str, Any]:
+            nonlocal current_song, latest_result
             update_job_diagnostics(
                 self.settings.output_dir,
                 job_id,
@@ -158,7 +193,8 @@ class GenerationOrchestrator:
             lyrics = prepared.lyrics
             duration_seconds = prepared.duration_seconds
             if duration_seconds is None and selected_provider not in {
-                "minimax_music", "elevenlabs_music"
+                "minimax_music",
+                "elevenlabs_music",
             }:
                 duration_seconds = self.settings.default_duration_minutes * 60
             provider_prompt = f"[歌词与创作内容]\n{lyrics}"
@@ -191,14 +227,36 @@ class GenerationOrchestrator:
                 **duration_diagnostics,
             )
             outputs: list[dict[str, Any]] = []
+            task_progress = (
+                0
+                if selected_provider == "elevenlabs_music" and duration_seconds is not None
+                else None
+            )
             music_provider = self.music_providers.get(selected_provider, self.music_provider)
-            # Variations are intentionally serial and the response is atomic: if a later
-            # generation fails, the whole request fails instead of returning a partial set.
+            response: dict[str, Any] = {
+                "success": True,
+                "jobId": job_id,
+                "prompt": user_prompt,
+                "title": song_title,
+                "durationMinutes": duration_minutes if duration_minutes is not None else "auto",
+                "structuredPrompt": structured_prompt,
+                "lyrics": lyrics,
+                "requestedCount": count,
+                "provider": selected_provider,
+            }
+            if duration_seconds is not None:
+                response["requestedDurationSeconds"] = duration_seconds
+            failures = []
+            # Each song is published after its own audio and waveform are ready.
             for index in range(effective_count):
-                song_number = index + 1
+                song_number = current_song = index + 1
+                song_state = song_states[index]
+                song_state.update(
+                    status="running", progress=0 if task_progress is not None else None
+                )
                 await report(
                     "generating_music",
-                    None,
+                    task_progress,
                     f"音乐模型正在生成第 {song_number}/{effective_count} 首",
                     structured_prompt=structured_prompt,
                     lyrics=lyrics,
@@ -210,36 +268,64 @@ class GenerationOrchestrator:
                     step: int | None,
                     total_steps: int | None,
                     song_number: int = song_number,
+                    *,
+                    received_audio_seconds: float | None = None,
+                    expected_audio_seconds: float | None = None,
                 ) -> None:
+                    nonlocal task_progress
+                    song_progress = None
+                    message = f"音乐模型正在生成第 {song_number}/{effective_count} 首"
+                    if selected_provider == "elevenlabs_music":
+                        message = f"第 {song_number}/{effective_count} 首：等待 ElevenLabs 返回音频"
+                    if received_audio_seconds is not None:
+                        message = (
+                            f"第 {song_number}/{effective_count} 首："
+                            f"已接收 {received_audio_seconds:g} 秒音频"
+                        )
+                        if expected_audio_seconds is not None:
+                            message += f"，目标 {expected_audio_seconds:g} 秒"
+                            ratio = min(1, received_audio_seconds / expected_audio_seconds)
+                            song_progress = min(99, int(ratio * 100))
+                            task_progress = min(
+                                99, int((song_number - 1 + ratio) / effective_count * 100)
+                            )
+                        else:
+                            message += "，总时长待确定"
                     await report(
                         stage,
-                        None,
-                        f"音乐模型正在生成第 {song_number}/{effective_count} 首",
+                        task_progress,
+                        message,
                         step=step,
                         total_steps=total_steps,
+                        received_audio_seconds=received_audio_seconds,
+                        expected_audio_seconds=expected_audio_seconds,
+                        song_progress=song_progress,
                     )
 
-                music_result = await music_provider.generate(
-                    structured_prompt,
-                    duration_seconds,
-                    provider_prompt,
-                    variation=index,
-                    progress=provider_progress,
-                    job_id=job_id,
-                )
-                await report("saving_audio", None, f"正在保存第 {song_number} 首")
-                song_dir = job_song_dir(self.settings.output_dir, job_id, index)
-                full_path = await ensure_file_under_root(
-                    music_result.audio_path,
-                    song_dir,
-                    f"full_song_{job_id}_{song_number}{music_result.audio_path.suffix}",
-                )
-                full_relative = full_path.relative_to(self.settings.output_dir)
-                full_playback = await make_playback_mp3(full_path, self.settings.output_dir)
+                try:
+                    music_result = await music_provider.generate(
+                        structured_prompt,
+                        duration_seconds,
+                        provider_prompt,
+                        variation=index,
+                        progress=provider_progress,
+                        job_id=job_id,
+                    )
+                    if task_progress is not None:
+                        task_progress = min(99, int(song_number / effective_count * 100))
+                    await report("saving_audio", task_progress, f"正在保存第 {song_number} 首")
+                    song_dir = job_song_dir(self.settings.output_dir, job_id, index)
+                    full_path = await ensure_file_under_root(
+                        music_result.audio_path,
+                        song_dir,
+                        f"full_song_{job_id}_{song_number}{music_result.audio_path.suffix}",
+                    )
+                    full_relative = full_path.relative_to(self.settings.output_dir)
+                    full_playback = await make_playback_mp3(full_path, self.settings.output_dir)
 
-                await report("waveform", None, f"正在提取第 {song_number} 首真实波形")
-                outputs.append(
-                    {
+                    await report("waveform", task_progress, f"正在提取第 {song_number} 首真实波形")
+                    output = {
+                        "songNumber": song_number,
                         "fullTrack": full_relative.as_posix(),
                         **({"playback": {"fullTrack": full_playback}} if full_playback else {}),
                         "stems": {},
@@ -249,32 +335,41 @@ class GenerationOrchestrator:
                         "durationSeconds": music_result.debug.get("durationSeconds"),
                         "debug": {"music": music_result.debug},
                     }
+
+                except Exception as exc:
+                    logger.exception(
+                        "song generation failed job_id=%s song=%s", job_id, song_number
+                    )
+                    song_state.update(status="failed", progress=None, error=str(exc))
+                    failures.append(f"第 {song_number} 首生成失败：{exc}")
+                    if task_progress is not None:
+                        task_progress = min(99, int(song_number / effective_count * 100))
+                    if latest_result is not None:
+                        latest_result = {**latest_result, "warning": "；".join(failures)}
+                    await report("song_failed", task_progress, failures[-1])
+                    if isinstance(exc, ProviderGlobalError) or effective_count == 1:
+                        raise
+                    continue
+                outputs.append(output)
+                song_state.update(status="succeeded", progress=100)
+                latest_result = {
+                    **response,
+                    **outputs[0],
+                    "count": len(outputs),
+                    "alternatives": outputs[1:],
+                    "warning": "；".join(failures) or None,
+                }
+                await report(
+                    "song_completed", task_progress, f"第 {song_number} 首已生成，可播放和下载"
                 )
 
-            await report("finalizing", None, "正在校验并整理输出文件")
-            primary = outputs[0]
-            response: dict[str, Any] = {
-                "success": True,
-                "jobId": job_id,
-                "prompt": user_prompt,
-                "title": song_title,
-                "durationMinutes": duration_minutes if duration_minutes is not None else "auto",
-                "structuredPrompt": structured_prompt,
-                "lyrics": lyrics,
-                "count": effective_count,
-                "requestedCount": count,
-                "provider": selected_provider,
-                "alternatives": outputs[1:],
-                # Kept for released clients. Compare count with requestedCount when
-                # a provider only supports one song; no warning is emitted.
-                "warning": None,
-                **primary,
-            }
-            if duration_seconds is not None:
-                response["requestedDurationSeconds"] = duration_seconds
+            current_song = None
+            if not outputs:
+                raise GenerationError("；".join(failures))
+            await report("finalizing", task_progress, "正在校验并整理输出文件")
             await self.events.publish(GenerationEvent("generation.succeeded", job_id, request_id))
             logger.info("generation succeeded job_id=%s request_id=%s", job_id, request_id)
-            return response
+            return latest_result
 
         async def dispatch() -> dict[str, Any]:
             try:

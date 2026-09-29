@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 import wave
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -14,7 +15,7 @@ from uuid import NAMESPACE_URL, uuid5
 import httpx
 
 from app.core.config import PROJECT_ROOT, Settings
-from app.core.errors import GenerationError
+from app.core.errors import GenerationError, ProviderGlobalError
 from app.services.audio_files import download_audio, require_readable_file, write_stream_atomically
 from app.services.job_files import job_song_dir, update_provider_diagnostic
 from app.services.prompt import (
@@ -22,20 +23,39 @@ from app.services.prompt import (
     split_generation_prompt,
 )
 
+logger = logging.getLogger(__name__)
+
 MINIMAX_GENERATE_PATH = "/v1/audio/jobs"
+GLOBAL_PROVIDER_HTTP_STATUSES = {401, 402, 403, 429}
 MINIMAX_LYRIC_LINE_LIMIT = 32
-# ElevenLabs /v1/music compose API documents a maximum prompt length of 4100 characters:
+# The 4100-character prompt limit applies to both compose and stream endpoints:
 # https://elevenlabs.io/docs/api-reference/music/compose
+# https://elevenlabs.io/docs/api-reference/music/stream
 ELEVENLABS_PROMPT_MAX_CHARS = 4100
 # Auto output validation follows the compose API's 3-second minimum song length.
 ELEVENLABS_AUTO_MIN_DURATION_SECONDS = 3
-# Live music_v2 pcm_44100 check (2026-09-23): a 3s request returned 529,200 bytes
+# Live /v1/music compose check (2026-09-23), music_v2 pcm_44100:
+# a 3s request returned 529,200 bytes.
 # (44,100 Hz × 2 channels × 2 bytes × 3s), with distinct signals in both channels.
 # This account received HTTP 200; the wrapped WAV decoded as 16-bit stereo, 3.000s.
+# Live /v1/music/stream check (2026-09-29), music_v2, output_format=pcm_44100:
+# music_length_ms=3000, force_instrumental=true, short piano prompt; HTTP 200,
+# 529,200 bytes in 408 chunks; wrapped WAV: 44,100 Hz, 16-bit stereo, 3.000s.
 ELEVENLABS_PCM_CHANNELS = 2
 ELEVENLABS_PCM_SAMPLE_WIDTH = 2
 LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")
-ProviderProgressCallback = Callable[[str, int | None, int | None], Awaitable[None]]
+
+
+class ProviderProgressCallback(Protocol):
+    async def __call__(
+        self,
+        stage: str,
+        step: int | None,
+        total_steps: int | None,
+        *,
+        received_audio_seconds: float | None = None,
+        expected_audio_seconds: float | None = None,
+    ) -> None: ...
 
 
 def build_elevenlabs_prompt(
@@ -331,7 +351,7 @@ class ElevenLabsMusicProvider:
     def _api_key(self) -> str:
         secret = self._settings.elevenlabs_api_key or self._settings.music_api_key
         if secret is None:
-            raise GenerationError("ElevenLabs 音乐生成失败：缺少 ELEVENLABS_API_KEY 环境变量。")
+            raise ProviderGlobalError("ElevenLabs 音乐生成失败：缺少 ELEVENLABS_API_KEY 环境变量。")
         return secret.get_secret_value()
 
     def _headers(self) -> dict[str, str]:
@@ -347,6 +367,8 @@ class ElevenLabsMusicProvider:
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
     ) -> MusicResult:
+        if duration_seconds is not None and duration_seconds <= 0:
+            raise GenerationError("ElevenLabs 音乐生成失败：目标时长必须大于 0 秒。")
         force_instrumental = self._settings.elevenlabs_force_instrumental
         clear_chinese = (
             self._settings.elevenlabs_clear_chinese_vocal_mode and not force_instrumental
@@ -367,7 +389,7 @@ class ElevenLabsMusicProvider:
         }
         if duration_seconds is not None:
             request_body["music_length_ms"] = duration_seconds * 1000
-        url = f"{self._settings.elevenlabs_music_base_url}/v1/music"
+        url = f"{self._settings.elevenlabs_music_base_url}/v1/music/stream"
         request_diagnostic = {
             "method": "POST",
             "url": url,
@@ -402,20 +424,50 @@ class ElevenLabsMusicProvider:
                 job_id,
                 variation,
             )
-            async with self._client.stream(
-                "POST",
-                url,
-                json=request_body,
-                params={"output_format": output_format},
-                headers=self._headers(),
-                timeout=self._settings.music_api_timeout_seconds,
-            ) as response:
-                if not response.is_success:
-                    await response.aread()
-                response.raise_for_status()
-                actual_duration_seconds = await self._write_pcm_wav(
-                    response.aiter_bytes(), target, sample_rate, duration_seconds
-                )
+            await self._report_progress(
+                progress, "generating_music", expected_audio_seconds=duration_seconds
+            )
+            for attempt in range(2):
+                async with self._client.stream(
+                    "POST",
+                    url,
+                    json=request_body,
+                    params={"output_format": output_format},
+                    headers=self._headers(),
+                    timeout=self._settings.music_api_timeout_seconds,
+                ) as response:
+                    if not response.is_success:
+                        await response.aread()
+                    # Only retry explicit rejections before any audio is accepted; never retry
+                    # a timeout or broken audio stream, which may already have been billed.
+                    if attempt == 0 and response.status_code in {402, 403, 404, 405}:
+                        logger.warning(
+                            "ElevenLabs stream endpoint rejected, falling back to compose "
+                            "status=%s job_id=%s",
+                            response.status_code,
+                            job_id,
+                        )
+                        url = url.removesuffix("/stream")
+                        update_provider_diagnostic(
+                            self._settings.output_dir,
+                            job_id,
+                            variation,
+                            streamFallbackStatus=response.status_code,
+                            streamFallbackResponse=_response_diagnostic(response),
+                            request={**request_diagnostic, "url": url},
+                        )
+                        continue
+                    response.raise_for_status()
+                    actual_duration_seconds = await self._write_pcm_wav(
+                        response.aiter_bytes(),
+                        target,
+                        sample_rate,
+                        duration_seconds,
+                        progress=progress,
+                    )
+                    break
+            else:
+                raise GenerationError("ElevenLabs 音乐生成失败：未能取得音频。")
             return MusicResult(
                 target,
                 {
@@ -423,6 +475,7 @@ class ElevenLabsMusicProvider:
                     "modelId": self._settings.elevenlabs_music_model_id,
                     "outputFormat": output_format,
                     "mode": "prompt_pcm_wav",
+                    "endpoint": url,
                     "clearChineseVocalMode": clear_chinese,
                     "durationSeconds": actual_duration_seconds,
                 },
@@ -430,9 +483,37 @@ class ElevenLabsMusicProvider:
         except GenerationError:
             raise
         except httpx.HTTPStatusError as exc:
-            raise GenerationError(self._failure_message(exc)) from exc
+            error_type = (
+                ProviderGlobalError
+                if exc.response.status_code in GLOBAL_PROVIDER_HTTP_STATUSES
+                else GenerationError
+            )
+            raise error_type(self._failure_message(exc)) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise GenerationError(f"ElevenLabs 音乐生成失败：{_http_failure_message(exc)}") from exc
+
+    @staticmethod
+    async def _report_progress(
+        progress: ProviderProgressCallback | None,
+        stage: str,
+        *,
+        received_audio_seconds: float | None = None,
+        expected_audio_seconds: float | None = None,
+    ) -> None:
+        if progress is None:
+            return
+        try:
+            await progress(
+                stage,
+                None,
+                None,
+                received_audio_seconds=received_audio_seconds,
+                expected_audio_seconds=expected_audio_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("ElevenLabs progress report failed stage=%s", stage, exc_info=True)
 
     @staticmethod
     async def _write_pcm_wav(
@@ -440,10 +521,30 @@ class ElevenLabsMusicProvider:
         target: Path,
         sample_rate: int,
         expected_duration_seconds: int | None,
+        *,
+        progress: ProviderProgressCallback | None = None,
     ) -> float:
+        if expected_duration_seconds is not None and expected_duration_seconds <= 0:
+            raise GenerationError("ElevenLabs 音乐生成失败：目标时长必须大于 0 秒。")
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f"{target.name}.{time.time_ns()}.part")
         written = 0
+        bytes_per_second = sample_rate * ELEVENLABS_PCM_CHANNELS * ELEVENLABS_PCM_SAMPLE_WIDTH
+        last_reported_bytes = 0
+        last_reported_at = None
+
+        async def report_received() -> None:
+            nonlocal last_reported_bytes, last_reported_at
+            if progress:
+                await ElevenLabsMusicProvider._report_progress(
+                    progress,
+                    "receiving_audio",
+                    received_audio_seconds=round(written / bytes_per_second, 3),
+                    expected_audio_seconds=expected_duration_seconds,
+                )
+                last_reported_bytes = written
+                last_reported_at = time.monotonic()
+
         try:
             # write_stream_atomically cannot write RIFF sizes; wave patches them on close
             # before the completed temporary file is atomically renamed.
@@ -462,6 +563,10 @@ class ElevenLabsMusicProvider:
                     if chunk:
                         written += len(chunk)
                         audio.writeframesraw(chunk)
+                        if progress and (
+                            last_reported_at is None or time.monotonic() - last_reported_at >= 1
+                        ):
+                            await report_received()
             if written == 0:
                 raise GenerationError("ElevenLabs 音乐生成接口返回空音频。")
             frame_size = ELEVENLABS_PCM_CHANNELS * ELEVENLABS_PCM_SAMPLE_WIDTH
@@ -486,6 +591,8 @@ class ElevenLabsMusicProvider:
                     f"期望 {expected_duration_seconds} 秒，实际 {actual_duration_seconds:.3f} 秒。"
                 )
             temporary.replace(target)
+            if written != last_reported_bytes:
+                await report_received()
             return round(actual_duration_seconds, 3)
         finally:
             temporary.unlink(missing_ok=True)
@@ -636,7 +743,7 @@ class MiniMaxMusicProvider:
         job_id: str | None = None,
     ) -> MusicResult:
         if not self._settings.minimax_base_url:
-            raise GenerationError("MiniMax 音乐生成失败：MINIMAX_BASE_URL 不能为空。")
+            raise ProviderGlobalError("MiniMax 音乐生成失败：MINIMAX_BASE_URL 不能为空。")
         # MiniMax decides its own natural duration; fixed values from shared callers are ignored.
         del duration_seconds
         try:
@@ -810,9 +917,12 @@ class MiniMaxMusicProvider:
                 "请求已绕过系统代理；请确认服务监听地址、端口和防火墙配置。"
             ) from exc
         except httpx.HTTPStatusError as exc:
-            raise GenerationError(
-                f"MiniMax Music 3 服务调用失败：{_http_failure_message(exc)}"
-            ) from exc
+            error_type = (
+                ProviderGlobalError
+                if exc.response.status_code in GLOBAL_PROVIDER_HTTP_STATUSES
+                else GenerationError
+            )
+            raise error_type(f"MiniMax Music 3 服务调用失败：{_http_failure_message(exc)}") from exc
         except (httpx.HTTPError, ValueError, wave.Error) as exc:
             raise GenerationError(
                 f"MiniMax Music 3 服务调用失败：{_http_failure_message(exc)}"

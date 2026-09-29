@@ -273,6 +273,61 @@ SSE 终态始终使用具名 `done` 事件，客户端收到后应主动关闭 E
 "message":"歌曲已过期。"}`，不包含音频结果；`expired` 仅表示该 SSE 终态的原因，
 不会写入任务的持久化状态。连接前已过期的任务仍返回 HTTP 404。
 
+ElevenLabs 优先使用 `/v1/music/stream`，收到首块音频前显示等待状态；接收期间
+`stage=receiving_audio`，`receivedAudioSeconds` 表示当前这一首已收到的 PCM 音频秒数，
+`expectedAudioSeconds` 表示请求的目标秒数（自动时长为 `null`）。进度更新通常最多每秒一次，
+首块立即推送，流结束并原子保存音频后补齐最后一次更新。固定时长的 `progress` 按整个任务
+聚合已完成歌曲数和当前歌曲接收比例，后处理及歌曲切换期间保留进度，最高为 99；
+自动时长保持 `progress=null`，可直接展示 `message` 中的已接收秒数。
+这表示音频接收量，不代表上游模型内部推理进度。双曲切换和后处理阶段清空
+`receivedAudioSeconds`/`expectedAudioSeconds`，`progress` 保留当前任务进度；
+所有歌曲均已完成或失败后，只要至少一首可用，任务就以 `progress=100` 结束。
+MiniMax 继续使用上游回传的 `step/totalSteps`。
+
+**硬性发布门槛：按首发布与部分成功改变了已发布客户端的响应契约，必须与支持这些
+行为的前端同版本发布，禁止只升级后端。无法保证配套发布时，本版本不得上线。**
+上线前须联调确认：运行中的 `result` 不会被当作任务成功或导致 SSE 关闭；
+第二首未完成时不会按当前可用输出数夹取或覆盖用户的歌曲选择；部分成功按
+`songNumber` 映射输出与状态，并保留可用歌曲。本仓库的后端测试不能代替前端联调。
+
+双曲任务按首串行生成，每首完成文件保存、试听处理和波形提取后立即发布：
+`GET /api/jobs/<jobId>`、历史列表和 SSE 的 `result` 都包含当前已完成的歌曲，
+此时顶层 `status` 仍可为 `running`，不能仅凭 `result` 存在就关闭 SSE。
+`currentSong` 是当前正在处理的歌曲序号（从 1 开始，终态为 `null`）；
+`songStates` 按序号分别提供 `songNumber/status/stage/message/progress/error`，以及
+每首自己的 `step/totalSteps` 和音频接收秒数。顶层 `progress` 是任务级进度。
+顶层 `stage` 增加 `song_completed`/`song_failed`，两者仍属于任务运行阶段。
+`songStates` 长度为实际尝试的曲数，可能小于 `requestedCount`（例如只支持单曲的 provider）；
+首个进度上报前可能为空数组，请以 `songStates[].songNumber` 区分歌曲。
+`songStates[].progress` 是单首进度（固定时长可用百分比，自动时长为 `null`，完成为 100）。
+客户端可立即展示第一首播放器，并按 `currentSong` 显示第二首的进度。
+SSE 仅在 `song_completed` 帧及终态帧附带波形，其余中间帧的 `waveforms` 为 `{}`，
+不表示已保存的波形被删除。帧可能合并推进到下一阶段；新订阅或未收到歌曲完成帧的
+客户端需要立即展示波形时，请查询 `GET /api/jobs/<jobId>` 获取完整结果。
+
+第二首失败不会撤回第一首：任务以 `status=succeeded` 收尾，`warning` 说明部分失败，
+`songStates[1].status=failed` 和 `error` 保存第二首的错误。两首都失败才令任务 `failed`。
+明确的 provider 全局错误例外：鉴权、套餐、配额或限流错误（HTTP 401/402/403/429）以及
+缺少必需配置会终止后续歌曲调用，任务标为 `failed`，但已经发布的歌曲仍可播放和下载。
+ElevenLabs 的 402/403 流式端点拒绝仍先单次回退 compose；回退也失败才按全局错误终止。
+生成被取消或服务器重启时，已经发布的歌曲也保留，未完成的歌曲分别标为 `cancelled` 或 `failed`。
+`result.count` 始终等于可用歌曲数（`1 + alternatives.length`），`requestedCount` 是请求数；
+每个输出的 `songNumber` 表示原始序号。因此第一首失败、第二首成功时，`result.count=1`、
+`result.songNumber=2`，`alternatives=[]`。编辑接口的 `song` 仍是可用输出列表的零基索引，
+这种情况下编辑第二首应传 `song=0`。音频编辑操作仍需等待任务结束。
+
+首块音频到达前，上游不提供推理进度；本服务不会周期更新等待秒数，`message` 保持等待文案。
+这段等待期间 SSE 仍约每 15 秒保活；保活表示连接存活，不表示上游生成取得了新进展。
+流式端点返回 402/403/404/405 时，仅回退一次到 `/v1/music`，使用相同参数；
+超时、断流或其它错误不重试。回退记录写入 `prompts.json` 的
+`providerRequests[].streamFallbackStatus`，被拒响应的状态码、响应头与响应体保存在
+`providerRequests[].streamFallbackResponse`；条目按 `variation` 区分，`variation=0` 对应第 1 首。
+实际使用的端点记录在结果的 `debug.music.endpoint`。compose 回退可能集中返回音频，
+因而无法保证持续更新接收量。进度观察回调失败只记日志，取消仍向上传播；完整音频已保存后
+发生取消时保留该文件。2026-09-29 使用真实 Key 实测流式端点：`music_v2`、
+`pcm_44100`、`music_length_ms=3000`、纯钢琴器乐请求返回 HTTP 200；408 个音频块共
+529,200 字节，保存后的 WAV 为 44.1 kHz、16 位双声道、3.000 秒。
+
 ```bash
 # 创建任务（返回 202 和 jobId）
 curl -X POST http://127.0.0.1:8010/api/jobs \

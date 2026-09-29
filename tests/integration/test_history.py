@@ -3,6 +3,7 @@ import json
 from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 from starlette.requests import Request
 
 from app.core.errors import CapacityExceededError
@@ -576,11 +577,12 @@ async def test_job_events_keep_alive_after_timeout(tmp_path, monkeypatch):
     await response.body_iterator.aclose()
 
 
-async def test_job_events_send_waveforms_only_in_done_frame(tmp_path, monkeypatch):
+@pytest.mark.parametrize("stage", ["receiving_audio", "song_completed"])
+async def test_job_events_only_publish_waveforms_on_completion(tmp_path, monkeypatch, stage):
     settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
     bins = [0.5] * 640
-    job = GenerationJob(job_id="active", prompt="rock", status="running", stage="music")
+    job = GenerationJob(job_id="active", prompt="rock", status="running", stage=stage)
     job.result = {"fullTrack": "song_1/full.mp3", "waveforms": {"full": bins}}
     app.state.jobs[job.job_id] = job
     endpoint = next(
@@ -598,8 +600,7 @@ async def test_job_events_send_waveforms_only_in_done_frame(tmp_path, monkeypatc
 
     payload = json.loads(progress.removeprefix("data: "))
     assert payload["status"] == "running"
-    # 中间帧只推阶段进度：每 15 秒一次的保活不该重发整份 640-bin 波形。
-    assert payload["result"]["waveforms"] == {}
+    assert payload["result"]["waveforms"] == ({"full": bins} if stage == "song_completed" else {})
     assert done.startswith("event: done\ndata: ")
     completed = json.loads(done.split("data: ", 1)[1])
     assert completed["status"] == "succeeded"
@@ -724,9 +725,9 @@ async def test_generated_title_is_listed_and_survives_restart(tmp_path):
     settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
     async with client(app) as http:
-        job_id = (
-            await http.post("/api/jobs", json={"prompt": "rock", "title": "   "})
-        ).json()["jobId"]
+        job_id = (await http.post("/api/jobs", json={"prompt": "rock", "title": "   "})).json()[
+            "jobId"
+        ]
         await app.state.jobs[job_id].task
         history = (await http.get("/api/jobs")).json()["jobs"]
     assert history[0]["title"] == "测试歌名"

@@ -15,10 +15,11 @@ def seed_job(app, settings, job_id: str) -> Path:
     full_track = song_dir / "full_song.wav"
     full_track.write_bytes(b"RIFF-full")
     app.state.jobs[job_id] = SimpleNamespace(
+        status="succeeded",
         result={
             "fullTrack": full_track.relative_to(settings.output_dir).as_posix(),
             "alternatives": [],
-        }
+        },
     )
     return song_dir
 
@@ -35,9 +36,7 @@ async def test_voice_result_download_delete_and_restore(tmp_path: Path) -> None:
         transport=httpx.ASGITransport(app=app),
         base_url="http://testserver",
     ) as client:
-        direct_download = await client.get(
-            f"/output/jobs/{job_id}/song_1/real_song_rvc_vocal.wav"
-        )
+        direct_download = await client.get(f"/output/jobs/{job_id}/song_1/real_song_rvc_vocal.wav")
         deleted = await client.request(
             "DELETE",
             "/api/voice/result",
