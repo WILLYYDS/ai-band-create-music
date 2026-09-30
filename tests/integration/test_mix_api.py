@@ -946,9 +946,11 @@ async def test_replacement_outcomes_against_the_exported_mix(tmp_path, install_s
     assert "replacedVocal" not in detail["result"]
     assert detail["mixStatus"] == "succeeded" and audio.content == b"RIFF-mixed-stub"
 
-    # 写盘失败：落盘记录里两者要么都在、要么都不在，不会"没有替换人声却有成品"。
+    # 写盘失败：撤下失效的人声引用，但旧音轨与旧成品仍可用。
     app = build_app(settings, StubReplaceEngine())
     job = seed_job(app, settings, job_id="job-savefail")
+    previous_vocal = settings.output_dir / job.result["replacedVocal"]
+    previous_audio = previous_vocal.read_bytes()
     async with client(app) as http:
         await run_job_mix(http, job)
         job.result["_replacedVocalModel"] = "v1:" + "0" * 64
@@ -967,7 +969,10 @@ async def test_replacement_outcomes_against_the_exported_mix(tmp_path, install_s
         await job.replace_task
         assert (await http.get(f"/api/jobs/{job.job_id}")).json()["replaceStatus"] == "failed"
     reloaded = load_jobs(settings.output_dir)[job.job_id]
-    assert "replacedVocal" not in reloaded.result and "mixedTrack" not in reloaded.result
+    assert "replacedVocal" not in reloaded.result
+    assert previous_vocal.read_bytes() == previous_audio
+    assert reloaded.result["mixedTrack"] == job.result["mixedTrack"]
+    assert (settings.output_dir / reloaded.result["mixedTrack"]).read_bytes() == b"RIFF-mixed-stub"
 
 
 # ------------------------------------------------------------- invalidation & restore

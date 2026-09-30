@@ -4,6 +4,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from app.main import create_app
 from tests.helpers import (
     BlockingVoiceEngine,
@@ -314,7 +316,7 @@ async def test_failed_rerun_keeps_previous_replaced_vocal(tmp_path: Path) -> Non
 
     模型换掉后缓存立即失效（结果里不再对外宣称 replacedVocal），但新产物还没生成。如果这时
     立刻删旧文件，重跑又失败（模型不可用、OOM、超时……），用户就同时失去了新旧两版。旧文件的
-    覆盖是原子的（同名），所以正确做法是留到新产物落位为止。
+    覆盖是原子的（同名），但备份必须留到新结果元数据提交成功为止。
     """
     settings = make_settings(tmp_path)
     engine = SlowVoiceEngine()
@@ -359,6 +361,95 @@ async def test_failed_rerun_keeps_previous_replaced_vocal(tmp_path: Path) -> Non
     assert retried["replaceStatus"] == "succeeded"
     assert audio.content == b"RIFF-replaced-1"
     assert replaced_file.read_bytes() == b"RIFF-replaced-1"
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "waveform_cancel",
+        "preview_cancel",
+        "task_cancel",
+        "preview_failure",
+        "save_failure",
+        "success",
+    ],
+)
+async def test_rerun_commits_replacement_only_after_metadata_save(tmp_path, monkeypatch, outcome):
+    settings = make_settings(tmp_path)
+    engine = SlowVoiceEngine()
+    engine.release.set()
+    app = create_app(settings, make_orchestrator(settings), engine)
+    job, _ = seed_job(app, settings)
+    async with client(app) as http:
+        await http.post(f"/api/jobs/{job.job_id}/replace")
+        await job.replace_task
+
+    replaced_file = settings.output_dir / job.result["replacedVocal"]
+    mixed_file = replaced_file.with_name("previous-mix.wav")
+    mixed_file.write_bytes(b"previous-mix")
+    job.result["mixedTrack"] = mixed_file.relative_to(settings.output_dir).as_posix()
+    job.save(settings.output_dir)
+    changed_model = tmp_path / "changed-model.pth"
+    changed_model.write_bytes(b"changed")
+    settings.rvc_model_path = changed_model
+    app = create_app(settings, make_orchestrator(settings), engine)
+    job = app.state.jobs[job.job_id]
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def waveform(_paths):
+        if outcome in {"waveform_cancel", "task_cancel"}:
+            started.set()
+            await release.wait()
+        return {}
+
+    async def preview(_source, _output_dir):
+        if outcome == "preview_cancel":
+            started.set()
+            await release.wait()
+        if outcome == "preview_failure":
+            raise OSError("preview failed")
+        return None
+
+    save = type(job).save
+    failed_save = False
+
+    def save_with_failure(self, output_dir):
+        nonlocal failed_save
+        if outcome == "save_failure" and "replacedVocal" in job.result and not failed_save:
+            failed_save = True
+            raise OSError("metadata save failed")
+        save(self, output_dir)
+
+    monkeypatch.setattr("app.main.extract_waveforms", waveform)
+    monkeypatch.setattr("app.main.make_playback_mp3", preview)
+    monkeypatch.setattr(type(job), "save", save_with_failure)
+    async with client(app) as http:
+        assert (await http.post(f"/api/jobs/{job.job_id}/replace")).status_code == 202
+        if outcome.endswith("_cancel"):
+            await asyncio.wait_for(started.wait(), 2)
+            if outcome == "task_cancel":
+                job.replace_task.cancel()
+            else:
+                await http.patch(f"/api/jobs/{job.job_id}", json={"status": "cancelled"})
+            release.set()
+        await job.replace_task
+        response = (await http.get(f"/api/jobs/{job.job_id}")).json()
+
+    stored = json.loads((settings.output_dir / "jobs" / job.job_id / "job.json").read_text())
+    if outcome == "success":
+        assert response["replaceStatus"] == "succeeded"
+        assert replaced_file.read_bytes() == b"RIFF-replaced-2"
+        assert stored["result"]["replacedVocal"] == job.result["replacedVocal"]
+        assert "mixedTrack" not in job.result
+    else:
+        expected_status = "cancelled" if outcome.endswith("_cancel") else "failed"
+        assert response["replaceStatus"] == expected_status
+        assert replaced_file.read_bytes() == b"RIFF-replaced-1"
+        assert "replacedVocal" not in response["result"]
+        assert "replacedVocal" not in stored["result"]
+        assert stored["result"]["mixedTrack"] == job.result["mixedTrack"]
+    assert app.state.orchestrator.capacity.active == 0
+    assert not list(replaced_file.parent.glob(".rvc-*"))
 
 
 async def test_replace_failure_and_cancel_preserve_generation(tmp_path: Path) -> None:

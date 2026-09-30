@@ -1379,8 +1379,8 @@ def create_app(
 
         if isinstance(cached_url, str):
             # 缓存失效（模型指纹/文件/路径任一不符）：只把引用从结果里摘掉以触发重新推理，
-            # 磁盘上的旧文件保持不动。它与新产物同名，重跑成功时 output_path.replace 会原子
-            # 覆盖它；重跑失败/超时/取消时它则是"上一版还能听"的唯一退路——留着只是不再被任何
+            # 旧文件与新产物同名：覆盖前保留备份，直到新结果元数据提交成功后再清理。
+            # 重跑失败/超时/取消时旧文件仍是"上一版还能听"的唯一退路——留着只是不再被任何
             # 结果引用、也不会对外暴露，同曲最多一份，不会堆积。
             # 先给已完成成品存档再作废：作废会立刻落盘，而接下来的推理可能失败、超时或被
             # 取消，那时要能把这个成品还回去——它的文件按设计一直留在盘上。人声引用则按既有
@@ -1419,6 +1419,11 @@ def create_app(
                 # 而 RVC 推理线程无法强停、仍在写这个目录，清理与写文件会互相打架（真实 RVC 还会
                 # 在推理中途读取输入/写入输出）。改成手动创建、等线程确认退出后再删。
                 temp_dir = Path(tempfile.mkdtemp(prefix=".rvc-", dir=output_dir))
+                backup_path = temp_dir / "previous.wav"
+                previous_result = copy.deepcopy(result)
+                previous_deleted = job.deleted_replaced_vocals.copy()
+                installed = False
+                committed = False
                 try:
                     output_path = temp_dir / "converted.wav"
                     if job.replace_cancel_requested:
@@ -1477,50 +1482,64 @@ def create_app(
                     job.replace_message = "正在创建替换音轨"
                     publish()
                     require_readable_file(output_path, "人声替换输出文件不可读")
+                    # 同一文件系统内保留旧文件，直到后处理与元数据提交都成功。
+                    if result_path.exists():
+                        backup_path.hardlink_to(result_path)
                     output_path.replace(result_path)
+                    installed = True
+                    replacement_waveforms = {}
+                    try:
+                        replacement_waveforms = await extract_waveforms({"replaced": result_path})
+                    except Exception:
+                        logger.warning(
+                            "replaced vocal waveform skipped job_id=%s song=%s",
+                            job_id,
+                            song,
+                            exc_info=True,
+                        )
+                    if job.replace_cancel_requested:
+                        raise asyncio.CancelledError
+                    job.replace_stage = "exporting_replacement"
+                    job.replace_progress = 75
+                    job.replace_message = "正在导出替换结果"
+                    publish()
+                    preview = await make_playback_mp3(result_path, application_settings.output_dir)
+                    if job.replace_cancel_requested:
+                        raise asyncio.CancelledError
+                    job.replace_progress = 99
+                    publish()
+                    result["replacedVocal"] = result_path.relative_to(
+                        application_settings.output_dir.resolve()
+                    ).as_posix()
+                    result.setdefault("playback", {}).pop("replacedVocal", None)
+                    if preview:
+                        result["playback"]["replacedVocal"] = preview
+                    result.setdefault("waveforms", {}).pop("replaced", None)
+                    result["waveforms"].update(replacement_waveforms)
+                    result["_replacedVocalModel"] = fingerprint
+                    job.deleted_replaced_vocals.pop(str(song), None)
+                    # 人声内容已经不同，旧成品不再对应当前歌曲：作废引用，需要重新合轨。
+                    invalidate_mix_artifact(job, result)
+                    job.save(application_settings.output_dir)
+                    committed = True
+                    job.replace_previous = None
+                    job.replace_status = "succeeded"
+                    job.replace_stage = "completed"
+                    job.replace_progress = REPLACE_COMPLETE_PROGRESS
+                    job.replace_message = "人声替换完成"
+                except (Exception, asyncio.CancelledError):
+                    result.clear()
+                    result.update(previous_result)
+                    job.deleted_replaced_vocals = previous_deleted
+                    if backup_path.exists():
+                        backup_path.replace(result_path)
+                    elif installed:
+                        result_path.unlink(missing_ok=True)
+                    raise
                 finally:
-                    # 走到这里 conversion_task 一定已经结束（成功/失败/两条收尾分支都等过它），
-                    # 所以删除临时目录不会再和推理线程抢文件。
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                replacement_waveforms = {}
-                try:
-                    replacement_waveforms = await extract_waveforms({"replaced": result_path})
-                except Exception:
-                    logger.warning(
-                        "replaced vocal waveform skipped job_id=%s song=%s",
-                        job_id,
-                        song,
-                        exc_info=True,
-                    )
-                if job.replace_cancel_requested:
-                    raise asyncio.CancelledError
-                job.replace_stage = "exporting_replacement"
-                job.replace_progress = 75
-                job.replace_message = "正在导出替换结果"
-                publish()
-                preview = await make_playback_mp3(result_path, application_settings.output_dir)
-                if job.replace_cancel_requested:
-                    raise asyncio.CancelledError
-                job.replace_progress = 99
-                publish()
-                result["replacedVocal"] = result_path.relative_to(
-                    application_settings.output_dir.resolve()
-                ).as_posix()
-                result.setdefault("playback", {}).pop("replacedVocal", None)
-                if preview:
-                    result["playback"]["replacedVocal"] = preview
-                result.setdefault("waveforms", {}).pop("replaced", None)
-                result["waveforms"].update(replacement_waveforms)
-                result["_replacedVocalModel"] = fingerprint
-                job.deleted_replaced_vocals.pop(str(song), None)
-                # 人声内容已经不同，旧成品不再对应当前歌曲：作废引用，需要重新合轨。
-                invalidate_mix_artifact(job, result)
-                job.replace_previous = None
-                job.save(application_settings.output_dir)
-                job.replace_status = "succeeded"
-                job.replace_stage = "completed"
-                job.replace_progress = REPLACE_COMPLETE_PROGRESS
-                job.replace_message = "人声替换完成"
+                    # 推理已退出；若回滚失败则保留备份，避免清理时丢失旧文件。
+                    if committed or not backup_path.exists():
+                        shutil.rmtree(temp_dir, ignore_errors=True)
             except asyncio.CancelledError:
                 job.replace_status = "cancelled"
                 job.replace_stage = "cancelled"
