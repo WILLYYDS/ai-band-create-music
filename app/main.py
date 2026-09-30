@@ -1329,24 +1329,18 @@ def create_app(
         fingerprint = request.app.state.rvc_model_fingerprint
         cached_url = result.get("replacedVocal")
         if isinstance(cached_url, str):
-            try:
-                cached_path = _output_path_from_url(cached_url, application_settings)
-                if (
-                    result.get("_replacedVocalModel") == fingerprint
-                    and cached_path.parent == output_dir.resolve()
-                    and cached_path.is_file()
-                ):
-                    job.last_operation = "replace"
-                    job.replace_song = song
-                    job.replace_status = "succeeded"
-                    job.replace_stage = "completed"
-                    job.replace_progress = REPLACE_COMPLETE_PROGRESS
-                    job.replace_message = "人声替换完成"
-                    job.replace_error = None
-                    response.status_code = status.HTTP_200_OK
-                    return await _async_job_response(job, request, application_settings)
-            except ValueError:
-                pass
+            if result.get("_replacedVocalModel") == fingerprint and _replacement_file_exists(
+                cached_url, application_settings, output_dir
+            ):
+                job.last_operation = "replace"
+                job.replace_song = song
+                job.replace_status = "succeeded"
+                job.replace_stage = "completed"
+                job.replace_progress = REPLACE_COMPLETE_PROGRESS
+                job.replace_message = "人声替换完成"
+                job.replace_error = None
+                response.status_code = status.HTTP_200_OK
+                return await _async_job_response(job, request, application_settings)
 
         active_orchestrator = _orchestrator(request)
         job.replace_song = song
@@ -2428,6 +2422,15 @@ def _reported_mix_status(job: GenerationJob) -> tuple[str | None, int | None]:
     return "succeeded", mixed_songs[0] if len(mixed_songs) == 1 else None
 
 
+def _replacement_file_exists(audio_url: str, settings: Settings, directory: Path) -> bool:
+    """替换缓存与重启恢复只认可对应歌曲目录内仍存在的文件。"""
+    try:
+        target = _output_path_from_url(audio_url, settings)
+        return target.parent == directory.resolve() and target.is_file()
+    except (OSError, ValueError):
+        return False
+
+
 def _reported_replace_status(
     job: GenerationJob, settings: Settings, *, fingerprint: str | None = None
 ) -> tuple[str | None, int | None]:
@@ -2438,7 +2441,7 @@ def _reported_replace_status(
     是 null"的矛盾响应，前端的替换状态机会直接判失败（"生成服务未返回人声替换状态"），
     撤回删除后再点替换就再也走不通。这里以结果为准补齐终态：
 
-    - 有 replacedVocal、且模型指纹与当前模型一致（或这条旧数据没有指纹）→ succeeded；
+    - replacedVocal 文件在对应歌曲目录内存在、且模型指纹一致（或旧数据没有指纹）→ succeeded；
     - 指纹不一致且模型资产在场，说明缓存确实失效，交给 /replace 重新推理，不在这里谎报成功；
     - 指纹不一致但资产不在（缺挂载的实例）：指纹根本无从验证，此时既不能判失效也不该让
       客户端去跑一个必然失败的 /replace，按 succeeded 汇报，与合轨入口的逃逸一致。
@@ -2451,6 +2454,14 @@ def _reported_replace_status(
     replaced_songs = []
     for index, song in enumerate([result, *(result.get("alternatives") or [])]):
         if not isinstance(song, dict) or not isinstance(song.get("replacedVocal"), str):
+            continue
+        try:
+            directory = job_song_dir(
+                settings.output_dir, job.job_id, (song.get("songNumber") or index + 1) - 1
+            )
+        except ValueError:
+            continue
+        if not _replacement_file_exists(song["replacedVocal"], settings, directory):
             continue
         recorded = song.get("_replacedVocalModel")
         if isinstance(recorded, str) and recorded != fingerprint:

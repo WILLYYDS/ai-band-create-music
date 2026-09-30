@@ -682,3 +682,44 @@ async def test_replace_status_is_derived_after_restart(tmp_path: Path) -> None:
     assert cached.status_code == 200
     assert cached.json()["replaceStatus"] == "succeeded"
     assert cached.json()["result"]["replacedVocal"].endswith("/demo_rvc_vocal.wav")
+
+
+@pytest.mark.parametrize("song", [0, 1])
+@pytest.mark.parametrize("artifact", ["valid", "missing", "wrong_song", "other_job", "symlink"])
+async def test_restored_replace_status_requires_file_in_song_directory(tmp_path, song, artifact):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings), ReadyVoiceEngine())
+    job, _ = seed_job(app, settings)
+    output = job.result
+    if song == 1:
+        output = {**job.result, "alternatives": []}
+        job.result["alternatives"] = [output]
+        job.result["count"] = 2
+    output["songNumber"] = song + 1
+    directory = settings.output_dir / "jobs" / job.job_id / f"song_{song + 1}"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / "demo_rvc_vocal.wav"
+    if artifact == "wrong_song":
+        target = directory.parent / f"song_{2 - song}" / target.name
+    elif artifact == "other_job":
+        target = settings.output_dir / "jobs" / "another-job" / directory.name / target.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if artifact == "symlink":
+        outside = tmp_path / "outside.wav"
+        outside.write_bytes(b"RIFF-outside")
+        target.symlink_to(outside)
+    elif artifact != "missing":
+        target.write_bytes(b"RIFF-replaced")
+    output["replacedVocal"] = f"http://music.test/output/{target.relative_to(settings.output_dir)}"
+    output["_replacedVocalModel"] = app.state.rvc_model_fingerprint
+    job.save(settings.output_dir)
+
+    restarted = create_app(settings, make_orchestrator(settings), ReadyVoiceEngine())
+    async with client(restarted) as http:
+        detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
+        events = await http.get(f"/api/jobs/{job.job_id}/events")
+    frame = json.loads(events.text.split("data: ", 1)[1])
+    for payload in (detail, frame):
+        assert payload.get("replaceStatus") == ("succeeded" if artifact == "valid" else None)
+        assert payload.get("replaceSong") == (song if artifact == "valid" else None)
+        assert payload["operationProgress"] == (100 if artifact == "valid" else None)

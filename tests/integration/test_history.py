@@ -151,6 +151,9 @@ async def test_job_detail_reuses_startup_rvc_fingerprint(tmp_path, monkeypatch):
         "replacedVocal": "jobs/cached/song_1/vocal_rvc_vocal.wav",
         "_replacedVocalModel": "fingerprint",
     }
+    replaced = settings.output_dir / job.result["replacedVocal"]
+    replaced.parent.mkdir(parents=True, exist_ok=True)
+    replaced.write_bytes(b"RIFF-replaced")
     app.state.jobs[job.job_id] = job
     async with client(app) as http:
         first = await http.get(f"/api/jobs/{job.job_id}")
