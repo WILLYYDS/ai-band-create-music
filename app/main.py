@@ -1222,12 +1222,11 @@ def create_app(
         """
         previous = job.replace_previous
         job.replace_previous = None
-        if not restore_mix_artifact(result, previous):
-            return
+        restore_mix_artifact(result, previous)
         try:
             job.save(application_settings.output_dir)
         except Exception:
-            logger.exception("failed to restore the previous mix job_id=%s", job.job_id)
+            logger.exception("failed to persist replacement rollback job_id=%s", job.job_id)
 
     @application.post(
         "/api/jobs/{job_id}/replace",

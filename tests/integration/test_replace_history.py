@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.main import create_app
+from app.main import create_app, load_jobs
 from tests.helpers import (
     BlockingVoiceEngine,
     ReadyVoiceEngine,
@@ -346,6 +346,10 @@ async def test_failed_rerun_keeps_previous_replaced_vocal(tmp_path: Path) -> Non
     assert failed["replaceStatus"] == "failed"
     assert "replacedVocal" not in failed["result"]
     assert replaced_file.read_bytes() == b"RIFF-replaced-1"
+    # 没有旧合轨成品也必须持久化失效引用，重启不能重新加载它。
+    reloaded = load_jobs(changed_settings.output_dir)[job.job_id]
+    assert "replacedVocal" not in reloaded.result
+    assert "_replacedVocalModel" not in reloaded.result
 
     # 重跑成功：新产物同名原子覆盖，链接恢复可用
     retry_engine = SlowVoiceEngine()
