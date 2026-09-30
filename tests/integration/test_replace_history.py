@@ -371,6 +371,7 @@ async def test_failed_rerun_keeps_previous_replaced_vocal(tmp_path: Path) -> Non
         "task_cancel",
         "preview_failure",
         "save_failure",
+        "restore_save_failure",
         "success",
     ],
 )
@@ -389,6 +390,8 @@ async def test_rerun_commits_replacement_only_after_metadata_save(tmp_path, monk
     mixed_file.write_bytes(b"previous-mix")
     job.result["mixedTrack"] = mixed_file.relative_to(settings.output_dir).as_posix()
     job.save(settings.output_dir)
+    metadata_path = settings.output_dir / "jobs" / job.job_id / "job.json"
+    previous_result = json.loads(metadata_path.read_text())["result"]
     changed_model = tmp_path / "changed-model.pth"
     changed_model.write_bytes(b"changed")
     settings.rvc_model_path = changed_model
@@ -406,7 +409,7 @@ async def test_rerun_commits_replacement_only_after_metadata_save(tmp_path, monk
         if outcome == "preview_cancel":
             started.set()
             await release.wait()
-        if outcome == "preview_failure":
+        if outcome in {"preview_failure", "restore_save_failure"}:
             raise OSError("preview failed")
         return None
 
@@ -415,6 +418,8 @@ async def test_rerun_commits_replacement_only_after_metadata_save(tmp_path, monk
 
     def save_with_failure(self, output_dir):
         nonlocal failed_save
+        if outcome == "restore_save_failure" and self.replace_status == "failed":
+            raise OSError("restore save failed")
         if outcome == "save_failure" and "replacedVocal" in job.result and not failed_save:
             failed_save = True
             raise OSError("metadata save failed")
@@ -427,6 +432,14 @@ async def test_rerun_commits_replacement_only_after_metadata_save(tmp_path, monk
         assert (await http.post(f"/api/jobs/{job.job_id}/replace")).status_code == 202
         if outcome.endswith("_cancel"):
             await asyncio.wait_for(started.wait(), 2)
+            assert "mixedTrack" not in job.result
+            assert json.loads(metadata_path.read_text())["result"] == previous_result
+            restarted = create_app(settings, make_orchestrator(settings), engine)
+            async with client(restarted) as restarted_http:
+                detail = (await restarted_http.get(f"/api/jobs/{job.job_id}")).json()
+                assert detail["mixStatus"] == "succeeded"
+                audio = await restarted_http.get(detail["result"]["mixedTrack"])
+                assert audio.content == b"previous-mix"
             if outcome == "task_cancel":
                 job.replace_task.cancel()
             else:
@@ -435,7 +448,7 @@ async def test_rerun_commits_replacement_only_after_metadata_save(tmp_path, monk
         await job.replace_task
         response = (await http.get(f"/api/jobs/{job.job_id}")).json()
 
-    stored = json.loads((settings.output_dir / "jobs" / job.job_id / "job.json").read_text())
+    stored = json.loads(metadata_path.read_text())
     if outcome == "success":
         assert response["replaceStatus"] == "succeeded"
         assert replaced_file.read_bytes() == b"RIFF-replaced-2"
@@ -446,7 +459,10 @@ async def test_rerun_commits_replacement_only_after_metadata_save(tmp_path, monk
         assert response["replaceStatus"] == expected_status
         assert replaced_file.read_bytes() == b"RIFF-replaced-1"
         assert "replacedVocal" not in response["result"]
-        assert "replacedVocal" not in stored["result"]
+        if outcome == "restore_save_failure":
+            assert stored["result"] == previous_result
+        else:
+            assert "replacedVocal" not in stored["result"]
         assert stored["result"]["mixedTrack"] == job.result["mixedTrack"]
     assert app.state.orchestrator.capacity.active == 0
     assert not list(replaced_file.parent.glob(".rvc-*"))

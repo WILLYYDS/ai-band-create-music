@@ -1382,8 +1382,8 @@ def create_app(
             # 旧文件与新产物同名：覆盖前保留备份，直到新结果元数据提交成功后再清理。
             # 重跑失败/超时/取消时旧文件仍是"上一版还能听"的唯一退路——留着只是不再被任何
             # 结果引用、也不会对外暴露，同曲最多一份，不会堆积。
-            # 先给已完成成品存档再作废：作废会立刻落盘，而接下来的推理可能失败、超时或被
-            # 取消，那时要能把这个成品还回去——它的文件按设计一直留在盘上。人声引用则按既有
+            # 先给已完成成品存档，再在内存中作废；成功提交时才落盘，避免进程中断或恢复保存
+            # 失败时丢失旧成品引用。推理失败/超时/取消时还原成品；人声引用则按既有
             # 契约在判定失效时撤下、失败也不恢复（见 test_failed_rerun_keeps_previous_...）。
             job.replace_previous = capture_mix_artifact(result) or None
             result.pop("replacedVocal", None)
@@ -1391,11 +1391,10 @@ def create_app(
             result.setdefault("playback", {}).pop("replacedVocal", None)
             if isinstance(result.get("waveforms"), dict):
                 result["waveforms"].pop("replaced", None)
-            # 判定失效的正是"合轨成品所依据的那份人声"，所以成品引用也在同一次落盘里摘掉：
+            # 判定失效的正是"合轨成品所依据的那份人声"，所以先在内存中摘掉成品引用：
             # 替换**成功**时成品就此过期（不会继续被当成最新）。替换失败/超时/取消时，由
             # _restore_stashed_mix 把这个成品引用还回来——文件没被动过，用户仍应能试听。
             invalidate_mix_artifact(job, result)
-            job.save(application_settings.output_dir)
 
         job.last_operation = "replace"
 
