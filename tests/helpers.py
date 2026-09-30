@@ -4,9 +4,13 @@ import asyncio
 import wave
 from pathlib import Path
 
+import httpx
+from starlette.requests import Request
+
 from app.core.config import Settings
 from app.infrastructure.events import NullEventPublisher
 from app.infrastructure.queue import InlineTaskDispatcher
+from app.main import GenerationJob
 from app.services.orchestrator import GenerationOrchestrator
 from app.services.prompt import PreparedPrompt
 from app.services.providers import MusicResult
@@ -125,3 +129,88 @@ def make_orchestrator(
         task_dispatcher=InlineTaskDispatcher(),
         events=NullEventPublisher(),
     )
+
+
+def client(app):
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://testserver")
+
+
+def events_request(app, job_id: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "app": app,
+            "headers": [],
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "path": f"/api/jobs/{job_id}/events",
+            "root_path": "",
+            "query_string": b"",
+            "method": "GET",
+        }
+    )
+
+
+def seed_job(app, settings, job_id: str = "job-replace") -> tuple[GenerationJob, Path]:
+    song_dir = settings.output_dir / "jobs" / job_id / "song_1"
+    song_dir.mkdir(parents=True, exist_ok=True)
+    full_track = song_dir / "full_song.wav"
+    vocal = song_dir / "demo_vocal.mp3"
+    full_track.write_bytes(b"RIFF-full")
+    vocal.write_bytes(b"ID3-vocal")
+    job = GenerationJob(
+        job_id=job_id,
+        prompt="rock",
+        structured_prompt="[Genre: Rock]",
+        lyrics="[Verse]\ntest",
+        status="succeeded",
+        stage="completed",
+        progress=100,
+        message="音乐生成完成",
+        result={
+            "success": True,
+            "jobId": job_id,
+            "prompt": "rock",
+            "durationMinutes": "auto",
+            "structuredPrompt": "[Genre: Rock]",
+            "lyrics": "[Verse]\ntest",
+            "count": 1,
+            "alternatives": [],
+            "fullTrack": full_track.relative_to(settings.output_dir).as_posix(),
+            "stems": {"vocal": vocal.relative_to(settings.output_dir).as_posix()},
+            "stemUrls": [vocal.relative_to(settings.output_dir).as_posix()],
+            "waveforms": {"vocal": [0.5]},
+            "splitEnabled": True,
+            "debug": {},
+        },
+    )
+    app.state.jobs[job_id] = job
+    job.save(settings.output_dir)
+    return job, vocal
+
+
+class BlockingVoiceEngine:
+    loaded = True
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self.params = None
+
+    async def convert(self, input_path: Path, output_path: Path, **_params) -> None:
+        self.calls += 1
+        self.params = _params
+        assert input_path.name == "demo_vocal.mp3"
+        self.started.set()
+        await self.release.wait()
+        output_path.write_bytes(b"RIFF-replaced")
+
+
+class ReadyVoiceEngine:
+    """转换在 POST 返回后立刻完成，用来模拟"客户端连上 SSE 时替换已经收尾"。"""
+
+    loaded = True
+
+    async def convert(self, _input_path: Path, output_path: Path, **_params) -> None:
+        output_path.write_bytes(b"RIFF-replaced")

@@ -262,14 +262,14 @@ async def test_cancel_during_preview_only_stops_encoders(
     async with blocked_preview_split(tmp_path, monkeypatch) as (app, client, job_id, orchestrator):
         encoding = (await client.get(f"/api/jobs/{job_id}")).json()
         assert encoding["splitStatus"] == "running"
-        assert encoding["stage"] == "preview"
+        assert encoding["operationStage"] == "preview"
         # 容量在编码前就让给了下一个 Demucs 任务（分支 reduce-audio-stress 的既定取舍），
         # 编码并发由 app.services.audio_files 的信号量单独限制。
         assert orchestrator.capacity.active == 0
         cancelled = (await client.patch(f"/api/jobs/{job_id}", json={"status": "cancelled"})).json()
         # preview 阶段的取消不写终态：PATCH 的响应与随后的最终状态必须一致。
         assert cancelled["splitStatus"] == "running"
-        assert cancelled["stage"] == "preview"
+        assert cancelled["operationStage"] == "preview"
         await app.state.jobs[job_id].split_task
         completed = (await client.get(f"/api/jobs/{job_id}")).json()
 

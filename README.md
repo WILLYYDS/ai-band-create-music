@@ -131,14 +131,29 @@ curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/replace?song=0'
 
 首次启动返回 `202`；重复启动同一任务返回当前状态，已有可读结果时返回 `200`；上一次替换恰好
 超时或取消、推理线程仍在安全收尾时返回 `409`。`GET /api/jobs/<jobId>` 和任务 SSE 会返回
-`replaceStatus`、`replaceSong`、`replaceError`，运行时顶层 `status/stage/progress/message`
-与拆轨任务一致地反映当前操作。完成后歌曲结果增加 `replacedVocal` 音频 URL。转换超过
+`replaceStatus`、`replaceSong`、`replaceError`。顶层 `status/stage/progress/message`
+沿用既有兼容契约：操作 `pending/running` 期间覆盖为当前操作的四字段；操作进入终态后，
+顶层回到主音乐生成任务。历史列表与落盘记录始终表示主生成任务，操作失败不会污染歌曲生成状态。
+POST、GET 与 SSE 新增独立操作字段：`operation`（`split` / `replace` / `mix`）、
+`operationStatus`、`operationSong`、`operationStage`、`operationProgress`、`operationMessage`。
+三种操作的进行中和终态均使用这套字段；`operationSong` 与对应的 `splitSong/replaceSong/mixSong`
+一致，都是从 0 起的序号。既有操作 Status/Song/Error 字段保留。
+操作字段选择当前操作或本进程最近一次操作，运行态不落盘；重启后复用既有 `replaceStatus/mixStatus`
+推导补齐成功状态、`completed` 和 100。同时存在替换与合轨产物时优先报告下游合轨；
+同类操作只有唯一一首有可用产物时才恢复歌曲序号；多首都有时为 `null`，应查看各首结果。失败/取消记录不跨重启保留，
+没有可推导操作时新字段为 `null`；分轨缓存 POST 仍会补齐成功状态和歌曲序号。
+替换依次经过 `operationStage=preparing_vocal`（准备输入音频，0）、
+`replacing_vocal`（RVC 整体转换，25）、
+`creating_replacement`（替换音轨与波形，50）、`exporting_replacement`（进入试听导出时 75、导出完成后 99）。
+RVC 不暴露独立的特征分析回调或内部推理进度，只报告阶段里程碑；
+结果保存可用后才报告 `operationStage=completed`、`replaceStatus=succeeded`、
+`operationStatus=succeeded`、`operationProgress=100`。完成后歌曲结果增加 `replacedVocal` 音频 URL。转换超过
 `RVC_CONVERSION_TIMEOUT_SECONDS`（默认 1800 秒）会立即标记失败；由于 RVC 推理线程不能安全
 强停，锁和并发额度会保留到线程实际退出，期间产物不会发布。这种"已经终态但线程还没退出"的
 替换数量可以从 `GET /api/health` 的 `replacement.workersHoldingCapacityAfterTerminal` 读到，
 日志里也会在进入收尾和线程退出时各记一条 warning。`PATCH /api/jobs/<jobId>` 可取消：
-接口会立即把 `replaceStatus` 标记为 `cancelled`，但保留已完成生成任务的顶层
-`status=succeeded`；当前推理安全退出后会丢弃产物、释放并发额度。
+接口会立即把 `operationStatus/operationStage` 和 `replaceStatus` 标记为 `cancelled`，
+`operationProgress` 置空；主生成任务的顶层字段及历史保持成功。当前推理安全退出后会丢弃产物、释放并发额度。
 
 替换结果与 RVC 模型绑定：`RVC_MODEL_PATH`/`RVC_INDEX_PATH` 内容或 `RVC_MODEL_VERSION` 变化后，
 已缓存的结果会被判定为失效并自动重新推理。失效到新产物落位之间旧文件仍保留在磁盘上（不再
@@ -187,10 +202,11 @@ curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/mix?song=0'
 - 与生成、拆轨、人声替换共享同一并发额度：额度用满返回 429；同一任务已有音频操作在跑返回
   409。合轨进行中（含试听编码）会拒绝该任务的拆轨、替换人声、分轨删除/恢复与替换产物
   删除/恢复。试听编码进入并发闸门前可能等待，此时仍占用合轨额度；编码本身最长 120 秒。
-- 合轨阶段依次为 `mixing`（`progress=76`）、`waveform`（`progress=90`）、
-  `preview`（`progress=95`）和 `completed`（`progress=100`）。`preview` 时 WAV 已发布，
+- `operationStage` 合轨阶段依次为 `mixing`（`operationProgress=76`）、
+  `waveform`（`operationProgress=90`）、`preview`（`operationProgress=95`）
+  和 `completed`（`operationProgress=100`）。`preview` 时 WAV 已发布，
   但 `mixStatus` 仍为 `running`；试听 MP3 就绪或回退处理完成后才发送 SSE `done`。
-  前端应容忍 `stage=preview`；试听失败时 `playback.mixedTrack` 缺失，继续使用 WAV。
+  前端应容忍 `operationStage=preview`（运行期顶层也为 `stage=preview`）；试听失败时 `playback.mixedTrack` 缺失，继续使用 WAV。
 - 入参不合法时返回 400（路径形状/任务 id）、404（输入文件不存在/不可读、歌曲不存在）、
   409（任务未完成、缺音轨、模型已变更、已有音频操作在跑）、429（额度用满）。超时阈值为
   `RVC_MIX_TIMEOUT_SECONDS`（默认 180 秒），也可从 `GET /api/health` 的
@@ -230,9 +246,10 @@ curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/mix?song=0'
   若据此拒绝，就会把只依赖 ffmpeg 的合轨锁死，还给出一个必然失败的补救动作。此时放行合轨
   并记一条 warning。
 
-任务状态里合轨以 `mixStatus`、`mixSong`、`mixError` 暴露，运行期间顶层
-`status/stage/progress/message` 与拆轨、替换人声一致地反映当前操作（混音阶段 `progress`
-从 76 起，波形阶段 90，完成 100）。`mixStatus` 与 `replaceStatus` 一样不落盘：重启后由
+任务状态里合轨以 `mixStatus`、`mixSong`、`mixError` 暴露，独立的 `operation*` 字段
+与拆轨、替换人声使用同一规则，包括成功、失败和取消；只有运行期兼容覆盖顶层字段，
+终态回到主生成状态。
+合轨保留既有百分比：混音阶段 `operationProgress` 从 76 起，波形阶段 90，完成 100。`mixStatus` 与 `replaceStatus` 一样不落盘：重启后由
 结果里的 `mixedTrack` 推导为 `succeeded`；此时若只有一首歌有成品才给出 `mixSong`，多首
 都有成品时 `mixSong` 为 `null`——客户端应直接读每首歌自己的 `mixedTrack` 判断。
 
@@ -497,15 +514,20 @@ stems, stemUrls, waveforms, splitEnabled, debug
 音乐生成只产出完整混音，不会自动拆轨。从历史记录进入编辑时，调用分轨接口执行
 Demucs 四轨分离并通过任务 SSE 推送真实进度；已有 `stems` 时直接复用结果。
 
-拆轨依次经过 `stage=splitting`（Demucs，`progress=76`）、`waveform`（真实波形，
-`progress=90`）、`preview`（每轨试听 MP3，`progress` 在 90→100 之间随完成的轨道递增）
-和 `completed`。`preview` 阶段的 `result.stems`、`splitEnabled`、`waveforms` 已经写入，
+拆轨的 `operationStage` 依次经过 `starting_split`（读取输入，0）、`splitting`（Demucs，25）、
+`waveform`（真实波形，50–75）、`preview`（每轨试听 MP3，75–99）和 `completed`。
+`operationProgress` 按实际处理波形/试听轨道数更新；只有结果可用且操作成功时才报告 100、
+`splitStatus=succeeded` 和 `operationStatus=succeeded`。POST、GET 与 SSE 共用独立操作字段，
+SSE 按 `operationStatus` 判断音频操作是否结束，主生成任务成功不会提前关闭操作流。
+SSE 保存阶段快照，队列最多 16 帧；慢客户端积压时丢弃最旧更新，失败/取消优先于缓冲帧。
+生成进度通知可合并，队列非空表示消费者已有待处理通知；所有发布点使用同一 helper。
+后端不人为延时。`preview` 阶段的 `result.stems`、`splitEnabled`、`waveforms` 已经写入，
 `splitStatus` 仍为 `running`：
 
 - **`preview` 阶段取消只取消编码器**：`PATCH /api/jobs/{jobId}` 仍会取消该阶段的
   ffmpeg 编码任务，因为 WAV 分轨与波形都已落盘，`splitStatus` 不被改写，任务照常以
   `succeeded` 收尾，只是 `result.playback.stems` 缺少试听 MP3（客户端回落到 WAV）。
-  这样 PATCH 的响应与最终状态不会互相矛盾。`splitting`/`waveform` 阶段取消才是终态：
+  这样 PATCH 的响应与最终状态不会互相矛盾。输入读取、`splitting`/`waveform` 阶段取消才是终态：
   `splitStatus=cancelled`。
 - **分轨进行中（`splitStatus` 为 `pending`/`running`，含 `preview` 窗口）拒绝删除/恢复
   分轨**，返回 `409`：此时编码器正在读写 `playtrack/`，删除会丢失播放引用，恢复会永久

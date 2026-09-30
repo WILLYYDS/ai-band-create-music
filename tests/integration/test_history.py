@@ -151,6 +151,9 @@ async def test_job_detail_reuses_startup_rvc_fingerprint(tmp_path, monkeypatch):
         "replacedVocal": "jobs/cached/song_1/vocal_rvc_vocal.wav",
         "_replacedVocalModel": "fingerprint",
     }
+    replaced = settings.output_dir / job.result["replacedVocal"]
+    replaced.parent.mkdir(parents=True, exist_ok=True)
+    replaced.write_bytes(b"RIFF-replaced")
     app.state.jobs[job.job_id] = job
     async with client(app) as http:
         first = await http.get(f"/api/jobs/{job.job_id}")
@@ -243,13 +246,22 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
         resplit_result = (await http.get(f"/api/jobs/{job_id}")).json()
 
     assert accepted.status_code == duplicate.status_code == 202
+    assert (
+        running["operationStatus"],
+        running["operationStage"],
+        running["operationProgress"],
+    ) == (
+        "running",
+        "splitting",
+        25,
+    )
     assert (running["status"], running["stage"], running["progress"]) == (
         "running",
         "splitting",
-        76,
+        25,
     )
-    assert running["splitSong"] == 0
-    assert running["message"] == "Demucs 正在分离音轨"
+    assert running["splitSong"] == running["operationSong"] == 0
+    assert running["operationMessage"] == "正在分离音轨"
     assert history_running["status"] == "succeeded"
     assert "splitStatus" not in history_running
     assert history_running["result"]["waveforms"] == {}
@@ -327,6 +339,7 @@ async def test_split_failure_and_cancel_preserve_completed_generation(tmp_path, 
         failed = (await http.get(f"/api/jobs/{job_id}")).json()
 
     assert failed["status"] == "succeeded"
+    assert failed["operationStatus"] == "failed"
     assert failed["splitStatus"] == "failed"
     assert failed["splitSong"] == 0
     assert failed["splitError"] == "音轨分离失败，请检查服务配置后重试。"
@@ -364,6 +377,7 @@ async def test_split_failure_and_cancel_preserve_completed_generation(tmp_path, 
         await asyncio.sleep(0)
 
     assert cancelled["status"] == "succeeded"
+    assert cancelled["operationStatus"] == "cancelled"
     assert cancelled["splitStatus"] == "cancelled"
     assert app.state.jobs[job_id].status == "succeeded"
     assert load_jobs(settings.output_dir)[job_id].status == "succeeded"
@@ -616,8 +630,8 @@ async def test_job_events_omit_waveforms_while_split_runs(tmp_path, monkeypatch)
     job.result = {"fullTrack": "song_1/full.mp3", "waveforms": {"full": bins}}
     job.split_status = "running"
     job.split_stage = "waveform"
-    job.split_progress = 90
-    job.split_message = "正在提取真实波形"
+    job.split_progress = 50
+    job.split_message = "正在提取波形"
     app.state.jobs[job.job_id] = job
     endpoint = next(
         route.endpoint for route in app.routes if route.path == "/api/jobs/{job_id}/events"
@@ -634,9 +648,14 @@ async def test_job_events_omit_waveforms_while_split_runs(tmp_path, monkeypatch)
     await response.body_iterator.aclose()
 
     payload = json.loads(splitting.removeprefix("data: "))
-    assert payload["status"] == "running"
-    assert (payload["stage"], payload["progress"]) == ("waveform", 90)
-    assert payload["message"] == "正在提取真实波形"
+    assert payload["status"] == payload["operationStatus"] == "running"
+    assert (payload["stage"], payload["progress"], payload["message"]) == (
+        payload["operationStage"],
+        payload["operationProgress"],
+        payload["operationMessage"],
+    )
+    assert (payload["operationStage"], payload["operationProgress"]) == ("waveform", 50)
+    assert payload["operationMessage"] == "正在提取波形"
     assert payload["splitStatus"] == "running"
     # 分轨期间 result 不会变化，波形只随 done 帧下发。
     assert payload["result"]["waveforms"] == {}

@@ -44,7 +44,7 @@ def test_complete_generation_over_real_http(tmp_path: Path) -> None:
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 completed = client.get(f"/api/jobs/{body['jobId']}").json()
-                if completed["status"] not in {"pending", "running"}:
+                if completed["splitStatus"] not in {"pending", "running"}:
                     break
                 time.sleep(0.01)
             assert completed["status"] == "succeeded"

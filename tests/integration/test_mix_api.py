@@ -243,12 +243,34 @@ async def test_restart_derives_status_from_the_result(tmp_path, install_stubs):
     async with client(restarted) as http:
         await run_job_mix(http, restarted_job, 1)
         single = (await http.get(f"/api/jobs/{job.job_id}")).json()
+        # One completed mix after restart still identifies its song before any new POST.
+        unique = build_app(settings)
+        async with client(unique) as unique_http:
+            unique_detail = (await unique_http.get(f"/api/jobs/{job.job_id}")).json()
+            unique_event = await unique_http.get(f"/api/jobs/{job.job_id}/events")
         await run_job_mix(http, restarted_job, 0)
 
     # 再重启一次：两首歌都有成品、又没有运行态，此时不猜序号。
     fresh = build_app(settings)
     async with client(fresh) as http:
         both = (await http.get(f"/api/jobs/{job.job_id}")).json()
+        both_event = await http.get(f"/api/jobs/{job.job_id}/events")
+
+    for detail, event, expected_song in (
+        (unique_detail, unique_event, 1),
+        (both, both_event, None),
+    ):
+        payload = json.loads(event.text.split("data: ", 1)[1])
+        assert event.text.startswith("event: done")
+        for row in (detail, payload):
+            assert (
+                row["operation"],
+                row["operationStatus"],
+                row["operationStage"],
+                row["operationProgress"],
+                row["operationSong"],
+                row["mixSong"],
+            ) == ("mix", "succeeded", "completed", 100, expected_song, expected_song)
 
     assert (single["mixStatus"], single["mixSong"]) == ("succeeded", 1)
     assert (both["mixStatus"], both["mixSong"]) == ("succeeded", None)
@@ -302,14 +324,29 @@ async def test_mix_streams_progress_over_sse(tmp_path, install_stubs, monkeypatc
             first = await anext(stream.body_iterator)
             running = json.loads(first.split("data: ", 1)[1])
             assert first.startswith("data: ")
-            assert running["status"] == running["mixStatus"] == "running"
-            assert (running["stage"], running["progress"]) == ("mixing", 76)
+            assert (running["status"], running["stage"], running["progress"]) == (
+                "running",
+                "mixing",
+                76,
+            )
+            assert running["operationSong"] == running["mixSong"]
+            assert running["operationStatus"] == running["mixStatus"] == "running"
+            assert (running["operationStage"], running["operationProgress"]) == ("mixing", 76)
             assert running["result"]["waveforms"] == {}
             mixer.release.set()
             assert (await asyncio.wait_for(accepted, 2)).status_code == 202
             await asyncio.wait_for(preview_started.wait(), 2)
             waiting = (await http.get(f"/api/jobs/{job.job_id}")).json()
-            assert (waiting["mixStatus"], waiting["stage"], waiting["progress"]) == (
+            assert (
+                waiting["mixStatus"],
+                waiting["operationStage"],
+                waiting["operationProgress"],
+            ) == (
+                "running",
+                "preview",
+                95,
+            )
+            assert (waiting["status"], waiting["stage"], waiting["progress"]) == (
                 "running",
                 "preview",
                 95,
@@ -317,6 +354,8 @@ async def test_mix_streams_progress_over_sse(tmp_path, install_stubs, monkeypatc
             preview_release.set()
             await job.mix_task
             done = await asyncio.wait_for(anext(stream.body_iterator), 2)
+            while not done.startswith("event: done"):
+                done = await asyncio.wait_for(anext(stream.body_iterator), 2)
             completed = json.loads(done.split("data: ", 1)[1])
             history = (await http.get("/api/jobs")).json()["jobs"][0]
         finally:
@@ -327,6 +366,13 @@ async def test_mix_streams_progress_over_sse(tmp_path, install_stubs, monkeypatc
                 await stream.body_iterator.aclose()
     assert done.startswith("event: done\ndata: ")
     assert (completed["mixStatus"], completed["progress"]) == ("succeeded", 100)
+    assert (
+        completed["operation"],
+        completed["operationStatus"],
+        completed["operationStage"],
+        completed["operationProgress"],
+        completed["operationMessage"],
+    ) == ("mix", "succeeded", "completed", 100, "合轨完成")
     assert completed["result"]["waveforms"]["mix"] == MIX_WAVEFORM
     assert completed["result"]["mixedTrack"].endswith(".wav")
     if preview_outcome == "ok":
@@ -359,6 +405,12 @@ async def test_failures_keep_the_previous_mix_intact(tmp_path, install_stubs, mo
         await run_job_mix(http, job)
         detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
         assert (detail["mixStatus"], detail["status"]) == ("failed", "succeeded")
+        assert (
+            detail["operation"],
+            detail["operationStatus"],
+            detail["operationStage"],
+            detail["operationProgress"],
+        ) == ("mix", "failed", "failed", None)
         assert (await http.get(detail["result"]["mixedTrack"])).content == b"RIFF-previous-mix"
 
         mixer.error = None
@@ -894,9 +946,11 @@ async def test_replacement_outcomes_against_the_exported_mix(tmp_path, install_s
     assert "replacedVocal" not in detail["result"]
     assert detail["mixStatus"] == "succeeded" and audio.content == b"RIFF-mixed-stub"
 
-    # 写盘失败：落盘记录里两者要么都在、要么都不在，不会"没有替换人声却有成品"。
+    # 写盘失败：撤下失效的人声引用，但旧音轨与旧成品仍可用。
     app = build_app(settings, StubReplaceEngine())
     job = seed_job(app, settings, job_id="job-savefail")
+    previous_vocal = settings.output_dir / job.result["replacedVocal"]
+    previous_audio = previous_vocal.read_bytes()
     async with client(app) as http:
         await run_job_mix(http, job)
         job.result["_replacedVocalModel"] = "v1:" + "0" * 64
@@ -915,7 +969,10 @@ async def test_replacement_outcomes_against_the_exported_mix(tmp_path, install_s
         await job.replace_task
         assert (await http.get(f"/api/jobs/{job.job_id}")).json()["replaceStatus"] == "failed"
     reloaded = load_jobs(settings.output_dir)[job.job_id]
-    assert "replacedVocal" not in reloaded.result and "mixedTrack" not in reloaded.result
+    assert "replacedVocal" not in reloaded.result
+    assert previous_vocal.read_bytes() == previous_audio
+    assert reloaded.result["mixedTrack"] == job.result["mixedTrack"]
+    assert (settings.output_dir / reloaded.result["mixedTrack"]).read_bytes() == b"RIFF-mixed-stub"
 
 
 # ------------------------------------------------------------- invalidation & restore
