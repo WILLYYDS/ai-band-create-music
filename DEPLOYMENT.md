@@ -6,7 +6,7 @@
 
 - Docker Engine 和 Docker Compose v2
 - NVIDIA 驱动及 NVIDIA Container Toolkit
-- 可访问 PyPI、PyTorch wheel 源和 `ghcr.io` 的构建网络
+- 可访问 Debian 软件源、PyPI、PyTorch wheel 源和 `ghcr.io` 的构建网络（容器运行时代理不自动覆盖镜像构建和拉取）
 - 建议至少预留 20 GB 磁盘空间；CUDA/PyTorch 镜像较大
 
 首次部署前确认 GPU 容器可用：
@@ -64,10 +64,16 @@ tar -xzf ../ai-band-generate-module.tar.gz
 tar -xzf ../ai-band-rvc-assets.tar.gz
 cp .env.example .env
 chmod 600 .env
-mkdir -p output
+mkdir -p output/.torch-cache output/.hf-cache
 ```
 
 编辑 `.env`，至少设置真实的 `LLM_API_KEY`、音乐 Provider 配置。宿主机端口可用 `APP_PORT` 修改；宿主机用户不是 UID/GID 1000 时，设置 `APP_UID` 和 `APP_GID`，确保容器能写入 `output`。
+
+缓存目录也必须由容器用户写入。若目录由 root 创建或从其他机器迁移，启动前按 `.env`
+中的实际 UID/GID 修正权限，例如默认配置执行 `sudo chown -R 1000:1000 output`。
+提前创建 `.torch-cache` 可避免 Docker 自动创建 root 所有的挂载目录，导致 Demucs 报权限错误。
+当前 Compose 默认启用 SSH 隧道代理，启动前先完成下面的代理配置；服务器可以直接联网时，
+按“停用代理”移除代理配置后再启动。
 
 ```bash
 docker compose config --quiet
@@ -84,6 +90,179 @@ docker compose logs -f --tail=200 api
 docker compose build --pull
 docker compose up -d
 ```
+
+### SSH 反向隧道代理
+
+为了不在服务器安装第三方代理软件，使用服务器已有的 OpenSSH，将**本机已有代理**的
+7897 端口通过 SSH 反向端口转发提供给服务器上的容器。这里的“本机”是执行 SSH 命令的
+个人电脑，`server_ip` 是运行 Docker 的服务器；这是出网代理，与应用入口的 HTTPS 反向代理无关。
+
+请求路径为：`容器 → host.docker.internal:7897（服务器）→ SSH 隧道 → 本机 localhost:7897 → 目标服务`。
+SSH 只转发 TCP，本机 7897 必须提供 HTTP 代理或兼容 HTTP 的 mixed 端口；纯 SOCKS 端口
+不能直接使用当前的 `http://` 配置。本机代理只需监听回环地址，无需向本机局域网开放。
+
+#### 1. 配置服务器 sshd
+
+在**服务器**的 `/etc/ssh/sshd_config` 或其实际加载的配置片段中设置：
+
+```text
+GatewayPorts clientspecified
+```
+
+`GatewayPorts` 默认是 `no`，会将远程转发限制在服务器回环地址；`clientspecified` 允许 SSH
+客户端指定监听地址，才能让 Docker bridge 中的容器连接宿主机的 7897。
+`yes` 会强制通配地址监听，不建议替代这里的 `clientspecified`。
+配置含义见 [OpenSSH sshd_config 手册](https://man.openbsd.org/sshd_config#GatewayPorts)。
+
+修改前备份原配置，检查 `Include` 和 `Match` 中是否已有设置，修改实际生效项，不要重复追加。
+如只供一个账号使用，建议将 `GatewayPorts clientspecified` 放在该账号的 `Match User user`
+配置范围内，并用 `PermitListen 0.0.0.0:7897` 限制可监听的地址和端口。
+该账号还必须允许远程 TCP 转发（`AllowTcpForwarding yes` 或 `remote`），且不能被
+`DisableForwarding`、`PermitListen` 或 `authorized_keys` 的转发限制阻止；不要为此取消其他账号的限制。
+
+验证语法并重载（Debian/Ubuntu 通常使用 `ssh`，其他发行版可能使用 `sshd` 服务名）：
+
+```bash
+sudo /usr/sbin/sshd -t && sudo systemctl reload ssh
+sudo /usr/sbin/sshd -T | grep -E '^(gatewayports|allowtcpforwarding|disableforwarding|permitlisten) '
+```
+
+使用 `Match` 时，需向 `sshd -T` 加上 `-C user=user,host=client_name,addr=client_ip`，
+替换为实际 SSH 用户、本机主机名和服务器看到的客户端 IP，检查该连接的有效配置。
+保留当前管理会话，用新会话验证 SSH 仍可登录；重载后需重新建立隧道才能应用新配置。
+
+#### 2. 在本机建立隧道
+
+先启动本机代理并确认 `localhost:7897` 可用，然后在**本机**终端运行：
+
+```bash
+ssh -v -N -R 0.0.0.0:7897:localhost:7897 user@server_ip
+```
+
+- `-v` 输出连接和转发调试信息；共享日志前隐藏用户名、主机地址和密钥路径。
+- `-N` 不执行远程命令，终端保持运行以维持隧道。
+- `-R 0.0.0.0:7897:localhost:7897` 在**服务器所有 IPv4 网卡**监听 7897，将连接转发到
+  **本机**的 `localhost:7897`；这里的 `localhost` 不指服务器或容器。
+- `user@server_ip` 替换成真实账号和地址；SSH 端口非 22 时加 `-p 实际端口`。
+
+建议使用下面的命令，让监听失败时退出，并及时检测 SSH 连接失效：
+
+```bash
+ssh -v -N -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -R 0.0.0.0:7897:localhost:7897 user@server_ip
+```
+
+这些选项不会自动重连，也不保证本机代理或目标网站可用。关闭终端、电脑休眠、网络中断
+都会影响代理；连接失败后需手动重新执行。选项说明见
+[OpenSSH ssh 手册](https://man.openbsd.org/ssh#R)。
+
+#### 3. 容器配置与验证
+
+当前 `docker-compose.yml` 的 `api` 服务包含：
+
+```yaml
+environment:
+  HTTP_PROXY: http://host.docker.internal:7897
+  HTTPS_PROXY: http://host.docker.internal:7897
+  NO_PROXY: localhost,127.0.0.1,::1,hf-mirror.com
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+`host.docker.internal` 通过 `host-gateway` 指向 Docker 宿主机内部地址，而不是个人电脑，
+见 [Docker host-gateway 文档](https://docs.docker.com/reference/cli/docker/container/run/#add-entries-to-container-hosts-file---add-host)。
+容器中的 `localhost` 指容器自身，不能将代理地址改为 `http://localhost:7897`。
+`HTTPS_PROXY` 仍使用 `http://`，表示通过 HTTP 代理的 CONNECT 隧道访问 HTTPS 目标。
+`NO_PROXY` 中的地址绕过代理；当前 `hf-mirror.com` 直接访问服务器网络。内网服务如需直连，
+将其实际域名/IP 加入列表；镜像站也需要代理时，从列表中移除 `hf-mirror.com`。
+这些值写在 Compose 的 `environment` 中，优先于 `env_file: .env`，只改 `.env` 不会覆盖它们，
+见 [Compose 环境变量优先级](https://docs.docker.com/compose/how-tos/environment-variables/envvars-precedence/)。
+
+应用中遵循代理环境变量的客户端会使用隧道；ElevenLabs 默认
+`ELEVENLABS_BYPASS_GLOBAL_PROXY=true`，其生成请求直连，需要代理时在 `.env` 改为 `false`。
+MiniMax 使用独立直连客户端，不随这组环境变量切换。模型下载是否走代理取决于实际下载客户端。
+
+在**服务器**检查监听和代理，再启动/重建容器并检查容器侧链路：
+
+```bash
+sudo ss -lntp 'sport = :7897'
+curl --noproxy "" -x http://127.0.0.1:7897 -I --max-time 30 https://pypi.org/simple/
+docker compose up -d --force-recreate api
+docker compose exec api python -c 'import httpx; r = httpx.head("https://pypi.org/simple/", proxy="http://host.docker.internal:7897", trust_env=False, timeout=30); r.raise_for_status(); print(r.status_code)'
+```
+
+若 SSH 报 `remote port forwarding failed`，检查端口占用和转发权限；服务器测试正常而容器
+连接被拒绝/超时，检查实际监听是否为 `0.0.0.0:7897`、`host-gateway` 解析和宿主机防火墙。
+以上显式代理测试成功只证明该目标的代理链路可用，应用 health 成功也不代表模型下载或
+Provider 已联通；还需按实际业务验证。
+
+#### 风险与访问限制
+
+- **公网暴露：** `0.0.0.0:7897` 会监听服务器所有 IPv4 网卡。如果安全组或防火墙允许公网
+  访问，任何能连接该端口的人都可能借用本机代理出网；SSH 登录认证不会替转发端口上的
+  代理请求做认证。可能造成流量盗用、出口 IP 滥用，以及通过本机代理访问其可达的内网服务。
+  不要在云安全组开放公网 7897；宿主机防火墙仅允许所需 Docker bridge 网段访问该端口，
+  阻止公网及其他不需要的来源，并核对实际监听地址及相关 IPv6 规则。
+- **配置影响范围：** 全局 `GatewayPorts clientspecified` 会允许其他具有远程转发权限的
+  SSH 用户选择非回环地址；优先按账号限制。可进一步把 `-R` 的 `0.0.0.0` 换成容器解析到的
+  宿主机 bridge 地址，并同步调整 `PermitListen`，避免监听公网网卡；该地址需按实际 Docker
+  网络确认，不能直接照抄固定 IP。
+- **可用性与数据路径：** 代理依赖个人电脑、代理进程和 SSH 会话；隧道断开时，仍配置代理
+  的客户端通常请求失败，不会自动回退直连。流量消耗本机带宽，受本机代理规则和出口影响。
+  SSH 保护本机与服务器之间的隧道，容器到宿主机段及代理出口段不因此获得额外加密；
+  使用 HTTPS 并保留证书验证，不要用关闭 TLS 校验解决连通问题。
+- **第三方镜像：** `HF_ENDPOINT=https://hf-mirror.com` 为支持该变量的 Hugging Face 客户端
+  切换镜像，`HF_HOME=/app/output/.hf-cache` 持久化缓存；当前镜像站在 `NO_PROXY` 中。
+  镜像服务有可用性和供应链风险，私有资源的令牌可能随客户端请求发送给所配置的镜像，
+  不要向不信任的镜像发送凭据。
+
+#### 停用代理与恢复配置
+
+服务器具备直连能力、需要长期独立运行或不再使用该代理时：
+
+1. 修改 `docker-compose.yml`，删除或注释 `api.environment` 中的 `HTTP_PROXY`、
+   `HTTPS_PROXY`、`NO_PROXY`，删除仅供代理使用的 `extra_hosts` 条目；块为空时一并删除块。
+   同时清理 `.env` 中可能存在的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`
+   及对应小写变量，避免从 `env_file` 再次注入。如果仍需其他宿主机服务的映射，保留对应条目。
+2. 校验并重建容器，使新环境生效：
+
+   ```bash
+   docker compose config --quiet
+   docker compose up -d --force-recreate api
+   docker compose exec api python -c 'import os; print(sorted(k for k in os.environ if k.lower().endswith("_proxy")))'
+   ```
+
+   彻底停用时最后一条应输出 `[]`。无需重新构建镜像，单独 `docker compose restart` 不会
+   更新容器环境；重新验证实际 API 请求和模型下载。若只是临时关闭 SSH 且不改 Compose，
+   代理请求会失败，因此不要把“关闭隧道”当作完整停用。
+3. 在本机运行 SSH 的终端按 `Ctrl+C` 结束该隧道；若以后台方式启动，找到并结束对应进程，
+   不要批量杀死其他 SSH 管理连接。在服务器用 `sudo ss -lntp 'sport = :7897'` 确认该监听已移除。
+4. 将服务器的有效 `GatewayPorts` 改回原值；原来未配置时恢复为默认 `no`，或移除本次为
+   专用账号增加的 `Match` 配置。按前面的 `sshd -t` 检查后重载，并再次验证有效配置。
+   若还需其他 SSH 转发，保留其配置。**修改并重载 sshd 不会撤销已经建立的转发，必须结束原隧道。**
+   同时撤回本次为 7897 添加的防火墙/安全组放行规则。
+
+镜像配置可独立选择：不用 Hugging Face 镜像时，删除 `HF_ENDPOINT`（默认回到官方端点）
+或改为 `https://huggingface.co`，并重建容器；`HF_HOME` 和 `.torch-cache` 挂载可以保留。
+不要为停用代理删除 `output` 或模型缓存，否则会丢失结果或触发重新下载。
+
+### 构建源与缓存说明
+
+当前 Dockerfile 在 builder 阶段将匹配到的 Debian `http://deb.debian.org` 地址替换为清华镜像，
+设置 `UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`、`UV_HTTP_TIMEOUT=3000`（秒），
+并通过 BuildKit 缓存挂载复用 `/root/.cache/uv`。构建缓存与容器模型缓存是两回事：
+`./output/.torch-cache` 挂载到 `/app/.torch-cache`，供应用固定路径下的 Demucs/Torch 缓存使用。
+
+**运行时 Compose 代理不会自动用于 `docker compose build`，也不会为 Docker daemon 拉取镜像
+提供代理。** 最终镜像的 `ffmpeg` 安装仍使用该阶段原有 Debian 源；项目的 `pyproject.toml`
+显式配置了 PyPI/PyTorch 索引，`uv.lock` 保留下载地址，`uv sync --frozen` 不重新生成锁文件，
+不能仅凭 `UV_INDEX_URL` 就认为所有依赖都已改走镜像。构建网络仍需覆盖实际访问的源，
+依据构建日志确认；无法满足时按第 5 节在可联网机器构建并导入镜像。
+锁文件行为见 [uv sync --frozen 文档](https://docs.astral.sh/uv/reference/cli/#uv-sync--frozen)。
+
+不用构建镜像源时，在 Dockerfile 中移除 builder 的 `sed` 替换和 `UV_INDEX_URL` 设置，
+按需要恢复 `UV_HTTP_TIMEOUT`，然后重新构建。BuildKit 缓存挂载可以保留，无需为停用代理清空。
 
 ### 安全启用歌曲保留策略
 
