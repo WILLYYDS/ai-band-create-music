@@ -72,7 +72,7 @@ mkdir -p output/.torch-cache output/.hf-cache
 缓存目录也必须由容器用户写入。若目录由 root 创建或从其他机器迁移，启动前按 `.env`
 中的实际 UID/GID 修正权限，例如默认配置执行 `sudo chown -R 1000:1000 output`。
 提前创建 `.torch-cache` 可避免 Docker 自动创建 root 所有的挂载目录，导致 Demucs 报权限错误。
-当前 Compose 默认启用 SSH 隧道代理，启动前先完成下面的代理配置；服务器可以直接联网时，
+当前 Compose 默认启用 SSH 隧道代理，发起联网业务前先完成下面的代理配置；服务器可以直接联网时，
 按“停用代理”移除代理配置后再启动。
 
 ```bash
@@ -116,7 +116,8 @@ GatewayPorts clientspecified
 
 修改前备份原配置，检查 `Include` 和 `Match` 中是否已有设置，修改实际生效项，不要重复追加。
 如只供一个账号使用，建议将 `GatewayPorts clientspecified` 放在该账号的 `Match User user`
-配置范围内，并用 `PermitListen 0.0.0.0:7897` 限制可监听的地址和端口。
+配置范围内，并用 `PermitListen 实际bridge地址:7897` 限制可监听的地址和端口；
+地址须按下一步核实，例如当前服务器为 `PermitListen 172.17.0.1:7897`。
 该账号还必须允许远程 TCP 转发（`AllowTcpForwarding yes` 或 `remote`），且不能被
 `DisableForwarding`、`PermitListen` 或 `authorized_keys` 的转发限制阻止；不要为此取消其他账号的限制。
 
@@ -131,33 +132,69 @@ sudo /usr/sbin/sshd -T | grep -E '^(gatewayports|allowtcpforwarding|disableforwa
 替换为实际 SSH 用户、本机主机名和服务器看到的客户端 IP，检查该连接的有效配置。
 保留当前管理会话，用新会话验证 SSH 仍可登录；重载后需重新建立隧道才能应用新配置。
 
-#### 2. 在本机建立隧道
+#### 2. 确认地址并先限制访问
 
-先启动本机代理并确认 `localhost:7897` 可用，然后在**本机**终端运行：
+完成镜像构建后，可以先启动容器核对网络，此时不要发起需要代理的业务请求。
+在**服务器项目目录**执行：
 
 ```bash
-ssh -v -N -R 0.0.0.0:7897:localhost:7897 user@server_ip
+docker compose up -d api
+docker compose exec -T api python -c 'import socket; print(socket.gethostbyname("host.docker.internal"))'
+ip -4 addr show
+docker inspect "$(docker compose ps -q api)" --format '{{json .NetworkSettings.Networks}}'
+```
+
+隧道应绑定容器解析到的宿主机 bridge 地址，防火墙应匹配应用所属的网桥，两者可能不同。
+当前服务器解析到 `172.17.0.1`（`docker0`），应用属于 `br-e71e5f2bd0ad`（网关 `172.20.0.1`）。
+可以根据容器网络的 `NetworkID` 与实际 `br-` 网卡核对；有自定义 bridge 名称时以实际配置为准。
+以下地址和网桥仅是该服务器的已验证示例，其他机器必须替换为核实后的值。
+
+**建立隧道前先限制 TCP 7897 的访问来源。** 本次排查时服务器使用 iptables-nft，
+IPv4/IPv6 INPUT 默认放行、UFW 未启用，尚无 7897 来源限制，Tailscale 规则也未限制该端口。
+使用 iptables 在 INPUT 首位添加规则，仅允许应用网桥访问；规则已存在时只检查其顺序，
+不重复添加：
+
+```bash
+sudo iptables -I INPUT 1 ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
+sudo iptables -S INPUT
+```
+
+确认 DROP 规则位于 `-j ts-input` 等放行规则之前；不要直接修改 Docker 管理的 nft 表。
+规则也阻止宿主机回环和其他网桥访问 7897，同一应用网桥上的其他容器仍能访问。
+这是 IPv4 规则，后续不应新增 IPv6 的 7897 监听而不配置相应限制。
+手动规则通常在重启后丢失；服务器重启或防火墙被重置后，需在重建隧道前检查/恢复。
+
+#### 3. 在本机建立隧道
+
+先结束原有监听 `0.0.0.0` 或错误地址的隧道，启动本机代理并确认 `localhost:7897` 可用，
+然后在**本机**终端运行（当前服务器已核实监听地址为 `172.17.0.1`）：
+
+```bash
+ssh -v -N -R 172.17.0.1:7897:localhost:7897 user@server_ip
 ```
 
 - `-v` 输出连接和转发调试信息；共享日志前隐藏用户名、主机地址和密钥路径。
 - `-N` 不执行远程命令，终端保持运行以维持隧道。
-- `-R 0.0.0.0:7897:localhost:7897` 在**服务器所有 IPv4 网卡**监听 7897，将连接转发到
+- `-R 172.17.0.1:7897:localhost:7897` 在**服务器已核实的 bridge 地址**监听 7897，将连接转发到
   **本机**的 `localhost:7897`；这里的 `localhost` 不指服务器或容器。
 - `user@server_ip` 替换成真实账号和地址；SSH 端口非 22 时加 `-p 实际端口`。
+
+原命令 `ssh -v -N -R 0.0.0.0:7897:localhost:7897 user@server_ip` 会监听服务器所有 IPv4
+网卡，存在外部借用代理的风险，不作为默认示例。仅在确有需要且已验证严格的来源限制后使用。
 
 建议使用下面的命令，让监听失败时退出，并及时检测 SSH 连接失效：
 
 ```bash
 ssh -v -N -o ExitOnForwardFailure=yes \
   -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-  -R 0.0.0.0:7897:localhost:7897 user@server_ip
+  -R 172.17.0.1:7897:localhost:7897 user@server_ip
 ```
 
 这些选项不会自动重连，也不保证本机代理或目标网站可用。关闭终端、电脑休眠、网络中断
 都会影响代理；连接失败后需手动重新执行。选项说明见
 [OpenSSH ssh 手册](https://man.openbsd.org/ssh#R)。
 
-#### 3. 容器配置与验证
+#### 4. 容器配置与验证
 
 当前 `docker-compose.yml` 的 `api` 服务包含：
 
@@ -183,17 +220,20 @@ extra_hosts:
 `ELEVENLABS_BYPASS_GLOBAL_PROXY=true`，其生成请求直连，需要代理时在 `.env` 改为 `false`。
 MiniMax 使用独立直连客户端，不随这组环境变量切换。模型下载是否走代理取决于实际下载客户端。
 
-在**服务器**检查监听和代理，再启动/重建容器并检查容器侧链路：
+在**服务器**检查监听和访问规则，并从容器验证代理链路：
 
 ```bash
 sudo ss -lntp 'sport = :7897'
-curl --noproxy "" -x http://127.0.0.1:7897 -I --max-time 30 https://pypi.org/simple/
-docker compose up -d --force-recreate api
-docker compose exec api python -c 'import httpx; r = httpx.head("https://pypi.org/simple/", proxy="http://host.docker.internal:7897", trust_env=False, timeout=30); r.raise_for_status(); print(r.status_code)'
+sudo iptables -S INPUT
+docker compose exec -T api python -c 'import httpx; r = httpx.head("https://example.com/", proxy="http://host.docker.internal:7897", trust_env=False, timeout=15); r.raise_for_status(); print(r.status_code)'
 ```
 
-若 SSH 报 `remote port forwarding failed`，检查端口占用和转发权限；服务器测试正常而容器
-连接被拒绝/超时，检查实际监听是否为 `0.0.0.0:7897`、`host-gateway` 解析和宿主机防火墙。
+当前服务器已验证监听为 `172.17.0.1:7897`，容器代理请求返回 `200`，DROP 规则位于
+Tailscale 放行规则之前。`ss` 的监听范围看 `Local Address`，`Peer Address` 中的
+`0.0.0.0:*` 不代表监听所有网卡；按上述限制配置后，宿主机回环代理测试也会被阻止。
+若 SSH 报 `remote port forwarding failed`，检查端口占用、`PermitListen` 和转发权限；
+容器连接被拒绝/超时时，检查实际监听是否匹配 `host.docker.internal` 的解析地址、
+网桥名称和防火墙规则。只监听 `172.20.0.1` 而容器解析到 `172.17.0.1` 会造成地址不匹配。
 以上显式代理测试成功只证明该目标的代理链路可用，应用 health 成功也不代表模型下载或
 Provider 已联通；还需按实际业务验证。
 
@@ -205,9 +245,8 @@ Provider 已联通；还需按实际业务验证。
   不要在云安全组开放公网 7897；宿主机防火墙仅允许所需 Docker bridge 网段访问该端口，
   阻止公网及其他不需要的来源，并核对实际监听地址及相关 IPv6 规则。
 - **配置影响范围：** 全局 `GatewayPorts clientspecified` 会允许其他具有远程转发权限的
-  SSH 用户选择非回环地址；优先按账号限制。可进一步把 `-R` 的 `0.0.0.0` 换成容器解析到的
-  宿主机 bridge 地址，并同步调整 `PermitListen`，避免监听公网网卡；该地址需按实际 Docker
-  网络确认，不能直接照抄固定 IP。
+  SSH 用户选择非回环地址；优先按账号限制。默认绑定已核实的宿主机 bridge 地址并同步
+  调整 `PermitListen`。绑定 bridge 地址本身不限制请求来源，还需上述 INPUT 访问限制。
 - **可用性与数据路径：** 代理依赖个人电脑、代理进程和 SSH 会话；隧道断开时，仍配置代理
   的客户端通常请求失败，不会自动回退直连。流量消耗本机带宽，受本机代理规则和出口影响。
   SSH 保护本机与服务器之间的隧道，容器到宿主机段及代理出口段不因此获得额外加密；
@@ -216,6 +255,23 @@ Provider 已联通；还需按实际业务验证。
   切换镜像，`HF_HOME=/app/output/.hf-cache` 持久化缓存；当前镜像站在 `NO_PROXY` 中。
   镜像服务有可用性和供应链风险，私有资源的令牌可能随客户端请求发送给所配置的镜像，
   不要向不信任的镜像发送凭据。
+
+#### 升级时保留网桥
+
+日常升级保持项目目录/Compose 项目名和网络配置不变，使用：
+
+```bash
+docker compose build
+docker compose up -d --force-recreate api
+```
+
+这些操作复用现有网络，容器 IP 变化不会影响按网桥匹配的防火墙规则。
+`docker compose down` 默认删除项目网络，再次 `up` 时网桥名称可能变化，见
+[Docker down 文档](https://docs.docker.com/reference/cli/docker/compose/down/)。
+网桥生命周期取决于 Docker 网络，即使服务器不关机，删除/重建网络也会使原名称失效。
+网络重建后，核对解析地址和应用新网桥，先添加新的来源限制、移除旧规则，再复测代理；
+解析地址变化时同步更新隧道及 `PermitListen`。旧 DROP 规则会阻止新网桥访问 7897，
+表现为代理请求失败。正常升级保留现有网络即可，无需额外配置固定网桥。
 
 #### 停用代理与恢复配置
 
@@ -242,6 +298,13 @@ Provider 已联通；还需按实际业务验证。
    专用账号增加的 `Match` 配置。按前面的 `sshd -t` 检查后重载，并再次验证有效配置。
    若还需其他 SSH 转发，保留其配置。**修改并重载 sshd 不会撤销已经建立的转发，必须结束原隧道。**
    同时撤回本次为 7897 添加的防火墙/安全组放行规则。
+5. 确认隧道监听已移除后，删除本次添加的来源限制规则。当前服务器的命令为：
+
+   ```bash
+   sudo iptables -D INPUT ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
+   ```
+
+   网桥变更后应使用实际添加的规则参数；不要清空整个 INPUT 链或 Docker/Tailscale 规则。
 
 镜像配置可独立选择：不用 Hugging Face 镜像时，删除 `HF_ENDPOINT`（默认回到官方端点）
 或改为 `https://huggingface.co`，并重建容器；`HF_HOME` 和 `.torch-cache` 挂载可以保留。

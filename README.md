@@ -117,7 +117,8 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8010
 curl http://127.0.0.1:8010/api/health
 ```
 
-服务器 Docker 部署、离线镜像和发布包清单见 [`DEPLOYMENT.md`](DEPLOYMENT.md)。
+服务器 Docker 部署、离线镜像和发布包清单见 [`DEPLOYMENT.md`](DEPLOYMENT.md)，
+SSH 出网代理与升级注意事项见下方“Docker 部署与 SSH 出网代理”。
 
 RVC 默认自动查找 `assets/rvc` 中的模型、索引和 HuBERT/RMVPE 基础模型；也可通过
 `RVC_MODEL_PATH`、`RVC_INDEX_PATH` 和 `RVC_BASE_MODEL_DIR` 显式指定。RVC 推理在
@@ -164,6 +165,82 @@ RVC 不暴露独立的特征分析回调或内部推理进度，只报告阶段�
 `replacedVocal` 就是该 URL，前端直接播放或下载。`DELETE /api/voice/result` 软删除替换产物，
 `PUT /api/voice/result` 恢复；两者均传 `job_id`、`filename` 和可选的 `song`，删除后可恢复，
 重新替换则会覆盖同一路径。
+
+## Docker 部署与 SSH 出网代理
+
+为了不在服务器安装第三方代理软件，使用 SSH 反向隧道复用个人电脑上已有的 HTTP/mixed
+代理端口 `7897`。Compose 已将 `HTTP_PROXY`、`HTTPS_PROXY` 指向
+`http://host.docker.internal:7897`，并通过 `host-gateway` 将该域名映射到 Docker 宿主机。
+服务器 sshd 需要 `GatewayPorts clientspecified` 并允许该账号的远程 TCP 转发。
+完整配置、风险与停用步骤见 [`DEPLOYMENT.md`](DEPLOYMENT.md#ssh-反向隧道代理)。
+
+**必须先核实监听地址和应用网桥，并限制 7897 的访问来源，再建立隧道。** SSH 登录认证
+不会保护代理端口上的请求，不使用 `0.0.0.0:7897` 作为默认监听地址。
+在服务器项目目录确认：
+
+```bash
+docker compose exec -T api python -c 'import socket; print(socket.gethostbyname("host.docker.internal"))'
+ip -4 addr show
+docker inspect "$(docker compose ps -q api)" --format '{{json .NetworkSettings.Networks}}'
+```
+
+当前服务器已核实：`host.docker.internal` 解析为 `172.17.0.1`（`docker0`），应用位于
+`br-e71e5f2bd0ad`（网关 `172.20.0.1`）。**代理监听地址与允许访问的应用网桥是两个不同值**：
+隧道绑定前者，防火墙匹配后者。其他机器或网络重建后需重新核实，不能直接照抄。
+
+在服务器添加下面的 IPv4 规则，仅允许当前应用网桥访问 TCP 7897；
+规则已存在时只检查其顺序，不重复添加：
+
+```bash
+sudo iptables -I INPUT 1 ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
+sudo iptables -S INPUT
+```
+
+确认这条 DROP 规则位于 `-j ts-input` 等放行规则之前。规则也阻止宿主机回环访问以及
+其他网桥访问 7897；同一应用网桥上的其他容器仍可使用代理。手动添加的规则通常在重启后
+丢失；当前服务器按持续运行维护，重启或防火墙规则被重置后必须在建立隧道前重新检查/添加。
+
+先启动个人电脑上的代理，再在**个人电脑**终端建立隧道，替换 SSH 用户和服务器地址：
+
+```bash
+ssh -v -N -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -R 172.17.0.1:7897:localhost:7897 user@server_ip
+```
+
+如使用 `PermitListen`，同步设置为 `172.17.0.1:7897`。在服务器验证监听和容器出网：
+
+```bash
+sudo ss -lntp 'sport = :7897'
+docker compose exec -T api python -c 'import httpx; r = httpx.head("https://example.com/", proxy="http://host.docker.internal:7897", trust_env=False, timeout=15); r.raise_for_status(); print(r.status_code)'
+```
+
+当前部署已验证监听为 `172.17.0.1:7897`，容器请求返回 `200`。
+`ss` 的监听范围看 `Local Address`，`Peer Address` 的 `0.0.0.0:*` 不代表监听所有网卡。
+个人电脑休眠、代理退出或 SSH 断开会导致代理请求失败，需要恢复隧道。
+当前 `NO_PROXY` 包含 `hf-mirror.com`，镜像站直连；ElevenLabs 默认绕过全局代理，
+需要走隧道时在 `.env` 设置 `ELEVENLABS_BYPASS_GLOBAL_PROXY=false`，MiniMax 保持直连。
+Compose 运行时代理不覆盖镜像构建和拉取，构建源及缓存说明见部署文档。
+
+日常升级保留项目目录/Compose 项目名和网络配置，直接重建容器：
+
+```bash
+docker compose build
+docker compose up -d --force-recreate api
+```
+
+这些操作复用现有网络，容器 IP 变化不要求修改按网桥匹配的规则。
+`docker compose down` 会删除默认网络，再次 `up` 时网桥名称可能变化，见
+[Docker down 文档](https://docs.docker.com/reference/cli/docker/compose/down/)。
+删除/重建网络后，先核实新网桥、重新添加访问限制并移除旧规则，再复测代理；
+旧规则会阻止新网桥访问 7897，表现为代理连接失败。
+
+彻底停用时，先移除 Compose 和 `.env` 中的代理变量并重建容器，再结束 SSH 隧道、
+恢复 sshd 设置，最后移除本次添加的防火墙规则。当前规则的撤销命令为：
+
+```bash
+sudo iptables -D INPUT ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
+```
 
 ## 合轨导出
 
