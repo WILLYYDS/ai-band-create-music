@@ -572,6 +572,29 @@ jobId, prompt, durationMinutes, structuredPrompt, fullTrack,
 stems, stemUrls, waveforms, splitEnabled, debug
 ```
 
+双格式下载沿用结果字段，`result.alternatives` 中每首候选使用相同映射：
+
+| 音频 | WAV | MP3 |
+| --- | --- | --- |
+| 原曲 / 完整混音 | `fullTrack` | `playback.fullTrack` |
+| 合轨成品 | `mixedTrack` | `playback.mixedTrack` |
+| 单轨 / 原人声 | `stems[stemId]` | `playback.stems[stemId]` |
+| 替换人声 | `replacedVocal` | `playback.replacedVocal` |
+
+任务列表、详情、SSE、替换完成（含缓存命中）与重启恢复共用 URL 渲染逻辑。
+WAV 对应的 MP3 位于同歌曲的 `playtrack/` 下，文件名包含 WAV 的修改时间和大小；
+读取结果会复用磁盘上的当前版本，即使旧元数据遗漏了 `playback`，也不会重新编码。
+没有有效 MP3 时不返回对应地址。音频从现有 `/output/` 出口下载，支持 Range 和查询参数；
+WAV 被软删除或版本改变后，其旧 MP3 链接返回 404，撤回删除会恢复有效地址。
+
+兼容例外：旧任务的 `fullTrack`（或旧单轨字段）可能本来就是 MP3。
+后端保留该地址，并把它同步投影到对应的 `playback` 字段，不改写旧任务的原始引用。
+前端应按 URL pathname 的真实扩展名判断格式，仅在原始字段以 `.wav` 结尾时启用 WAV 下载；
+替换页的当前状态 `output` / `playback` 分别取当前歌曲的 `replacedVocal` /
+`playback.replacedVocal`。后端没有单独的 `output` 响应字段。
+只有 MP3 的旧任务没有可下载的 WAV，本次不做批量转码；如需补齐，必须实际解码生成 WAV，
+并通过新增 WAV 地址字段提供给前端（需要同步适配），不能只改扩展名，也不能恢复压缩前的音质。
+
 `waveforms` 是每条音轨的归一化 RMS 包络，固定 640 个 bin
 （`app/services/waveforms.py` 的 `WAVEFORM_BIN_COUNT`）：多轨编辑器按车道满宽绘制时
 640 个点才像波形，且同一个 `waveforms` 字典内的所有音轨共享同一长度，客户端可以用同一

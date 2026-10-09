@@ -125,6 +125,19 @@ def playback_matches(source: Path, preview: Path) -> bool:
     )
 
 
+def existing_playback_mp3(source: Path) -> Path | None:
+    """Reuse a current preview, or the original MP3 of a legacy song."""
+    if not source.is_file() or not source.stat().st_size:
+        return None
+    if source.suffix.lower() == ".mp3":
+        return source
+    if source.suffix.lower() == ".wav":
+        preview = source.parent / "playtrack" / _playback_name(source)
+        if playback_matches(source, preview):
+            return preview
+    return None
+
+
 def detect_audio_content_type(path: Path, *, header: bytes | None = None) -> str:
     try:
         if header is None:

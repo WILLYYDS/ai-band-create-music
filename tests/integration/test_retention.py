@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from app.main import GenerationJob, create_app
+from app.services.audio_files import _playback_name
 from app.services.retention import (
     cleanup_expired_jobs,
     is_expired,
@@ -233,7 +234,9 @@ async def test_expired_access_cache_lifecycle_and_persistent_audit(tmp_path):
     now = datetime.now(timezone.utc)
     add_job(app, "old", (now - timedelta(days=4)).isoformat())
     add_job(app, "recent", now.isoformat())
-    preview = settings.output_dir / "jobs/recent/song_1/playtrack/full.playback-1-2.mp3"
+    source = settings.output_dir / "jobs/recent/song_1/full.wav"
+    source.write_bytes(b"RIFF-wav")
+    preview = source.parent / "playtrack" / _playback_name(source)
     preview.parent.mkdir()
     preview.write_bytes(b"preview")
     async with httpx.AsyncClient(
@@ -258,7 +261,9 @@ async def test_expired_access_cache_lifecycle_and_persistent_audit(tmp_path):
                     data={"job_id": "old", "filename": "vocal.wav"},
                 )
             ).status_code == 404
-        response = await client.get("/output/jobs/recent/song_1/playtrack/full.playback-1-2.mp3")
+        response = await client.get(
+            f"/output/{preview.relative_to(settings.output_dir).as_posix()}"
+        )
         assert response.status_code == 200
         max_age = int(response.headers["cache-control"].split("max-age=")[1].split(",")[0])
         assert 0 < max_age <= 3 * 86400
@@ -732,14 +737,17 @@ async def test_in_flight_range_download_survives_cleanup(tmp_path, monkeypatch):
 async def test_orphan_preview_access_depends_on_retention_policy(tmp_path, enabled):
     settings = make_settings(tmp_path, song_retention_enabled=enabled, song_retention_dry_run=False)
     app = create_app(settings, make_orchestrator(settings))
-    path = settings.output_dir / "jobs/orphan/song_1/playtrack/full.playback-1-2.mp3"
-    path.parent.mkdir(parents=True)
+    source = settings.output_dir / "jobs/orphan/song_1/full.wav"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"RIFF-wav")
+    path = source.parent / "playtrack" / _playback_name(source)
+    path.parent.mkdir()
     path.write_bytes(b"preview")
     await refresh_retention_inventory(app)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app), base_url="http://testserver"
     ) as client:
-        response = await client.get("/output/jobs/orphan/song_1/playtrack/full.playback-1-2.mp3")
+        response = await client.get(f"/output/{path.relative_to(settings.output_dir).as_posix()}")
         inventory = (await client.get("/api/health")).json()["retention"]
     assert inventory["orphanJobIds"] == ["orphan"]
     assert response.status_code == (404 if enabled else 200)
