@@ -990,9 +990,21 @@ async def test_deleting_an_input_invalidates_and_restore_brings_the_mix_back(
     vocal = Path(job.result["replacedVocal"]).name
     async with client(app) as http:
         await run_job_mix(http, job)
+        mix_path = settings.output_dir / job.result["mixedTrack"]
+        mix_preview = mix_path.parent / "playtrack" / _playback_name(mix_path)
+        mix_preview.parent.mkdir(exist_ok=True)
+        mix_preview.write_bytes(b"ID3-mix-preview")
+        job.result.setdefault("playback", {})["mixedTrack"] = mix_preview.relative_to(
+            settings.output_dir
+        ).as_posix()
+        before = (await http.get(f"/api/jobs/{job.job_id}")).json()["result"]
         if deleted == "stem":
             removed = await http.request("DELETE", f"/api/jobs/{job.job_id}/stems/drums")
             while_invalid = (await http.get(f"/api/jobs/{job.job_id}")).json()
+            app.state.jobs = load_jobs(settings.output_dir)
+            assert app.state.jobs[job.job_id].deleted_stems["0:drums"]["mixPlayback"] == (
+                mix_preview.relative_to(settings.output_dir).as_posix()
+            )
             undone = await http.put(f"/api/jobs/{job.job_id}/stems/drums")
         else:
             removed = await http.request(
@@ -1006,10 +1018,12 @@ async def test_deleting_an_input_invalidates_and_restore_brings_the_mix_back(
 
     assert removed.status_code in {200, 204}
     assert "mixedTrack" not in while_invalid["result"]
+    assert "mixedTrack" not in while_invalid["result"]["playback"]
     assert while_invalid["mixStatus"] is None
     assert undone.status_code in {200, 204}
     assert restored["mixStatus"] == "succeeded"
     assert restored["result"]["waveforms"]["mix"] == MIX_WAVEFORM
+    assert restored["result"]["playback"]["mixedTrack"] == before["playback"]["mixedTrack"]
 
     # 还原自带防护：已有更新的成品时不得覆盖（这条路径目前经 API 不可达——分轨被删时
     # /mix 必然 409——但准入规则一旦放宽就会立刻暴露，所以把语义钉住）。

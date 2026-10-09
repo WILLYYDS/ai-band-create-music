@@ -1,5 +1,7 @@
 import array
 import asyncio
+import copy
+import json
 import math
 import os
 import shutil
@@ -8,16 +10,18 @@ import sys
 import wave
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
-from app.main import GenerationJob, _render_result_urls, create_app
+from app.main import GenerationJob, _render_result_urls, create_app, load_jobs
 from app.services.audio_files import make_playback_mp3
 from app.services.job_files import capture_mix_artifact, drop_mix_artifact, restore_mix_artifact
 from app.services.orchestrator import GenerationOrchestrator
+from app.services.retention import cleanup_expired_jobs
 from tests.helpers import make_orchestrator, make_settings
 
 
@@ -28,20 +32,26 @@ def wav(path: Path) -> None:
         output.writeframes(b"\0\0" * 8000)
 
 
+@pytest.mark.parametrize("suffix", [".wav", ".WAV", ".wAv"])
 async def test_four_preview_urls_range_and_stale_versions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
 ) -> None:
     settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
     folder = settings.output_dir / "jobs/j/song_1"
     names = {
-        "fullTrack": "full.wav",
-        "vocal": "vocal.wav",
-        "replacedVocal": "replaced.wav",
-        "mixedTrack": "mix.wav",
+        "fullTrack": f"full[1]{suffix}",
+        "vocal": f"vocal{suffix}",
+        "replacedVocal": f"replaced{suffix}",
+        "mixedTrack": f"mix{suffix}",
     }
     paths = {key: folder / name for key, name in names.items()}
     for path in paths.values():
+        if suffix != ".wav":
+            wav(path.with_suffix(".wav"))
         wav(path)
+        if suffix != ".wav":
+            old_mtime = path.stat().st_mtime_ns - 1_000_000
+            os.utime(path.with_suffix(".wav"), ns=(old_mtime, old_mtime))
     previews = {
         key: await make_playback_mp3(path, settings.output_dir) for key, path in paths.items()
     }
@@ -62,11 +72,11 @@ async def test_four_preview_urls_range_and_stale_versions(
     }
     rendered = _render_result_urls(result, "http://testserver", settings)
     assert set(rendered["playback"]) == {"fullTrack", "stems", "replacedVocal", "mixedTrack"}
-    assert rendered["fullTrack"].endswith(".wav")
+    assert rendered["fullTrack"].endswith(suffix)
     original_open = Path.open
 
     def reject_wav_read(path: Path, *args, **kwargs):
-        if path.suffix == ".wav":
+        if path.suffix.lower() == ".wav":
             raise AssertionError("result rendering must not read WAV bytes")
         return original_open(path, *args, **kwargs)
 
@@ -82,6 +92,13 @@ async def test_four_preview_urls_range_and_stale_versions(
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app), base_url="http://testserver"
     ) as client:
+        pairs = [(rendered[key], rendered["playback"][key]) for key in names if key != "vocal"]
+        pairs.append((rendered["stems"]["vocal"], rendered["playback"]["stems"]["vocal"]))
+        for source_url, preview_url in pairs:
+            assert (await client.get(source_url)).status_code == 200
+            mp3 = await client.get(preview_url)
+            assert mp3.status_code == 200
+            assert mp3.headers["content-type"].startswith("audio/mpeg")
         response = await client.get(
             rendered["playback"]["fullTrack"], headers={"Range": "bytes=0-2"}
         )
@@ -95,6 +112,16 @@ async def test_four_preview_urls_range_and_stale_versions(
     assert 3 * 86400 - 5 <= max_age <= 3 * 86400
     assert len(response.content) == 3
 
+    async def unexpected_encode(*_args, **_kwargs):
+        raise AssertionError("an existing MP3 must not be encoded again")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(asyncio, "create_subprocess_exec", unexpected_encode)
+        assert (
+            await make_playback_mp3(paths["fullTrack"], settings.output_dir)
+            == previews["fullTrack"]
+        )
+
     previous_mtime = paths["replacedVocal"].stat().st_mtime_ns
     replacement = paths["replacedVocal"].with_suffix(".new")
     wav(replacement)
@@ -105,6 +132,10 @@ async def test_four_preview_urls_range_and_stale_versions(
         "replacedVocal"
         not in _render_result_urls(result, "http://testserver", settings)["playback"]
     )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://testserver"
+    ) as client:
+        assert (await client.get(rendered["playback"]["replacedVocal"])).status_code == 404
     fresh = await make_playback_mp3(paths["replacedVocal"], settings.output_dir)
     assert fresh != previews["replacedVocal"]
     assert not (settings.output_dir / previews["replacedVocal"]).exists()
@@ -143,8 +174,12 @@ async def test_generation_and_split_publish_previews(tmp_path: Path) -> None:
         assert (await client.delete(f"/api/jobs/{job_id}/stems/vocal")).status_code == 204
         deleted = (await client.get(f"/api/jobs/{job_id}")).json()["result"]
         assert "vocal" not in deleted["playback"]["stems"]
+        assert (await client.get(split["stems"]["vocal"])).status_code == 404
+        assert (await client.get(split["playback"]["stems"]["vocal"])).status_code == 404
         restored = (await client.put(f"/api/jobs/{job_id}/stems/vocal")).json()["result"]
         assert restored["playback"]["stems"]["vocal"] == split["playback"]["stems"]["vocal"]
+        assert (await client.get(restored["stems"]["vocal"])).status_code == 200
+        assert (await client.get(restored["playback"]["stems"]["vocal"])).status_code == 200
 
 
 async def test_failed_stem_preview_does_not_fail_split(
@@ -450,7 +485,141 @@ async def test_replacement_waveform_and_delete_restore_preview(tmp_path: Path) -
         assert "replacedVocal" not in deleted
         assert "replacedVocal" not in deleted["playback"]
         assert "replaced" not in deleted["waveforms"]
+        assert (await client.get(filename)).status_code == 404
+        assert (await client.get(original_preview)).status_code == 404
+        # Undo metadata and both formats survive a backend restart.
+        app.state.jobs = load_jobs(settings.output_dir)
         assert (await client.request("PUT", "/api/voice/result", data=payload)).status_code == 200
         restored = (await client.get("/api/jobs/j")).json()["result"]
         assert restored["playback"]["replacedVocal"] == original_preview
         assert len(restored["waveforms"]["replaced"]) == 640
+        assert (await client.get(restored["replacedVocal"])).status_code == 200
+        assert (await client.get(original_preview)).status_code == 200
+
+
+@pytest.mark.parametrize("legacy_mp3", [False, True])
+async def test_download_formats_consistent_across_responses_restart_and_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_mp3: bool
+) -> None:
+    settings = make_settings(tmp_path, song_retention_enabled=True, song_retention_dry_run=False)
+    app = create_app(settings, make_orchestrator(settings))
+    songs = []
+    for song in (1, 2):
+        folder = settings.output_dir / f"jobs/download/song_{song}"
+        paths = {key: folder / f"{key}.wav" for key in ("fullTrack", "mixedTrack", "replacedVocal")}
+        paths["vocal"] = folder / "vocal.wav"
+        for key, path in paths.items():
+            wav(path)
+            preview = await make_playback_mp3(path, settings.output_dir)
+            assert preview
+            if key in {"fullTrack", "vocal"} and legacy_mp3:
+                paths[key] = path.with_suffix(".mp3")
+                shutil.copy2(settings.output_dir / preview, paths[key])
+                path.unlink()
+        relative = {
+            key: path.relative_to(settings.output_dir).as_posix() for key, path in paths.items()
+        }
+        songs.append(
+            {
+                "songNumber": song,
+                **{key: relative[key] for key in ("fullTrack", "mixedTrack", "replacedVocal")},
+                "_replacedVocalModel": app.state.rvc_model_fingerprint,
+                "stems": {"vocal": relative["vocal"]},
+                "stemUrls": [relative["vocal"]],
+                "waveforms": {},
+                "splitEnabled": True,
+                "debug": {},
+                # A missing or stale metadata URL must reuse the current file on disk.
+                "playback": {"fullTrack": "jobs/download/song_1/playtrack/stale.mp3"},
+            }
+        )
+    job = GenerationJob(
+        job_id="download",
+        prompt="test",
+        status="succeeded",
+        stage="completed",
+        result={
+            **songs[0],
+            "success": True,
+            "jobId": "download",
+            "prompt": "test",
+            "durationMinutes": "auto",
+            "structuredPrompt": "test",
+            "lyrics": "test",
+            "count": 2,
+            "alternatives": songs[1:],
+        },
+    )
+    stored_result = copy.deepcopy(job.result)
+    job.save(settings.output_dir)
+    app.state.jobs = load_jobs(settings.output_dir)
+
+    async def unexpected_encode(*_args, **_kwargs):
+        raise AssertionError("reading results must not encode audio")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_encode)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://testserver"
+    ) as client:
+        detail = (await client.get("/api/jobs/download")).json()["result"]
+        history = (await client.get("/api/jobs")).json()["jobs"][0]["result"]
+        sse = await client.get("/api/jobs/download/events")
+        terminal = json.loads(
+            next(line[6:] for line in sse.text.splitlines() if line.startswith("data: "))
+        )
+        cached = await client.post("/api/jobs/download/replace?song=1")
+        assert cached.status_code == 200
+        for payload in (history, terminal["result"], cached.json()["result"]):
+            for expected, actual in zip(
+                [detail, *detail["alternatives"]], [payload, *payload["alternatives"]], strict=True
+            ):
+                for key in (
+                    "fullTrack",
+                    "mixedTrack",
+                    "replacedVocal",
+                    "stems",
+                    "stemUrls",
+                    "playback",
+                ):
+                    assert actual[key] == expected[key]
+        assert app.state.jobs["download"].result == stored_result
+        urls = []
+        for output in [detail, *detail["alternatives"]]:
+            assert f"song_{output['songNumber']}/" in output["fullTrack"]
+            for key in ("fullTrack", "mixedTrack", "replacedVocal"):
+                source, mp3 = output[key], output["playback"][key]
+                if key == "fullTrack" and legacy_mp3:
+                    assert source == mp3
+                else:
+                    assert source.endswith(".wav")
+                assert mp3.endswith(".mp3")
+                urls.extend((source, mp3))
+            urls.extend((output["stems"]["vocal"], output["playback"]["stems"]["vocal"]))
+            if legacy_mp3:
+                assert output["stems"]["vocal"] == output["playback"]["stems"]["vocal"]
+            else:
+                assert output["stems"]["vocal"].endswith(".wav")
+        keys = ("fullTrack", "mixedTrack", "replacedVocal")
+        assert {detail["playback"][key] for key in keys}.isdisjoint(
+            detail["alternatives"][0]["playback"][key] for key in keys
+        )
+        for url in urls:
+            response = await client.get(url + "?download=1")
+            assert response.status_code == 200
+            if url.endswith(".wav"):
+                assert response.content[:4] == b"RIFF" and response.content[8:12] == b"WAVE"
+                assert response.headers["content-type"].startswith("audio/wav")
+            else:
+                assert response.content[:3] == b"ID3" or response.content[0] == 0xFF
+                assert response.headers["content-type"].startswith("audio/mpeg")
+        app.state.jobs["download"].created_at = (
+            datetime.now(timezone.utc) - timedelta(days=4)
+        ).isoformat()
+        app.state.jobs["download"].save(settings.output_dir)
+        for url in urls:
+            assert (await client.get(url)).status_code == 404
+        assert (await client.get("/api/jobs")).json()["jobs"] == []
+        assert (await client.get("/api/jobs/download")).status_code == 404
+        assert (await client.get("/api/jobs/download/events")).status_code == 404
+        await cleanup_expired_jobs(app, reason="test")
+        assert not (settings.output_dir / "jobs/download").exists()

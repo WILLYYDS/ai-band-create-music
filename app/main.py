@@ -47,6 +47,7 @@ from app.schemas import (
 from app.services.audio_files import (
     build_public_audio_url,
     detect_audio_content_type,
+    existing_playback_mp3,
     make_playback_mp3,
     output_path_from_url,
     playback_matches,
@@ -2049,10 +2050,7 @@ def create_app(
             deleted_entry["playback"] = stem_playback.get(stem_name)
         # 分轨是合轨的输入：删掉它就等于让成品不再对应当前歌曲。引用连同车道一起作废，
         # 但先存进撤回记录，PUT 恢复分轨时能把成品一并还原（与其它撤回字段同一机制）。
-        if isinstance(result.get("mixedTrack"), str):
-            deleted_entry["mixTrack"] = result["mixedTrack"]
-            if isinstance(waveforms, dict) and isinstance(waveforms.get("mix"), list):
-                deleted_entry["mixWaveform"] = waveforms["mix"]
+        deleted_entry.update(capture_mix_artifact(result))
         job.deleted_stems[deleted_key] = deleted_entry
         del stems[stem_name]
         if isinstance(stem_playback, dict):
@@ -2250,6 +2248,27 @@ def create_app(
                     raise HTTPException(status_code=404, detail="任务创建时间不可用。")
                 if is_expired(job, application_settings.song_retention_days):
                     raise HTTPException(status_code=404, detail="歌曲已过期。")
+        preview_match = (
+            re.fullmatch(r"(.+)\.playback-\d+-\d+\.mp3", target.name)
+            if target.parent.name == "playtrack"
+            else None
+        )
+        if preview_match:
+            source_path = target.parent.parent
+            try:
+                for source_path in target.parent.parent.iterdir():
+                    if source_path.stem != preview_match[1] or source_path.suffix.lower() != ".wav":
+                        continue
+                    source_path = source_path.resolve()
+                    source_path.relative_to(root)
+                    if playback_matches(source_path, target):
+                        break
+                else:
+                    raise HTTPException(status_code=404, detail="Audio file not found")
+            except (ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=404, detail="Audio file not found") from exc
+            except OSError as exc:
+                raise _audio_io_error(exc, source_path) from exc
         try:
             descriptor = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
             try:
@@ -2686,37 +2705,35 @@ def _render_result_urls(
         mixed_track = output.get("mixedTrack")
         if isinstance(mixed_track, str):
             output["mixedTrack"] = _public_audio_url(mixed_track, base_url, settings)
-        previews = output.get("playback")
-        if isinstance(previews, dict):
 
-            def valid_preview(source: object, preview: object) -> str | None:
-                if not isinstance(source, str) or not isinstance(preview, str):
-                    return None
-                try:
-                    if playback_matches(
-                        _output_path_from_url(source, settings),
-                        _output_path_from_url(preview, settings),
-                    ):
-                        return _public_audio_url(preview, base_url, settings)
-                except (OSError, ValueError):
-                    pass
+        def valid_preview(source: object) -> str | None:
+            if not isinstance(source, str):
                 return None
+            try:
+                preview = existing_playback_mp3(_output_path_from_url(source, settings))
+                if preview:
+                    return build_public_audio_url(
+                        base_url, preview.relative_to(settings.output_dir.resolve())
+                    )
+            except (OSError, ValueError):
+                pass
+            return None
 
-            valid = {}
-            for key in ("fullTrack", "replacedVocal", "mixedTrack"):
-                url = valid_preview(output.get(key), previews.get(key))
+        valid = {}
+        for key in ("fullTrack", "replacedVocal", "mixedTrack"):
+            url = valid_preview(output.get(key))
+            if url:
+                valid[key] = url
+        stems = output.get("stems")
+        if isinstance(stems, dict):
+            valid_stems = {}
+            for name, source in stems.items():
+                url = valid_preview(source)
                 if url:
-                    valid[key] = url
-            stems = output.get("stems")
-            stem_previews = previews.get("stems")
-            if isinstance(stems, dict) and isinstance(stem_previews, dict):
-                valid_stems = {}
-                for name, preview in stem_previews.items():
-                    url = valid_preview(stems.get(name), preview)
-                    if url:
-                        valid_stems[name] = url
-                if valid_stems:
-                    valid["stems"] = valid_stems
+                    valid_stems[name] = url
+            if valid_stems:
+                valid["stems"] = valid_stems
+        if valid or "playback" in output:
             output["playback"] = valid
         for key in [key for key in output if isinstance(key, str) and key.startswith("_")]:
             del output[key]
