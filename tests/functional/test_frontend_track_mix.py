@@ -119,25 +119,29 @@ const controls = (muted = [], solo = [], trackDb = {}) => ({
   muted: new Set(muted), solo: new Set(solo), trackDb,
 });
 
-/* 「完成创作」：代理透传请求体，后端回显同一份配置，终态必须过前端的揭晓判据。 */
-async function mix(job, song, config) {
+const project = (variant) => (output) => variant === "mixed" ? output.mixed : output;
+
+/* 「完成创作」：代理透传请求体，后端回显同一份配置，终态必须过前端的揭晓判据。
+   替换前后是两首歌：回显在读输入的那首上，判据与返回值是被覆盖的那首（替换编辑器写进 mixed）。 */
+async function mix(job, song, config, variant = "original") {
   const path = `/api/music/jobs/${job}`;
-  const accepted = await request(`${path}/mix?song=${song}`, {
+  const query = variant === "mixed" ? "&variant=mixed" : "";
+  const accepted = await request(`${path}/mix?song=${song}${query}`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(config),
   });
   assert.equal(accepted.response.status, 202, JSON.stringify(accepted.body));
-  assert.ok(trackMixMatches(selected(song)(accepted.body.result).mixConfig, config),
+  assert.ok(trackMixMatches(project(variant)(selected(song)(accepted.body.result)).mixConfig, config),
     "202 must echo the exact request");
+  const target = config.editor === "replace" ? "mixed" : variant;
   const sse = await request(`${path}/events`);
   assert.equal(sse.response.status, 200);
   assert.match(sse.body, /event: done/);
   const detail = (await request(path)).body;
   assert.equal(detail.mixStatus, "succeeded", JSON.stringify(detail));
   const outputs = [detail.result, ...detail.result.alternatives];
-  const output = selected(song)(detail.result);
-  assert.equal(completionMixStateFor(detail, outputs, song), "done", JSON.stringify(output));
+  const output = project(target)(selected(song)(detail.result));
+  assert.equal(completionMixStateFor(detail, outputs, song, target), "done", JSON.stringify(output));
   assert.ok(trackMixMatches(output.mixConfig, config));
-  assert.equal(output.fullTrack, output.mixedTrack);
   assert.equal(output.audioRevision, config.audioRevision + 1);
   assert.match(output.fullTrack, /^\/api\/music\/output\//);
   const wav = await fetch(base + output.fullTrack);
@@ -150,6 +154,33 @@ async function mix(job, song, config) {
   assert.equal((await preview.arrayBuffer()).byteLength, 3);
   return output;
 }
+
+/* ------------------------------------------- 替换人声：产出独立的「替换后」那首歌 */
+const replaceLanes = [{ id: "replaced", source: "replaced" }, { id: "drums", source: "stem", stemId: "drums" }];
+const replacedSong = await mix("project-live", 0,
+  trackMixRequest("replace", replaceLanes, controls([], [], { replaced: -3 }), 0));
+assert.deepEqual(Object.keys(replacedSong.stems).sort(), ["drums", "replaced"]);
+let originalSong = (await request("/api/music/jobs/project-live")).body.result;
+// 原曲原样保留：版本、母带、音轨都没动，替换人声已进了替换后那首。
+assert.equal(originalSong.audioRevision, 0);
+assert.deepEqual(Object.keys(originalSong.stems).sort(), ["bass", "drums", "other", "vocal"]);
+assert.equal(originalSong.replacedVocal ?? null, null);
+assert.equal(originalSong.mixedTrack, replacedSong.fullTrack);
+// 替换后那首的分轨删除/撤回走同一个代理，按它自己的版本校验。
+const mixedStem = (method, revision) => request("/api/music/jobs/project-live/stems/drums", {
+  method, headers: { "X-Song-Index": "0", "X-Song-Variant": "mixed", "X-Audio-Revision": String(revision) },
+});
+assert.equal((await mixedStem("DELETE", 0)).response.status, 409);
+assert.equal((await mixedStem("DELETE", 1)).response.status, 204);
+assert.equal((await mixedStem("PUT", 1)).response.status, 200);
+// 单独编辑替换后那首：只覆盖它自己。
+const editedReplaced = await mix("project-live", 0, trackMixRequest("tracks",
+  [{ id: "replaced", source: "stem", stemId: "replaced" }], controls(), 1), "mixed");
+assert.equal(editedReplaced.audioRevision, 2);
+assert.deepEqual(Object.keys(editedReplaced.stems), ["replaced"]);
+originalSong = (await request("/api/music/jobs/project-live")).body.result;
+assert.equal(originalSong.audioRevision, 0);
+assert.equal(originalSong.mixed.fullTrack, editedReplaced.fullTrack);
 
 /* ---------------------------------------------------------- 分轨歌曲：solo 与音量 */
 const lanes = ["vocal", "drums", "bass", "other"].map((id) => ({ id, source: "stem", stemId: id }));
@@ -231,12 +262,12 @@ const fullFirst = await mix("single-live", 0,
 assert.equal(fullFirst.splitEnabled, false);
 assert.deepEqual(fullFirst.stems, {});
 assert.deepEqual(fullFirst.stemUrls, []);
-assert.equal(fullFirst.fullTrack, fullFirst.mixedTrack);
+assert.equal(fullFirst.mixedTrack ?? null, null);
 const fullSecond = await mix("single-live", 0, trackMixRequest("tracks", fullLane, controls(), 1));
 assert.equal(fullSecond.audioRevision, 2);
 assert.notEqual(fullSecond.fullTrack, fullFirst.fullTrack);
 
-/* ------------------------------------------------------------------ 生成记录只有一条 */
+/* ------------------------------------- 生成记录：一个任务一条，替换前后两首分别可见 */
 const history = (await request("/api/music/jobs")).body.jobs;
 const rows = history.find(({ jobId }) => jobId === "project-live");
 assert.ok(rows);
@@ -246,8 +277,12 @@ assert.equal(rows.result.count, 2);
 assert.equal(rows.result.fullTrack, second.fullTrack);
 assert.equal(rows.result.audioRevision, 2);
 assert.equal(rows.result.alternatives[0].fullTrack, third.fullTrack);
+// 原曲被覆盖了两次，替换后那首仍是它自己最后一次覆盖的版本。
+assert.equal(rows.result.mixed.fullTrack, editedReplaced.fullTrack);
+assert.equal(rows.result.mixed.audioRevision, 2);
+assert.equal(rows.result.mixedTrack, editedReplaced.fullTrack);
 console.log("Next → FastAPI → FFmpeg: proxy passthrough, solo, gains, in-place overwrite,"
-  + " revisions, undo failure, single-track and history passed");
+  + " separate replaced song, revisions, undo failure, single-track and history passed");
 """
             result = subprocess.run(
                 [node, "--experimental-strip-types", "--input-type=module", "-e", script],
