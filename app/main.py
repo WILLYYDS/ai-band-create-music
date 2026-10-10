@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import httpx
@@ -42,6 +42,7 @@ from app.schemas import (
     GenerateRequest,
     GenerateResponse,
     GenerationJobResponse,
+    TrackMixRequest,
     UpdateGenerationJobRequest,
 )
 from app.services.audio_files import (
@@ -55,11 +56,15 @@ from app.services.audio_files import (
 )
 from app.services.job_files import (
     capture_mix_artifact,
-    drop_mix_artifact,
+    drop_editor_state,
     invalidate_mix_artifact,
     job_song_dir,
+    normalize_mixed_song,
     read_job_diagnostics,
+    require_audio_revision,
+    reset_mix_state,
     restore_mix_artifact,
+    song_project,
     stored_path_exists,
 )
 from app.services.orchestrator import GenerationOrchestrator
@@ -74,7 +79,7 @@ from app.services.retention import (
     retention_lifecycle,
     retention_status,
 )
-from app.services.stems import STEM_NAMES, DemucsStemSeparator
+from app.services.stems import STEM_NAMES, DemucsStemSeparator, is_vocal_stem
 from app.services.voice import (
     RVCConversionError,
     RVCEngine,
@@ -83,7 +88,6 @@ from app.services.voice import (
     mix_output_filename,
     mix_tracks,
     replacement_filename,
-    trash_result_path,
 )
 from app.services.waveforms import extract_waveforms
 
@@ -289,6 +293,16 @@ def load_jobs(
         safe_message = None
         try:
             data = json.loads(target.read_text(encoding="utf-8"))
+            discarded_state = False
+            for output in [
+                data.get("result"),
+                *((data.get("result") or {}).get("alternatives") or []),
+            ]:
+                if isinstance(output, dict):
+                    discarded_state = drop_editor_state(output) or discarded_state
+                    discarded_state = normalize_mixed_song(output) or discarded_state
+            if discarded_state:
+                logger.info("discarding obsolete editor settings job_id=%s", target.parent.name)
             validated = GenerationJobResponse.model_validate(data)
             if validated.jobId != target.parent.name:
                 safe_message = "jobId does not match directory"
@@ -316,12 +330,13 @@ def load_jobs(
                 deleted_stems=data.get("deletedStems", {}),
                 deleted_replaced_vocals=data.get("deletedReplacedVocals", {}),
             )
-            repaired = False
+            repaired = discarded_state
             for output in [job.result, *((job.result or {}).get("alternatives") or [])]:
-                if not isinstance(output, dict) or not isinstance(output.get("mixedTrack"), str):
+                mixed = song_project(output, "mixed")
+                if mixed is None or not isinstance(mixed.get("fullTrack"), str):
                     continue
                 try:
-                    artifact = output_path_from_url(output["mixedTrack"], output_dir)
+                    artifact = output_path_from_url(mixed["fullTrack"], output_dir)
                     missing = not artifact.is_file()
                 except ValueError:
                     missing = True
@@ -332,7 +347,7 @@ def load_jobs(
                     logger.warning(
                         "cannot verify mix reference job_id=%s path=%s error=%s",
                         job.job_id,
-                        output["mixedTrack"],
+                        mixed["fullTrack"],
                         exc,
                     )
                     continue
@@ -342,9 +357,9 @@ def load_jobs(
                     logger.warning(
                         "dropping mix reference without a file job_id=%s path=%s",
                         job.job_id,
-                        output["mixedTrack"],
+                        mixed["fullTrack"],
                     )
-                    drop_mix_artifact(output)
+                    output.pop("mixed")
                     repaired = True
             if job.status in {"pending", "running"}:
                 job.status = job.stage = "failed"
@@ -385,6 +400,19 @@ def _song_result(job: GenerationJob, song: int) -> dict[str, Any] | None:
         return None
     result = alternatives[song - 1]
     return result if isinstance(result, dict) else None
+
+
+def _playback_dict(output: dict[str, Any]) -> dict[str, Any]:
+    """可写的 `playback` 字典。
+
+    `playback` 在响应模型里允许是 null，而 job.json 里的 result 不经过模型再赋值就到
+    这里，所以缺失和 null 都得当作"还没有"处理，不能直接 `.pop()`/取下标。
+    """
+    playback = output.get("playback")
+    if not isinstance(playback, dict):
+        playback = {}
+        output["playback"] = playback
+    return playback
 
 
 def build_orchestrator(
@@ -982,7 +1010,7 @@ def create_app(
                 },
             )
         stems = result.get("stems")
-        if isinstance(stems, dict) and stems:
+        if result.get("splitEnabled") or (isinstance(stems, dict) and stems):
             job.last_operation = "split"
             job.split_song = song
             job.split_error = None
@@ -1027,6 +1055,9 @@ def create_app(
             raise
 
         job.last_operation = "split"
+        previous_result = copy.deepcopy(result)
+        previous_deleted_stems = copy.deepcopy(job.deleted_stems)
+        previous_deleted_vocals = copy.deepcopy(job.deleted_replaced_vocals)
 
         def publish() -> None:
             _publish_job(job, request, snapshot=True)
@@ -1075,31 +1106,17 @@ def create_app(
                     progress=waveform_progress,
                 )
                 result["stems"] = stems
-                playback = result.setdefault("playback", {})
+                playback = _playback_dict(result)
                 playback.pop("stems", None)
-                replaced_url = result.get("replacedVocal")
-                if isinstance(replaced_url, str) and stored_path_exists(
-                    application_settings.output_dir, replaced_url
-                ):
-                    # Only a newly invalidated replacement supersedes an earlier undo stash.
-                    previous_waveforms = result.get("waveforms")
-                    deleted = {"url": replaced_url}
-                    for key, value in (
-                        ("playback", playback.get("replacedVocal")),
-                        (
-                            "waveform",
-                            previous_waveforms.get("replaced")
-                            if isinstance(previous_waveforms, dict)
-                            else None,
-                        ),
-                        ("model", result.get("_replacedVocalModel")),
-                    ):
-                        if value is not None:
-                            deleted[key] = value
-                    job.deleted_replaced_vocals[str(song)] = deleted
+                job.deleted_replaced_vocals.pop(str(song), None)
                 playback.pop("replacedVocal", None)
                 result.pop("replacedVocal", None)
                 result.pop("_replacedVocalModel", None)
+                # 旧方案的工程状态（编辑器控制与单轨原输入）按"未提交设置"丢弃。新版的
+                # mixConfig 是已提交成品的凭据，而重新分轨用的是同一份 fullTrack、成品仍然
+                # 成立，所以它照旧保留（文档：成功终态继续保留此配置）。
+                drop_editor_state(result)
+                result["audioRevision"] = result.get("audioRevision", 0) + 1
                 invalidate_mix_artifact(job, result)
                 result["stemUrls"] = list(stems.values())
                 previous_waveforms = result.get("waveforms")
@@ -1113,29 +1130,17 @@ def create_app(
                 result["waveforms"] = merged_waveforms
                 result["waveforms"].pop("replaced", None)
                 result["waveforms"].pop("mix", None)
-                result["splitEnabled"] = bool(stems)
+                result["splitEnabled"] = True
                 debug = result.get("debug")
                 if not isinstance(debug, dict):
                     debug = result["debug"] = {}
                 debug["splitterDurationMs"] = split_result.duration_ms
                 deleted_prefix = f"{song}:"
-                for key, deleted in list(job.deleted_stems.items()):
-                    if key.startswith(deleted_prefix):
-                        try:
-                            target = _output_path_from_url(deleted["url"], application_settings)
-                            _stem_trash_path(
-                                target,
-                                application_settings,
-                                job_id,
-                                (result.get("songNumber") or song + 1) - 1,
-                            ).unlink(missing_ok=True)
-                        except (KeyError, OSError, ValueError):
-                            logger.warning(
-                                "failed to clear replaced stem trash job_id=%s key=%s",
-                                job_id,
-                                key,
-                            )
-                        del job.deleted_stems[key]
+                job.deleted_stems = {
+                    key: deleted
+                    for key, deleted in job.deleted_stems.items()
+                    if not key.startswith(deleted_prefix)
+                }
                 job.save(application_settings.output_dir)
                 wav_ready = True
                 await active_orchestrator.capacity.release()
@@ -1205,8 +1210,12 @@ def create_app(
                 job.split_progress = None
                 job.split_message = "音轨分离失败"
                 job.split_error = "音轨分离失败，请检查服务配置后重试。"
-                publish()
             finally:
+                if not wav_ready:
+                    result.clear()
+                    result.update(previous_result)
+                    job.deleted_stems = previous_deleted_stems
+                    job.deleted_replaced_vocals = previous_deleted_vocals
                 if not capacity_released:
                     await active_orchestrator.capacity.release()
                 publish()
@@ -1296,11 +1305,11 @@ def create_app(
             )
 
         stems = result.get("stems")
-        vocal_url = next(
+        vocal_url = (stems or {}).get("replaced") or next(
             (
                 value
                 for name, value in (stems.items() if isinstance(stems, dict) else ())
-                if name.lower() in {"vocal", "vocals", "voice"} and isinstance(value, str)
+                if is_vocal_stem(name) and isinstance(value, str)
             ),
             None,
         )
@@ -1382,7 +1391,7 @@ def create_app(
             job.replace_previous = capture_mix_artifact(result) or None
             result.pop("replacedVocal", None)
             result.pop("_replacedVocalModel", None)
-            result.setdefault("playback", {}).pop("replacedVocal", None)
+            _playback_dict(result).pop("replacedVocal", None)
             if isinstance(result.get("waveforms"), dict):
                 result["waveforms"].pop("replaced", None)
             # 判定失效的正是"合轨成品所依据的那份人声"，所以先在内存中摘掉成品引用：
@@ -1504,7 +1513,7 @@ def create_app(
                     result["replacedVocal"] = result_path.relative_to(
                         application_settings.output_dir.resolve()
                     ).as_posix()
-                    result.setdefault("playback", {}).pop("replacedVocal", None)
+                    _playback_dict(result).pop("replacedVocal", None)
                     if preview:
                         result["playback"]["replacedVocal"] = preview
                     result.setdefault("waveforms", {}).pop("replaced", None)
@@ -1594,6 +1603,9 @@ def create_app(
         inputs: list[Path],
         directory: Path,
         vocal_name: str,
+        mix: TrackMixRequest | None = None,
+        variant: str = "original",
+        song_output: dict[str, Any] | None = None,
     ) -> GenerationJob:
         """抢额度、置状态、起任务；与 /split、/replace 一样只通过 job.mix_* 汇报结果。"""
         active_orchestrator = _orchestrator(request)
@@ -1622,10 +1634,229 @@ def create_app(
             job.mix_message = None
             raise
 
+        if mix is not None:
+            previous = copy.deepcopy(result)
+            try:
+                result["mixConfig"] = mix.model_dump()
+                job.save(application_settings.output_dir)
+            except BaseException:
+                result.clear()
+                result.update(previous)
+                reset_mix_state(job)
+                await active_orchestrator.capacity.release()
+                raise
+
         job.last_operation = "mix"
 
         def publish() -> None:
             _publish_job(job, request, snapshot=True)
+
+        def cleanup_replaced_files() -> None:
+            referenced = set()
+            songs = [job.result, *(job.result.get("alternatives") or [])]
+            for output in [*songs, *filter(None, (song_project(item, "mixed") for item in songs))]:
+                urls = [output.get(key) for key in ("fullTrack", "mixedTrack", "replacedVocal")]
+                urls.extend(output.get("stems", {}).values())
+                playback = output.get("playback") or {}
+                urls.extend(
+                    playback.get(key) for key in ("fullTrack", "mixedTrack", "replacedVocal")
+                )
+                urls.extend((playback.get("stems") or {}).values())
+                for url in urls:
+                    if isinstance(url, str):
+                        try:
+                            referenced.add(_output_path_from_url(url, application_settings))
+                        except ValueError:
+                            pass
+            # 软删除的落点有两处：第一首候选的分轨进 `.trash/{job}` 根，替换结果与其它候选进
+            # `.trash/{job}/song_N`（见 _stem_trash_path / trash_result_path）。只扫 song_N
+            # 会让第一首被删除的分轨永远留在回收站里；反过来扫根目录又可能删掉别的候选的
+            # 可撤回文件，所以按 directory 推导出属于这一首的那一处。
+            trash_root = application_settings.output_dir / ".trash" / job.job_id
+            trash_folders = (trash_root,) if directory.name == "song_1" else ()
+            # 两首歌共用回收站：另一首仍可撤回的文件（软删除的音轨、替换人声）不能被清掉。
+            undoable = {
+                Path(str(entry.get(key))).name
+                for entry in [*job.deleted_stems.values(), *job.deleted_replaced_vocals.values()]
+                if isinstance(entry, dict)
+                for key in ("url", "mixTrack")
+                if isinstance(entry.get(key), str)
+            }
+            for folder in (
+                directory,
+                directory / "playtrack",
+                trash_root / directory.name,
+                *trash_folders,
+            ):
+                if folder.is_symlink():
+                    continue
+                try:
+                    for path in folder.glob("*"):
+                        if (
+                            path.suffix.lower() in MIX_INPUT_SUFFIXES
+                            and path.is_file()
+                            and path.resolve() not in referenced
+                            and not (".trash" in path.parts and path.name in undoable)
+                        ):
+                            path.unlink()
+                except OSError:
+                    logger.warning(
+                        "old mix files cleanup skipped directory=%s", folder, exc_info=True
+                    )
+
+        async def commit_mix() -> None:
+            # 替换编辑器把产出写进替换后那首（第一次提交时新建）；普通编辑器覆盖它读的那首。
+            # 原曲与替换后那首共用歌曲目录，替换后那首的文件带 `mixed_` 前缀。
+            original = song_output if song_output is not None else result
+            target_variant = "mixed" if mix.editor == "replace" else variant
+            target = (
+                result
+                if mix.editor != "replace"
+                else song_project(original, "mixed")
+                or {"durationSeconds": original.get("durationSeconds")}
+            )
+            prefix = "mixed_" if target_variant == "mixed" else ""
+            deleted_prefix = f"mixed:{song}:" if target_variant == "mixed" else f"{song}:"
+            # 版本号对这首歌单调递增：替换后那首的旧版本可能高于原曲版本。
+            revision = max(target.get("audioRevision", 0), mix.audioRevision) + 1
+            token = uuid4().hex[:12]
+            result_path = directory / f"{prefix}master_v{revision}_{token}.wav"
+            split = mix.tracks[0].source != "full"
+            track_paths = (
+                [directory / f"{prefix}{track.id}_v{revision}_{token}.wav" for track in mix.tracks]
+                if split
+                else []
+            )
+            created = [result_path, *track_paths]
+            previous = copy.deepcopy(original)
+            previous_deleted_stems = copy.deepcopy(job.deleted_stems)
+            previous_deleted_vocals = copy.deepcopy(job.deleted_replaced_vocals)
+            previous_replace = {
+                key: getattr(job, key)
+                for key in (
+                    "replace_song",
+                    "replace_status",
+                    "replace_stage",
+                    "replace_progress",
+                    "replace_message",
+                    "replace_error",
+                )
+            }
+            committed = False
+            try:
+                with tempfile.TemporaryDirectory(prefix=".mix-", dir=directory) as temp_dir:
+                    output_path = Path(temp_dir) / result_path.name
+                    staged_tracks = [Path(temp_dir) / path.name for path in track_paths]
+                    await mix_tracks(
+                        inputs,
+                        reference,
+                        output_path,
+                        application_settings.rvc_mix_timeout_seconds,
+                        gains=[10 ** (track.gainDb / 20) for track in mix.tracks],
+                        track_outputs=staged_tracks if split else None,
+                    )
+                    job.mix_stage = "waveform"
+                    job.mix_progress = WAVEFORM_PROGRESS
+                    job.mix_message = "正在提取合轨波形"
+                    publish()
+                    fresh_waveforms = await extract_waveforms(
+                        {
+                            "mix": output_path,
+                            **{
+                                track.id: path
+                                for track, path in zip(mix.tracks, staged_tracks, strict=True)
+                            },
+                        }
+                        if split
+                        else {"mix": output_path}
+                    )
+                    if job.mix_cancel_requested:
+                        raise asyncio.CancelledError
+                    output_path.replace(result_path)
+                    for staged, path in zip(staged_tracks, track_paths, strict=True):
+                        staged.replace(path)
+                job.mix_stage = "preview"
+                job.mix_progress = MIX_PREVIEW_PROGRESS
+                job.mix_message = "正在生成试听音频"
+                publish()
+                previews = []
+                for path in [result_path, *track_paths]:
+                    preview = await make_playback_mp3(path, application_settings.output_dir)
+                    previews.append(preview)
+                    if preview:
+                        created.append(application_settings.output_dir / preview)
+                if job.mix_cancel_requested:
+                    raise asyncio.CancelledError
+                relative = result_path.relative_to(application_settings.output_dir).as_posix()
+                target["fullTrack"] = relative
+                target["stems"] = (
+                    {
+                        track.id: path.relative_to(application_settings.output_dir).as_posix()
+                        for track, path in zip(mix.tracks, track_paths, strict=True)
+                    }
+                    if split
+                    else {}
+                )
+                target["stemUrls"] = list(target["stems"].values())
+                target["splitEnabled"] = split
+                playback = {}
+                if previews[0]:
+                    playback["fullTrack"] = previews[0]
+                stem_previews = (
+                    {
+                        track.id: preview
+                        for track, preview in zip(mix.tracks, previews[1:], strict=True)
+                        if preview
+                    }
+                    if split
+                    else {}
+                )
+                if stem_previews:
+                    playback["stems"] = stem_previews
+                target["playback"] = playback
+                target["waveforms"] = fresh_waveforms
+                if "mix" in fresh_waveforms:
+                    target["waveforms"]["full"] = fresh_waveforms["mix"]
+                target["audioRevision"] = revision
+                target["mixConfig"] = mix.model_dump()
+                # 生成记录按它显示这首歌最近一次完成创作的时间。
+                target["updatedAt"] = datetime.now(timezone.utc).isoformat()
+                target.setdefault("debug", {})
+                drop_editor_state(target)
+                if target_variant == "mixed":
+                    original["mixed"] = target
+                job.deleted_stems = {
+                    key: value
+                    for key, value in job.deleted_stems.items()
+                    if not key.startswith(deleted_prefix)
+                }
+                if variant == "original":
+                    # 替换人声是原曲上未提交的产物：替换编辑器把它写进了替换后那首，
+                    # 原曲覆盖后它对应的人声已经变了。两种情况都清掉。
+                    original.pop("replacedVocal", None)
+                    original.pop("_replacedVocalModel", None)
+                    _playback_dict(original).pop("replacedVocal", None)
+                    if isinstance(original.get("waveforms"), dict):
+                        original["waveforms"].pop("replaced", None)
+                    job.deleted_replaced_vocals.pop(str(song), None)
+                    for key in previous_replace:
+                        setattr(job, key, None)
+                job.save(application_settings.output_dir)
+                committed = True
+            finally:
+                if not committed:
+                    original.clear()
+                    original.update(previous)
+                    job.deleted_stems = previous_deleted_stems
+                    job.deleted_replaced_vocals = previous_deleted_vocals
+                    for key, value in previous_replace.items():
+                        setattr(job, key, value)
+                    for path in created:
+                        path.unlink(missing_ok=True)
+            # 清理放在落盘之后（异常时根本走不到这里）：进程若恰好死在这两行之间，只会留下
+            # 一批无引用的旧文件，等这首下一次成功提交时再删；反过来先删后写盘，一旦写盘失败
+            # 回滚回去的元数据就会指向已经被删掉的文件。
+            cleanup_replaced_files()
 
         def restore_result(
             previous_track: object, previous_waveforms: object, previous_playback: object
@@ -1639,9 +1870,9 @@ def create_app(
             else:
                 result["waveforms"] = previous_waveforms
             if previous_playback is None:
-                result.get("playback", {}).pop("mixedTrack", None)
+                (result.get("playback") or {}).pop("mixedTrack", None)
             else:
-                result.setdefault("playback", {})["mixedTrack"] = previous_playback
+                _playback_dict(result)["mixedTrack"] = previous_playback
 
         async def execute() -> None:
             try:
@@ -1649,6 +1880,13 @@ def create_app(
                     raise asyncio.CancelledError
                 job.mix_status = "running"
                 publish()
+                if mix is not None:
+                    await commit_mix()
+                    job.mix_status = "succeeded"
+                    job.mix_stage = "completed"
+                    job.mix_progress = 100
+                    job.mix_message = "合轨完成"
+                    return
                 # 原版命名规则：同名成品，成功后原子覆盖，失败时上一版原样保留。
                 output_name = mix_output_filename(vocal_name)
                 result_path = directory / output_name
@@ -1669,7 +1907,7 @@ def create_app(
                         raise asyncio.CancelledError
                     previous_track = result.get("mixedTrack")
                     previous_waveforms = result.get("waveforms")
-                    previous_playback = result.get("playback", {}).get("mixedTrack")
+                    previous_playback = (result.get("playback") or {}).get("mixedTrack")
                     updated = (
                         dict(previous_waveforms) if isinstance(previous_waveforms, dict) else {}
                     )
@@ -1698,7 +1936,7 @@ def create_app(
                                 "failed to roll back mix metadata job_id=%s", job.job_id
                             )
                         raise
-                result.setdefault("playback", {}).pop("mixedTrack", None)
+                _playback_dict(result).pop("mixedTrack", None)
                 job.mix_stage = "preview"
                 job.mix_progress = MIX_PREVIEW_PROGRESS
                 job.mix_message = "正在生成试听音频"
@@ -1712,6 +1950,9 @@ def create_app(
                     # WAV 已发布；PATCH 此时只取消试听编码，不改写合轨终态。
                     result["playback"].pop("mixedTrack", None)
                     logger.warning("mix preview skipped job_id=%s", job.job_id, exc_info=True)
+                # 旧版导出把成品挂在 mixedTrack 上：落成独立的替换后那首。
+                if normalize_mixed_song(result):
+                    job.save(application_settings.output_dir)
                 job.mix_status = "succeeded"
                 job.mix_stage = "completed"
                 job.mix_progress = 100
@@ -1722,7 +1963,7 @@ def create_app(
                         "mix waveform extraction failed job_id=%s song=%s file=%s",
                         job.job_id,
                         song,
-                        result["mixedTrack"],
+                        result_path.name,
                     )
             except asyncio.CancelledError:
                 job.mix_status = job.mix_stage = "cancelled"
@@ -1789,8 +2030,17 @@ def create_app(
             429: {"model": ErrorResponse},
         },
     )
-    async def mix_generation_job(job_id: str, request: Request, song: int = 0):
-        """任务级合轨：与 /split、/replace 同构，进度走任务状态与 SSE。"""
+    async def mix_generation_job(
+        job_id: str,
+        request: Request,
+        song: int = 0,
+        variant: Literal["original", "mixed"] = "original",
+    ):
+        """任务级合轨：与 /split、/replace 同构，进度走任务状态与 SSE。
+
+        `variant` 选输入来自哪首歌：原曲或替换后那首。替换编辑器（editor=replace）读原曲的
+        音轨与替换人声，产出写进替换后那首；普通编辑器读哪首就覆盖哪首。
+        """
         job = retained_job(request, job_id)
         if job is None:
             return JSONResponse(
@@ -1808,39 +2058,99 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "歌曲不存在。"},
             )
+        song_output = result
+        result = song_project(song_output, variant)
+        if result is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"success": False, "message": "替换后的歌曲不存在。"},
+            )
+        mix = None
+        body = await request.body()
+        if body:
+            try:
+                mix = TrackMixRequest.model_validate_json(body)
+            except ValidationError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"success": False, "message": "合轨设置无效，请检查音轨和音量。"},
+                )
+            if mix.editor == "replace" and variant != "original":
+                return JSONResponse(
+                    status_code=400,
+                    content={"success": False, "message": "替换人声只能基于原曲提交。"},
+                )
+            try:
+                require_audio_revision(result, mix.audioRevision)
+            except HTTPException as exc:
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    content={"success": False, "message": exc.detail},
+                )
+        elif variant != "original" or result.get("audioRevision", 0) > 0:
+            return JSONResponse(
+                status_code=409,
+                content={"success": False, "message": "请提交当前工程的音轨设置和版本号。"},
+            )
         conflict = _mix_conflict(job)
         if conflict is not None:
             return conflict
         try:
             directory = job_song_dir(
-                application_settings.output_dir, job_id, (result.get("songNumber") or song + 1) - 1
+                application_settings.output_dir,
+                job_id,
+                (song_output.get("songNumber") or song + 1) - 1,
             )
         except ValueError:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"success": False, "message": "合轨音轨路径无效。"},
             )
+        if (
+            mix is not None
+            and any(track.source == "full" for track in mix.tracks)
+            and result.get("splitEnabled")
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "message": "完整音轨只适用于未分轨的单轨歌曲。",
+                },
+            )
         full_track = result.get("fullTrack")
-        vocal_url = result.get("replacedVocal")
+        # 替换人声只属于原曲：替换后那首里的 `replaced` 已经是普通音轨（source=stem）。
+        vocal_url = result.get("replacedVocal") if variant == "original" else None
         stems = result.get("stems")
         stem_urls = [
             stems.get(name) if isinstance(stems, dict) else None for name in MIX_BACKING_STEMS
         ]
-        if (
-            not isinstance(full_track, str)
-            or not isinstance(vocal_url, str)
-            or not all(isinstance(value, str) for value in stem_urls)
+        selected_urls = [vocal_url, *stem_urls]
+        if mix is not None:
+            selected_urls = [
+                (stems if isinstance(stems, dict) else {}).get(track.stemId)
+                if track.source == "stem"
+                else vocal_url
+                if track.source == "replaced"
+                else full_track
+                for track in mix.tracks
+            ]
+        if not isinstance(full_track, str) or not all(
+            isinstance(value, str) for value in selected_urls
         ):
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={
                     "success": False,
-                    "message": "该歌曲缺少原始音频、替换人声或分轨，无法合轨。",
+                    "message": "该歌曲缺少所选工程输入，无法合轨。",
                 },
             )
-        recorded_model = result.get("_replacedVocalModel")
-        if isinstance(recorded_model, str) and (
-            recorded_model != request.app.state.rvc_model_fingerprint
+        recorded_model = song_output.get("_replacedVocalModel")
+        uses_replacement = mix is None or any(track.source == "replaced" for track in mix.tracks)
+        if (
+            uses_replacement
+            and isinstance(recorded_model, str)
+            and (recorded_model != request.app.state.rvc_model_fingerprint)
         ):
             if not _rvc_assets_present(application_settings):
                 # 资产不在时指纹无法验证：这台实例根本读不到模型，把它当成"模型已变更"会让
@@ -1863,8 +2173,7 @@ def create_app(
                 )
         try:
             reference = _mix_input_path(full_track, directory)
-            vocal_path = _mix_input_path(vocal_url, directory)
-            inputs = [vocal_path, *[_mix_input_path(value, directory) for value in stem_urls]]
+            inputs = [_mix_input_path(value, directory) for value in selected_urls]
         except ValueError:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1884,12 +2193,21 @@ def create_app(
                 reference=reference,
                 inputs=inputs,
                 directory=directory,
-                vocal_name=vocal_path.name,
+                vocal_name=inputs[0].name,
+                mix=mix,
+                variant=variant,
+                song_output=song_output,
             )
         except CapacityExceededError:
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 content={"success": False, "message": "当前音频处理任务过多，请稍后重试。"},
+            )
+        except Exception:
+            logger.exception("failed to save mix draft job_id=%s song=%s", job_id, song)
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "message": "保存合轨设置失败，请重试。"},
             )
         return await _async_job_response(job, request, application_settings)
 
@@ -1962,14 +2280,21 @@ def create_app(
         status_code=status.HTTP_204_NO_CONTENT,
         responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
     )
-    async def delete_generation_stem(job_id: str, stem_name: str, request: Request, song: int = 0):
+    async def delete_generation_stem(
+        job_id: str,
+        stem_name: str,
+        request: Request,
+        song: int = 0,
+        variant: Literal["original", "mixed"] = "original",
+    ):
         job = retained_job(request, job_id)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "生成任务不存在。"},
             )
-        result = _song_result(job, song)
+        song_output = _song_result(job, song)
+        result = song_project(song_output, variant)
         if job.status != "succeeded" or result is None:
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1993,6 +2318,16 @@ def create_app(
                 content={"success": False, "message": "该歌曲正在拆轨，请稍后重试。"},
             )
 
+        try:
+            require_audio_revision(
+                result,
+                request.headers.get("X-Audio-Revision"),
+            )
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"success": False, "message": exc.detail},
+            )
         stems = result.get("stems", {})
         stem_url = stems.get(stem_name)
         if not stem_url:
@@ -2000,36 +2335,16 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "音轨不存在或已被删除。"},
             )
-        is_vocal = stem_name.lower() in {"vocal", "vocals", "voice"}
-        replaced_url = result.get("replacedVocal") if is_vocal else None
-        replaced_model = result.get("_replacedVocalModel") if is_vocal else None
-        replaced_path = None
+        is_vocal = is_vocal_stem(stem_name)
         try:
             target = _output_path_from_url(stem_url, application_settings)
             if not target.is_file():
                 raise OSError("stem file is missing")
-            if isinstance(replaced_url, str):
-                candidate = _output_path_from_url(replaced_url, application_settings)
-                if candidate.parent == target.parent and candidate.is_file():
-                    replaced_path = candidate
-            directory_song = (result.get("songNumber") or song + 1) - 1
+            directory_song = (song_output.get("songNumber") or song + 1) - 1
             trash = _stem_trash_path(target, application_settings, job_id, directory_song)
             trash.parent.mkdir(parents=True, exist_ok=True)
             trash.unlink(missing_ok=True)
-            replaced_trash = None
-            if replaced_path is not None:
-                replaced_trash = trash_result_path(
-                    application_settings, replaced_path.name, job_id, directory_song
-                )
-                replaced_trash.parent.mkdir(parents=True, exist_ok=True)
-                replaced_trash.unlink(missing_ok=True)
             target.replace(trash)
-            if replaced_path is not None and replaced_trash is not None:
-                try:
-                    replaced_path.replace(replaced_trash)
-                except OSError:
-                    trash.replace(target)
-                    raise
         except (OSError, ValueError):
             logger.exception("failed to delete stem job_id=%s stem=%s", job_id, stem_name)
             return JSONResponse(
@@ -2038,7 +2353,8 @@ def create_app(
             )
         stem_index = list(stems).index(stem_name)
         waveforms = result.get("waveforms")
-        deleted_key = f"{song}:{stem_name}"
+        # 两首歌各记各的撤回：替换后那首的键带 `mixed:` 前缀。
+        deleted_key = f"mixed:{song}:{stem_name}" if variant == "mixed" else f"{song}:{stem_name}"
         deleted_entry: dict[str, Any] = {
             "url": stem_url,
             "index": stem_index,
@@ -2056,13 +2372,10 @@ def create_app(
         if isinstance(stem_playback, dict):
             stem_playback.pop(stem_name, None)
         result["stemUrls"] = list(stems.values())
-        replaced_waveform = waveforms.get("replaced") if isinstance(waveforms, dict) else None
         if isinstance(waveforms, dict):
             waveforms.pop(stem_name, None)
-            if is_vocal:
-                waveforms.pop("replaced", None)
         invalidate_mix_artifact(job, result)
-        if is_vocal:
+        if is_vocal and variant == "original":
             if (
                 job.replace_song == song
                 and job.replace_status in {"pending", "running"}
@@ -2071,29 +2384,6 @@ def create_app(
             ):
                 _mark_replace_cancelled(job)
                 _publish_job(job, request, snapshot=True)
-            elif job.replace_song == song and (job.replace_task is None or job.replace_task.done()):
-                job.replace_song = None
-                job.replace_status = None
-                job.replace_stage = None
-                job.replace_progress = None
-                job.replace_message = None
-                job.replace_error = None
-            result.pop("replacedVocal", None)
-            result.pop("_replacedVocalModel", None)
-            deleted_replacement_playback = None
-            if isinstance(playback, dict):
-                deleted_replacement_playback = playback.pop("replacedVocal", None)
-            if replaced_path is None:
-                job.deleted_replaced_vocals.pop(str(song), None)
-            else:
-                deleted_replacement = {"url": replaced_url}
-                if deleted_replacement_playback:
-                    deleted_replacement["playback"] = deleted_replacement_playback
-                if isinstance(replaced_waveform, list):
-                    deleted_replacement["waveform"] = replaced_waveform
-                if isinstance(replaced_model, str):
-                    deleted_replacement["model"] = replaced_model
-                job.deleted_replaced_vocals[str(song)] = deleted_replacement
         job.message = f"音轨 {stem_name} 已删除"
         job.save(application_settings.output_dir)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -2103,20 +2393,26 @@ def create_app(
         response_model=GenerationJobResponse,
         responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
     )
-    async def restore_generation_stem(job_id: str, stem_name: str, request: Request, song: int = 0):
+    async def restore_generation_stem(
+        job_id: str,
+        stem_name: str,
+        request: Request,
+        song: int = 0,
+        variant: Literal["original", "mixed"] = "original",
+    ):
         job = retained_job(request, job_id)
         if job is None:
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
                 content={"success": False, "message": "生成任务不存在。"},
             )
-        result = _song_result(job, song)
+        song_output = _song_result(job, song)
+        result = song_project(song_output, variant)
         if job.status != "succeeded" or result is None:
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"success": False, "message": "生成任务尚未完成，无法恢复音轨。"},
             )
-
         stems = result.get("stems", {})
         if mix_busy(job):
             return JSONResponse(
@@ -2129,9 +2425,20 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"success": False, "message": "该歌曲正在拆轨，请稍后重试。"},
             )
+        try:
+            require_audio_revision(
+                result,
+                request.headers.get("X-Audio-Revision"),
+            )
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"success": False, "message": exc.detail},
+            )
         if stem_name in stems:
             return await _async_job_response(job, request, application_settings)
-        deleted_key = f"{song}:{stem_name}"
+        # 两首歌各记各的撤回：替换后那首的键带 `mixed:` 前缀。
+        deleted_key = f"mixed:{song}:{stem_name}" if variant == "mixed" else f"{song}:{stem_name}"
         deleted = job.deleted_stems.get(deleted_key)
         if deleted is None:
             return JSONResponse(
@@ -2141,7 +2448,7 @@ def create_app(
 
         try:
             target = _output_path_from_url(deleted["url"], application_settings)
-            directory_song = (result.get("songNumber") or song + 1) - 1
+            directory_song = (song_output.get("songNumber") or song + 1) - 1
             trash = _stem_trash_path(target, application_settings, job_id, directory_song)
             if not trash.is_file():
                 del job.deleted_stems[deleted_key]
@@ -2149,38 +2456,8 @@ def create_app(
                     status_code=status.HTTP_404_NOT_FOUND,
                     content={"success": False, "message": "删除的音轨文件已不存在，无法恢复。"},
                 )
-            deleted_replacement = (
-                job.deleted_replaced_vocals.get(str(song))
-                if stem_name.lower() in {"vocal", "vocals", "voice"}
-                else None
-            )
-            replaced_path = replaced_trash = None
-            if isinstance(deleted_replacement, dict) and isinstance(
-                deleted_replacement.get("url"), str
-            ):
-                replaced_path = _output_path_from_url(
-                    deleted_replacement["url"], application_settings
-                )
-                replaced_trash = trash_result_path(
-                    application_settings, replaced_path.name, job_id, directory_song
-                )
-                if not replaced_trash.is_file():
-                    return JSONResponse(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        content={
-                            "success": False,
-                            "message": "删除的替换人声文件已不存在，无法恢复。",
-                        },
-                    )
             target.parent.mkdir(parents=True, exist_ok=True)
             trash.replace(target)
-            if replaced_path is not None and replaced_trash is not None:
-                replaced_path.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    replaced_trash.replace(replaced_path)
-                except OSError:
-                    target.replace(trash)
-                    raise
         except (OSError, ValueError):
             logger.exception("failed to restore stem job_id=%s stem=%s", job_id, stem_name)
             return JSONResponse(
@@ -2192,22 +2469,14 @@ def create_app(
         items.insert(min(deleted["index"], len(items)), (stem_name, deleted["url"]))
         result["stems"] = dict(items)
         if isinstance(deleted.get("playback"), str):
-            result.setdefault("playback", {}).setdefault("stems", {})[stem_name] = deleted[
-                "playback"
-            ]
+            _playback_dict(result).setdefault("stems", {})[stem_name] = deleted["playback"]
         result["stemUrls"] = list(result["stems"].values())
         waveforms = result.get("waveforms")
         if isinstance(waveforms, dict) and deleted["waveform"] is not None:
             waveforms[stem_name] = deleted["waveform"]
-        if isinstance(deleted_replacement, dict):
-            result["replacedVocal"] = deleted_replacement["url"]
-            if isinstance(deleted_replacement.get("playback"), str):
-                result.setdefault("playback", {})["replacedVocal"] = deleted_replacement["playback"]
-            if isinstance(deleted_replacement.get("waveform"), list):
-                result.setdefault("waveforms", {})["replaced"] = deleted_replacement["waveform"]
-            if isinstance(deleted_replacement.get("model"), str):
-                result["_replacedVocalModel"] = deleted_replacement["model"]
-            job.deleted_replaced_vocals.pop(str(song), None)
+        # 这条入口只恢复本车道。替换人声（`/api/voice/result` DELETE 写下的记录）由它自己的
+        # PUT 负责：拼在一起会让"撤回一条普通音轨"顺手复活刚删掉的替换结果，
+        # 而删除侧早已不再联动（文档第 10 条只要求单向不连带删除）。
         if stored_path_exists(application_settings.output_dir, deleted.get("mixTrack")):
             # 删除分轨时作废的成品：文件还在（同名覆盖只会由下一次合轨写），恢复引用与车道。
             # 用 helper 而不是裸写：它自带"已有更新的成品就不覆盖"的防护，并会一并写回 mix
@@ -2432,7 +2701,8 @@ def _reported_mix_status(job: GenerationJob) -> tuple[str | None, int | None]:
     mixed_songs = [
         index
         for index, song in enumerate([result, *(result.get("alternatives") or [])])
-        if isinstance(song, dict) and isinstance(song.get("mixedTrack"), str)
+        if isinstance(song, dict)
+        and (isinstance(song.get("mixedTrack"), str) or song_project(song, "mixed") is not None)
     ]
     if not mixed_songs:
         return None, None
@@ -2685,9 +2955,14 @@ def _render_result_urls(
     include_waveforms: bool = True,
 ) -> dict[str, Any]:
     rendered = copy.deepcopy(result if include_waveforms else _without_waveforms(result))
-    for output in [rendered, *rendered.get("alternatives", [])]:
+    songs = [rendered, *rendered.get("alternatives", [])]
+    for song in songs:
+        normalize_mixed_song(song)
+    for output in [*songs, *(song_project(song, "mixed") for song in songs)]:
         if not isinstance(output, dict):
             continue
+        output.setdefault("audioRevision", 0)
+        drop_editor_state(output)
         full_track = output.get("fullTrack")
         if isinstance(full_track, str):
             output["fullTrack"] = _public_audio_url(full_track, base_url, settings)
@@ -2737,6 +3012,17 @@ def _render_result_urls(
             output["playback"] = valid
         for key in [key for key in output if isinstance(key, str) and key.startswith("_")]:
             del output[key]
+    for song in songs:
+        # 兼容字段：替换后那首的成品同时以 mixedTrack 暴露（生成记录、旧客户端按它判断有无成品）。
+        mixed = song_project(song, "mixed")
+        if mixed is not None and isinstance(mixed.get("fullTrack"), str):
+            song["mixedTrack"] = mixed["fullTrack"]
+            preview = (mixed.get("playback") or {}).get("fullTrack")
+            if isinstance(preview, str):
+                _playback_dict(song)["mixedTrack"] = preview
+            waveform = (mixed.get("waveforms") or {}).get("full")
+            if isinstance(waveform, list) and isinstance(song.get("waveforms"), dict):
+                song["waveforms"]["mix"] = waveform
     return rendered
 
 
@@ -2749,6 +3035,8 @@ def _without_waveforms(result: dict[str, Any]) -> dict[str, Any]:
     """
     projected = {key: value for key, value in result.items() if key != "waveforms"}
     projected["waveforms"] = {}
+    if isinstance(result.get("mixed"), dict):
+        projected["mixed"] = _without_waveforms(result["mixed"])
     alternatives = result.get("alternatives")
     if isinstance(alternatives, list):
         projected["alternatives"] = [

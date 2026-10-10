@@ -75,6 +75,7 @@ async def test_four_stages_follow_work_and_post_get_sse_agree(tmp_path, monkeypa
     job, _ = seed_job(app, settings)
     if operation == "split":
         job.result["stems"] = {}
+        job.result["splitEnabled"] = False
     reached = [asyncio.Event() for _ in range(4)]
     release = [asyncio.Event() for _ in range(4)]
     read_release = threading.Event()
@@ -212,6 +213,7 @@ async def test_operation_terminal_and_cache_are_consistent(
     job, _ = seed_job(app, settings)
     if operation == "split":
         job.result["stems"] = {}
+        job.result["splitEnabled"] = False
     started, release = asyncio.Event(), asyncio.Event()
     original_split = orchestrator.stem_separator.split
 

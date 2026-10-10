@@ -208,7 +208,7 @@ def test_mix_over_real_http_with_real_ffmpeg(tmp_path: Path) -> None:
                     "stream=sample_rate,channels",
                     "-of",
                     "json",
-                    str(settings.output_dir / app.state.jobs[job_id].result["mixedTrack"]),
+                    str(settings.output_dir / app.state.jobs[job_id].result["mixed"]["fullTrack"]),
                 ],
                 capture_output=True,
                 check=True,

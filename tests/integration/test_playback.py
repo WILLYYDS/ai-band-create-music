@@ -171,12 +171,22 @@ async def test_generation_and_split_publish_previews(tmp_path: Path) -> None:
         preview_response = await client.get(preview_url, headers={"Range": "bytes=0-2"})
         assert preview_response.status_code == 206
         assert preview_response.headers["content-type"].startswith("audio/mpeg")
-        assert (await client.delete(f"/api/jobs/{job_id}/stems/vocal")).status_code == 204
+        assert (
+            await client.delete(
+                f"/api/jobs/{job_id}/stems/vocal",
+                headers={"X-Audio-Revision": "1"},
+            )
+        ).status_code == 204
         deleted = (await client.get(f"/api/jobs/{job_id}")).json()["result"]
         assert "vocal" not in deleted["playback"]["stems"]
         assert (await client.get(split["stems"]["vocal"])).status_code == 404
         assert (await client.get(split["playback"]["stems"]["vocal"])).status_code == 404
-        restored = (await client.put(f"/api/jobs/{job_id}/stems/vocal")).json()["result"]
+        restored = (
+            await client.put(
+                f"/api/jobs/{job_id}/stems/vocal",
+                headers={"X-Audio-Revision": "1"},
+            )
+        ).json()["result"]
         assert restored["playback"]["stems"]["vocal"] == split["playback"]["stems"]["vocal"]
         assert (await client.get(restored["stems"]["vocal"])).status_code == 200
         assert (await client.get(restored["playback"]["stems"]["vocal"])).status_code == 200
@@ -318,14 +328,32 @@ async def test_stem_delete_and_restore_rejected_while_preview_encodes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with blocked_preview_split(tmp_path, monkeypatch) as (app, client, job_id, _):
-        rejected = await client.delete(f"/api/jobs/{job_id}/stems/vocal")
+        rejected = await client.delete(
+            f"/api/jobs/{job_id}/stems/vocal",
+            headers={"X-Audio-Revision": "1"},
+        )
         assert rejected.status_code == 409
         assert rejected.json()["message"] == "该歌曲正在拆轨，请稍后重试。"
-        assert (await client.put(f"/api/jobs/{job_id}/stems/vocal")).status_code == 409
+        assert (
+            await client.put(
+                f"/api/jobs/{job_id}/stems/vocal",
+                headers={"X-Audio-Revision": "1"},
+            )
+        ).status_code == 409
         await client.patch(f"/api/jobs/{job_id}", json={"status": "cancelled"})
         await app.state.jobs[job_id].split_task
-        assert (await client.delete(f"/api/jobs/{job_id}/stems/vocal")).status_code == 204
-        restored = (await client.put(f"/api/jobs/{job_id}/stems/vocal")).json()
+        assert (
+            await client.delete(
+                f"/api/jobs/{job_id}/stems/vocal",
+                headers={"X-Audio-Revision": "1"},
+            )
+        ).status_code == 204
+        restored = (
+            await client.put(
+                f"/api/jobs/{job_id}/stems/vocal",
+                headers={"X-Audio-Revision": "1"},
+            )
+        ).json()
 
     assert set(restored["result"]["stems"]) == {"vocal", "drums", "bass", "other"}
     # 试听编码被取消过，恢复出来的分轨只有 WAV，没有可回填的 preview。
@@ -550,9 +578,11 @@ async def test_download_formats_consistent_across_responses_restart_and_expiry(
             "alternatives": songs[1:],
         },
     )
-    stored_result = copy.deepcopy(job.result)
     job.save(settings.output_dir)
     app.state.jobs = load_jobs(settings.output_dir)
+    # 加载时旧版 mixedTrack 迁成独立的替换后那首；之后读取不得再改动结果。
+    stored_result = copy.deepcopy(app.state.jobs["download"].result)
+    assert all("mixed" in output for output in [stored_result, *stored_result["alternatives"]])
 
     async def unexpected_encode(*_args, **_kwargs):
         raise AssertionError("reading results must not encode audio")

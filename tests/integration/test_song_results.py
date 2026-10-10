@@ -88,7 +88,13 @@ async def test_song_failures_preserve_other_outputs(
                 mixed.write_bytes(b"mixed audio")
                 mixed_url = mixed.relative_to(settings.output_dir).as_posix()
                 app.state.jobs[job_id].result["mixedTrack"] = mixed_url
-                form = {"filename": mixed.name, "job_id": job_id, "song": "0"}
+                form = {
+                    "filename": mixed.name,
+                    "job_id": job_id,
+                    "song": "0",
+                    # 首次拆轨已经推进过文件版本，派生音频的删除/撤回要带上当前版本。
+                    "audio_revision": "1",
+                }
                 assert (
                     await client.request("DELETE", "/api/voice/result", data=form)
                 ).status_code == 200
@@ -108,14 +114,20 @@ async def test_song_failures_preserve_other_outputs(
                 ).as_posix()
                 stem = settings.output_dir / stored_result["stems"]["vocal"]
                 assert (
-                    await client.delete(f"/api/jobs/{job_id}/stems/vocal?song=0")
+                    await client.delete(
+                        f"/api/jobs/{job_id}/stems/vocal?song=0",
+                        headers={"X-Audio-Revision": "1"},
+                    )
                 ).status_code == 204
                 assert not stem.exists()
-                assert not replacement.exists()
+                assert replacement.read_bytes() == b"replaced audio"
                 assert (trash_dir / stem.name).exists()
-                assert (trash_dir / replacement.name).read_bytes() == b"replaced audio"
+                assert not (trash_dir / replacement.name).exists()
                 assert (
-                    await client.put(f"/api/jobs/{job_id}/stems/vocal?song=0")
+                    await client.put(
+                        f"/api/jobs/{job_id}/stems/vocal?song=0",
+                        headers={"X-Audio-Revision": "1"},
+                    )
                 ).status_code == 200
                 assert stem.exists()
                 assert replacement.read_bytes() == b"replaced audio"

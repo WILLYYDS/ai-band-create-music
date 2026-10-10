@@ -20,6 +20,10 @@ from app.services.audio_files import require_readable_file
 STEM_NAMES = ("vocal", "drums", "bass", "other")
 
 
+def is_vocal_stem(name: str) -> bool:
+    return name.lower().rsplit(":", 1)[-1] in {"vocal", "vocals", "voice", "replaced"}
+
+
 @dataclass(frozen=True, slots=True)
 class SplitProfile:
     model: str

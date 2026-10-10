@@ -2,7 +2,66 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
+
+from app.services.stems import is_vocal_stem
+
+
+class MixTrack(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_:-]{0,99}$")
+    source: Literal["stem", "full", "replaced"]
+    stemId: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    gainDb: float = Field(ge=-66, le=6, allow_inf_nan=False)
+
+
+def original_vocal_lane_id(stem_id: str) -> str:
+    """替换编辑器里原人声车道的 id。
+
+    未带前缀的人声键加一次 `original:`；已经带前缀的键（重新分轨可能落下 `original:vocal`）
+    保持原样，不能再叠加一次。`replaced` 是替换产物本身，从来不是"原人声"那条车道。
+    """
+    if stem_id == "replaced" or stem_id.startswith("original:"):
+        return stem_id
+    return f"original:{stem_id}"
+
+
+class TrackMixRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    commit: bool
+    audioRevision: int = Field(ge=0)
+    editor: Literal["tracks", "replace"]
+    tracks: list[MixTrack] = Field(min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def valid_tracks(self):
+        ids = [track.id for track in self.tracks]
+        if not self.commit or len(ids) != len(set(ids)):
+            raise ValueError("A committed mix requires unique tracks")
+        for track in self.tracks:
+            expected = track.source
+            if track.source == "stem":
+                if not track.stemId:
+                    raise ValueError("Stem ID is required")
+                expected = track.stemId
+                if self.editor == "replace" and is_vocal_stem(track.stemId):
+                    expected = original_vocal_lane_id(track.stemId)
+            elif "stemId" in track.model_fields_set:
+                raise ValueError("Only stems can have a stem ID")
+            if track.id != expected:
+                raise ValueError("Track ID does not match its source")
+            if track.source == "full" and len(self.tracks) != 1:
+                raise ValueError("A full track must be the only input")
+        return self
 
 
 class GenerateRequest(BaseModel):
@@ -36,6 +95,10 @@ class PlaybackUrls(BaseModel):
 
 
 class MusicOutput(BaseModel):
+    audioRevision: int = Field(default=0, ge=0)
+    mixConfig: TrackMixRequest | None = Field(default=None, exclude_if=lambda value: value is None)
+    # 最近一次完成创作（覆盖）的时间；从未覆盖过时缺省。
+    updatedAt: str | None = Field(default=None, exclude_if=lambda value: value is None)
     songNumber: int | None = Field(default=None, ge=1, le=2, exclude_if=lambda value: value is None)
     fullTrack: str
     playback: PlaybackUrls | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -47,6 +110,8 @@ class MusicOutput(BaseModel):
     waveforms: dict[str, list[float]]
     splitEnabled: bool
     debug: dict[str, Any]
+    # 「替换后」那首歌：与原曲分开编辑、分开覆盖，字段与原曲同构。
+    mixed: MusicOutput | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class GenerateResponse(MusicOutput):

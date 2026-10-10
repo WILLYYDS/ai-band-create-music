@@ -6,7 +6,40 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from fastapi import HTTPException
+
 from app.services.audio_files import output_path_from_url
+
+
+def require_audio_revision(output: dict[str, Any], value: object) -> None:
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        try:
+            value = int(value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="音频版本号无效。") from exc
+    if value is None:
+        value = 0
+    if type(value) is not int or value < 0:
+        raise HTTPException(status_code=400, detail="音频版本号无效。")
+    if value != output.get("audioRevision", 0):
+        raise HTTPException(status_code=409, detail="歌曲版本已更新，请刷新后重试。")
+
+
+def drop_editor_state(output: dict[str, Any]) -> bool:
+    changed = False
+    for key in ("projectRevision", "editorState", "editorFullTrack"):
+        if key in output:
+            output.pop(key)
+            changed = True
+    config = output.get("mixConfig")
+    if isinstance(config, dict) and ("editorState" in config or "projectRevision" in config):
+        output.pop("mixConfig")
+        changed = True
+    for field, key in (("playback", "editorFullTrack"), ("waveforms", "editorFull")):
+        if key in (output.get(field) or {}):
+            output[field].pop(key)
+            changed = True
+    return changed
 
 
 def job_song_dir(output_dir: Path, job_id: str, song: int = 0) -> Path:
@@ -83,6 +116,10 @@ def capture_mix_artifact(output: dict[str, Any]) -> dict[str, Any]:
     """打包当前成品的引用与车道，供作废后按需还原（撤回删除、替换失败回滚）。"""
     if not isinstance(output, dict) or not isinstance(output.get("mixedTrack"), str):
         return {}
+    if (output.get("mixConfig") or {}).get("commit") and output.get("fullTrack") == output[
+        "mixedTrack"
+    ]:
+        return {}
     captured: dict[str, Any] = {"mixTrack": output["mixedTrack"]}
     playback = output.get("playback")
     if isinstance(playback, dict) and isinstance(playback.get("mixedTrack"), str):
@@ -134,6 +171,11 @@ def invalidate_mix_artifact(job: Any, output: dict[str, Any]) -> None:
     改的是内存里的任务状态，调用方负责随后的 `job.save()` 落盘；job 的 mix 运行态一并复位，
     否则 `_reported_mix_status` 还会拿旧的 `mix_status` 报成功。
     """
+    # Editing raw inputs changes the draft, while the committed song stays playable.
+    if (output.get("mixConfig") or {}).get("commit") and output.get("fullTrack") == output.get(
+        "mixedTrack"
+    ):
+        return
     if drop_mix_artifact(output):
         reset_mix_state(job)
 
@@ -151,3 +193,43 @@ def stored_path_exists(output_dir: Path, value: object) -> bool:
         return output_path_from_url(value, output_dir).is_file()
     except (OSError, ValueError):
         return False
+
+
+def normalize_mixed_song(output: dict[str, Any]) -> bool:
+    """「替换后」是一首独立的歌，存在 `output["mixed"]`，有自己的成品、音轨与版本号。
+
+    旧结果（以及无请求体的旧版导出）把成品挂在原曲的 `mixedTrack` 上：用到替换后那首时
+    （`song_project`、加载、渲染）迁成单轨的 `mixed`。
+    与原曲母带是同一个文件时（覆盖式提交的旧形状）只是同一首歌，直接摘掉。返回是否改过。
+    """
+    if not isinstance(output, dict) or not isinstance(output.get("mixedTrack"), str):
+        return False
+    track = output.pop("mixedTrack")
+    playback = output.get("playback")
+    preview = playback.pop("mixedTrack", None) if isinstance(playback, dict) else None
+    waveforms = output.get("waveforms")
+    waveform = waveforms.pop("mix", None) if isinstance(waveforms, dict) else None
+    if track != output.get("fullTrack"):
+        output["mixed"] = {
+            "audioRevision": (output.get("mixed") or {}).get("audioRevision", 0),
+            "fullTrack": track,
+            "playback": {"fullTrack": preview} if isinstance(preview, str) else {},
+            "durationSeconds": output.get("durationSeconds"),
+            "stems": {},
+            "stemUrls": [],
+            "waveforms": {"full": waveform} if isinstance(waveform, list) else {},
+            "splitEnabled": False,
+            "debug": {},
+        }
+    return True
+
+
+def song_project(output: dict[str, Any] | None, variant: str) -> dict[str, Any] | None:
+    """一首候选里要编辑的那首歌：`original` 是原曲本身，`mixed` 是替换后的那首。"""
+    if not isinstance(output, dict):
+        return None
+    if variant == "original":
+        return output
+    normalize_mixed_song(output)
+    mixed = output.get("mixed")
+    return mixed if variant == "mixed" and isinstance(mixed, dict) else None
