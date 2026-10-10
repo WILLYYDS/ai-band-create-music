@@ -19,6 +19,7 @@ from app.services.job_files import (
     capture_mix_artifact,
     invalidate_mix_artifact,
     job_song_dir,
+    require_audio_revision,
     restore_mix_artifact,
     stored_path_exists,
 )
@@ -190,17 +191,24 @@ def install_voice_api(
         filename: Annotated[str, Form(min_length=1, max_length=260)],
         job_id: Annotated[str, Form(min_length=1, max_length=100)],
         song: Annotated[int, Form(ge=0)] = 0,
+        audio_revision: Annotated[str | None, Form()] = None,
     ) -> dict[str, bool]:
         job = retained_job(request, job_id)
         job_result = _job_song_result(request, job_id, song)
+        require_audio_revision(job_result, audio_revision)
         if mix_busy(job):
             raise HTTPException(status_code=409, detail="正在合轨，请稍后重试。")
         directory_song = (job_result.get("songNumber") or song + 1) - 1
         result_path = _result_path(settings, filename, job_id, directory_song)
-        # 这个入口只管理"派生音频"的软删除。母带删掉整首歌就没法播放了，所以明确拒绝
-        # （与"完整混音不能作为分轨删除"同一考虑）。
-        if _resolves_to(settings, job_result.get("fullTrack"), result_path):
-            raise HTTPException(status_code=409, detail="完整音频不能作为替换产物删除。")
+        # 这个入口只管理"派生音频"的软删除。母带删掉整首歌就没法播放；提交后的保留音轨
+        # （stems 里的 *_v<rev>_*.wav）该走 /stems 的软删除 —— 那里才记撤回、才检查版本。
+        # 两者都必须拒绝，否则会留下"结果仍引用、文件已进回收站、还没有撤回记录"的死链。
+        protected = [job_result.get("fullTrack"), job_result.get("editorFullTrack")]
+        stems = job_result.get("stems")
+        if isinstance(stems, dict):
+            protected.extend(stems.values())
+        if any(_resolves_to(settings, value, result_path) for value in protected):
+            raise HTTPException(status_code=409, detail="完整音频或保留音轨不能作为替换产物删除。")
         if not result_path.is_file():
             raise HTTPException(status_code=404, detail="Converted audio not found")
         trash_path = trash_result_path(settings, filename, job_id, directory_song)
@@ -251,9 +259,11 @@ def install_voice_api(
         filename: Annotated[str, Form(min_length=1, max_length=260)],
         job_id: Annotated[str, Form(min_length=1, max_length=100)],
         song: Annotated[int, Form(ge=0)] = 0,
+        audio_revision: Annotated[str | None, Form()] = None,
     ) -> dict[str, bool]:
         job = retained_job(request, job_id)
         job_result = _job_song_result(request, job_id, song)
+        require_audio_revision(job_result, audio_revision)
         if mix_busy(job):
             raise HTTPException(status_code=409, detail="正在合轨，请稍后重试。")
         directory_song = (job_result.get("songNumber") or song + 1) - 1
@@ -416,15 +426,20 @@ async def mix_tracks(
     reference_path: Path,
     output_path: Path,
     timeout_seconds: float,
+    *,
+    gains: list[float] | None = None,
+    track_outputs: list[Path] | None = None,
 ) -> None:
-    """合轨入口：把内部超时统一报成配置的总超时。
-
-    原 `_mix_tracks` 的步骤序列原封不动地留在 :func:`_mix_steps`（滤镜图、响度补偿、
-    限幅参数与执行顺序都没有改动）；改名为公开函数只是因为路由按仓库约定挪到了
-    `app/main.py`（replace/split 同构），需要跨模块调用。
-    """
+    """Render saved linear gains, or the legacy four-track export when gains are omitted."""
     try:
-        await _mix_steps(inputs, reference_path, output_path, timeout_seconds)
+        await _mix_steps(
+            inputs,
+            reference_path,
+            output_path,
+            timeout_seconds,
+            gains=gains,
+            track_outputs=track_outputs,
+        )
     except MixTimeoutError as exc:
         raise RVCConversionError(
             f"FFmpeg mixing timed out after {timeout_seconds:g} seconds"
@@ -436,6 +451,9 @@ async def _mix_steps(
     reference_path: Path,
     output_path: Path,
     timeout_seconds: float,
+    *,
+    gains: list[float] | None = None,
+    track_outputs: list[Path] | None = None,
 ) -> None:
     environment = prepare_ffmpeg_environment()
     loop = asyncio.get_running_loop()
@@ -447,13 +465,85 @@ async def _mix_steps(
             raise MixTimeoutError("mix budget exhausted")
         return value
 
-    sample_rate, channels, codec = await _master_audio_format(
+    sample_rate, channels, codec, duration = await _master_audio_format(
         reference_path, environment, remaining()
     )
     premix_path = output_path.with_name("premix.wav")
     command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
     for input_path in inputs:
         command.extend(("-i", str(input_path)))
+    if gains is not None:
+        if (
+            not inputs
+            or len(gains) != len(inputs)
+            or any(not math.isfinite(gain) or gain < 0 for gain in gains)
+        ):
+            raise RVCConversionError("Invalid mix inputs or gains")
+        if track_outputs is not None:
+            if len(track_outputs) != len(inputs):
+                raise RVCConversionError("Invalid retained track outputs")
+            for source, target, gain in zip(inputs, track_outputs, gains, strict=True):
+                await _run_ffmpeg(
+                    [
+                        "ffmpeg",
+                        "-nostdin",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-i",
+                        str(source),
+                        "-af",
+                        f"aresample={sample_rate},aformat=channel_layouts={channels}c,"
+                        f"volume={gain:.12g},apad=whole_dur={duration:.9f},"
+                        f"atrim=duration={duration:.9f},{LIMIT_FILTER.format(gain_db=0)}",
+                        "-ar",
+                        str(sample_rate),
+                        "-ac",
+                        str(channels),
+                        "-c:a",
+                        codec,
+                        str(target),
+                    ],
+                    environment,
+                    remaining(),
+                )
+            inputs = track_outputs
+            gains = [1.0] * len(inputs)
+            command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+            for input_path in inputs:
+                command.extend(("-i", str(input_path)))
+        # Retained files already contain their levels; never compensate them back up.
+        filters = [
+            f"[{index}:a]aresample={sample_rate},"
+            f"aformat=channel_layouts={channels}c,volume={gain:.12g}[track{index}]"
+            for index, gain in enumerate(gains)
+        ]
+        labels = "".join(f"[track{index}]" for index in range(len(inputs)))
+        filters.append(
+            f"{labels}amix=inputs={len(inputs)}:duration=longest:"
+            f"dropout_transition=0:normalize=0,apad=whole_dur={duration:.9f},"
+            f"atrim=duration={duration:.9f},{LIMIT_FILTER.format(gain_db=0)}[premix]"
+        )
+        command.extend(
+            (
+                "-filter_complex",
+                ";".join(filters),
+                "-map",
+                "[premix]",
+                "-ar",
+                str(sample_rate),
+                "-ac",
+                str(channels),
+                "-c:a",
+                codec,
+                str(output_path),
+            )
+        )
+        await _run_ffmpeg(command, environment, remaining())
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise RVCConversionError("FFmpeg mixing did not produce an output file")
+        return
     command.extend(
         (
             "-filter_complex",
@@ -505,7 +595,7 @@ async def _mix_steps(
 
 async def _master_audio_format(
     input_path: Path, environment: dict[str, str], timeout_seconds: float
-) -> tuple[int, int, str]:
+) -> tuple[int, int, str, float]:
     output = await _run_ffmpeg(
         [
             "ffprobe",
@@ -514,7 +604,7 @@ async def _master_audio_format(
             "-select_streams",
             "a:0",
             "-show_entries",
-            "stream=sample_rate,channels,codec_name,bits_per_sample,bits_per_raw_sample",
+            "stream=sample_rate,channels,codec_name,bits_per_sample,bits_per_raw_sample,duration:format=duration",
             "-of",
             "json",
             str(input_path),
@@ -524,19 +614,23 @@ async def _master_audio_format(
         capture_stdout=True,
     )
     try:
-        stream = json.loads(output)["streams"][0]
+        metadata = json.loads(output)
+        stream = metadata["streams"][0]
         sample_rate = int(stream["sample_rate"])
         channels = int(stream["channels"])
         bits = int(stream.get("bits_per_raw_sample") or stream.get("bits_per_sample") or 0)
+        duration = float(stream.get("duration") or metadata["format"]["duration"])
     except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RVCConversionError("FFprobe could not read the master audio format") from exc
     if not 8_000 <= sample_rate <= 384_000 or not 1 <= channels <= 32:
         raise RVCConversionError("Master audio format is unsupported")
+    if not math.isfinite(duration) or duration <= 0:
+        raise RVCConversionError("Master audio duration is unsupported")
     codec = stream.get("codec_name")
     supported_pcm = {"pcm_u8", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le", "pcm_f64le"}
     if codec not in supported_pcm:
         codec = {8: "pcm_u8", 24: "pcm_s24le", 32: "pcm_s32le"}.get(bits, "pcm_s16le")
-    return sample_rate, channels, codec
+    return sample_rate, channels, codec, duration
 
 
 async def _integrated_loudness(

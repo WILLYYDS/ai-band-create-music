@@ -275,10 +275,108 @@ def test_mix_filter_input_count_matches_the_stem_list():
 
 def test_mix_filter_keeps_stereo_when_rvc_vocal_is_mono(tmp_path):
     inputs = [write_wav(tmp_path / "vocal.wav", 220, channels=1)] + [
-        write_wav(tmp_path / f"backing{index}.wav", 330 + index * 110)
-        for index in range(3)
+        write_wav(tmp_path / f"backing{index}.wav", 330 + index * 110) for index in range(3)
     ]
 
     premix = build_premix(inputs, tmp_path / "premix.wav")
 
     assert int(probe(premix)["channels"]) == 2
+
+
+async def test_project_gains_apply_once_without_eq_or_loudness_compensation(tmp_path, tracks):
+    inputs, master = tracks
+    first = tmp_path / "first.wav"
+    second = tmp_path / "second.wav"
+    gain = 10 ** (-6 / 20)
+    await mix_tracks([inputs[0]], master, first, 120, gains=[gain])
+    await mix_tracks([inputs[0]], first, second, 120, gains=[gain])
+    assert peak(first) == pytest.approx(peak(inputs[0]) * gain, abs=1e-4)
+    assert peak(second) == pytest.approx(peak(first), abs=1e-4)
+    assert float(probe(second)["duration"]) == pytest.approx(SECONDS, abs=1 / RATE)
+
+
+async def test_project_mix_preserves_length_for_silence_and_short_tracks(tmp_path, tracks):
+    inputs, master = tracks
+    silent = tmp_path / "silent.wav"
+    await mix_tracks(inputs[:2], master, silent, 120, gains=[0, 0])
+    assert peak(silent) == 0
+    assert float(probe(silent)["duration"]) == pytest.approx(SECONDS, abs=1 / RATE)
+    with wave.open(str(inputs[0]), "rb") as source:
+        params = source.getparams()
+        frames = source.readframes(RATE // 2)
+    short = tmp_path / "short.wav"
+    with wave.open(str(short), "wb") as output:
+        output.setparams(params)
+        output.writeframes(frames)
+    padded = tmp_path / "padded.wav"
+    await mix_tracks([short], master, padded, 120, gains=[1])
+    assert float(probe(padded)["duration"]) == pytest.approx(SECONDS, abs=1 / RATE)
+    with wave.open(str(padded), "rb") as output:
+        output.setpos(RATE)
+        assert not any(output.readframes(RATE))
+
+
+async def test_project_mix_limits_hot_inputs_and_converts_mono(tmp_path):
+    inputs = [write_wav(tmp_path / f"hot{index}.wav", 220, amplitude=30_000) for index in range(3)]
+    master = write_wav(tmp_path / "mono.wav", 440, channels=1)
+    output = tmp_path / "hot.wav"
+    await mix_tracks(inputs, master, output, 120, gains=[2, 2, 2])
+    assert int(probe(output)["channels"]) == 1
+    assert 0.5 < peak(output, channels=1) <= 0.891251 + 1e-3
+
+
+async def test_project_mix_writes_each_gain_into_its_retained_track(tmp_path, tracks):
+    """保留音轨是交付物本身：长度补齐、格式统一，请求的增益必须只落一次。
+
+    成品再由这些**已带增益**的文件求和 —— 实现若把增益又按一遍（或按原曲响度整体抬回），
+    最后一条断言会明显偏轻。
+    """
+    inputs, master = tracks
+    output = tmp_path / "mix.wav"
+    retained = [tmp_path / f"kept{index}.wav" for index in range(2)]
+    gains = [10 ** (-6 / 20), 1.0]
+
+    await mix_tracks(inputs[:2], master, output, 120, gains=gains, track_outputs=retained)
+
+    reference = probe(master)
+    for source, kept, gain in zip(inputs[:2], retained, gains, strict=True):
+        assert kept.is_file() and kept.stat().st_size > 0
+        meta = probe(kept)
+        assert int(meta["sample_rate"]) == int(reference["sample_rate"])
+        assert int(meta["channels"]) == int(reference["channels"])
+        assert float(meta["duration"]) == pytest.approx(SECONDS, abs=1 / RATE)
+        assert peak(kept) == pytest.approx(peak(source) * gain, abs=1e-4)
+
+    assert float(probe(output)["duration"]) == pytest.approx(SECONDS, abs=1 / RATE)
+    assert peak(output) <= 0.891251 + 1e-3
+    assert peak(output) > peak(retained[1])
+
+    summed = tmp_path / "summed.wav"
+    await mix_tracks(retained, master, summed, 120, gains=[1.0, 1.0])
+    assert peak(output) == pytest.approx(peak(summed), abs=1e-3)
+
+
+async def test_project_mix_pads_short_and_silent_retained_tracks(tmp_path, tracks):
+    """短轨补静音、静音轨保留成同长度的 0：保留音轨与成品都不能比歌曲短。"""
+    inputs, master = tracks
+    with wave.open(str(inputs[0]), "rb") as source:
+        params = source.getparams()
+        half = source.readframes(RATE // 2)
+    short = tmp_path / "short.wav"
+    with wave.open(str(short), "wb") as output:
+        output.setparams(params)
+        output.writeframes(half)
+    silent = write_wav(tmp_path / "silent.wav", 220, amplitude=0)
+    retained = [tmp_path / "kept_short.wav", tmp_path / "kept_silent.wav"]
+    output = tmp_path / "mix.wav"
+
+    await mix_tracks([short, silent], master, output, 120, gains=[1.0, 1.0], track_outputs=retained)
+
+    for kept in retained:
+        assert float(probe(kept)["duration"]) == pytest.approx(SECONDS, abs=1 / RATE)
+    assert peak(retained[1]) == 0
+    with wave.open(str(retained[0]), "rb") as handle:
+        assert abs(handle.getnframes() - int(RATE * SECONDS)) <= 2
+        handle.setpos(int(RATE * 0.75))
+        assert not any(handle.readframes(int(RATE * 0.25)))
+    assert peak(output) > 0

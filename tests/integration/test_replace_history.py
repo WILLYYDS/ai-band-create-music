@@ -125,8 +125,8 @@ async def test_replace_runs_as_job_operation_and_caches_result(tmp_path: Path) -
     assert cached_after_restart.status_code == 200
     assert engine.calls == 1
     assert deleted_vocal.status_code == 204
-    assert "replacedVocal" not in after_delete["result"]
-    assert deleted_replacement.status_code == 404
+    assert after_delete["result"]["replacedVocal"] == replaced_url
+    assert deleted_replacement.status_code == 200
     assert restored_vocal.json()["result"]["replacedVocal"] == replaced_url
     assert restored_replacement.content == b"RIFF-replaced"
 

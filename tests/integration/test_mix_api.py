@@ -101,12 +101,25 @@ class StubMixer:
             self.release.set()
         self.error = error
         self.calls = []
+        self.gains = []
 
-    async def __call__(self, inputs, reference_path, output_path, timeout_seconds):
+    async def __call__(
+        self,
+        inputs,
+        reference_path,
+        output_path,
+        timeout_seconds,
+        *,
+        gains=None,
+        track_outputs=None,
+    ):
         self.calls.append((list(inputs), reference_path, Path(output_path), timeout_seconds))
+        self.gains.append(gains)
         self.started.set()
         await self.release.wait()
         Path(output_path).write_bytes(b"RIFF-mixed-stub")
+        for path in track_outputs or []:
+            Path(path).write_bytes(b"RIFF-retained-stub")
         if self.error:
             raise self.error
 
@@ -132,9 +145,11 @@ def install_stubs(monkeypatch):
         monkeypatch.setattr("app.main.mix_tracks", active)
 
         async def extract(inputs, **_kwargs):
-            assert set(inputs) == {"mix"}
-            assert Path(inputs["mix"]).is_file()
-            return {"mix": MIX_WAVEFORM.copy()} if waveforms is None else waveforms
+            assert "mix" in inputs
+            assert all(Path(path).is_file() for path in inputs.values())
+            return (
+                {name: MIX_WAVEFORM.copy() for name in inputs} if waveforms is None else waveforms
+            )
 
         monkeypatch.setattr("app.main.extract_waveforms", extract)
         return active

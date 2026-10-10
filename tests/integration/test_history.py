@@ -238,9 +238,13 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
         cached = await http.post(f"/api/jobs/{job_id}/split?song=0")
 
         for stem in list(completed["result"]["stems"]):
-            assert (await http.delete(f"/api/jobs/{job_id}/stems/{stem}")).status_code == 204
+            assert (
+                await http.delete(
+                    f"/api/jobs/{job_id}/stems/{stem}",
+                    headers={"X-Audio-Revision": "1"},
+                )
+            ).status_code == 204
         assert (await http.get(f"/api/jobs/{job_id}")).json()["result"]["stems"] == {}
-        monkeypatch.setattr(orchestrator.stem_separator, "split", original_split)
         resplit = await http.post(f"/api/jobs/{job_id}/split?song=0")
         await app.state.jobs[job_id].split_task
         resplit_result = (await http.get(f"/api/jobs/{job_id}")).json()
@@ -275,10 +279,11 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
     assert cached.status_code == 200
     assert cached.json()["status"] == "succeeded"
     cache_guard.assert_not_called()
-    assert resplit.status_code == 202
-    assert sorted(resplit_result["result"]["stems"]) == ["bass", "drums", "other", "vocal"]
-    assert app.state.jobs[job_id].deleted_stems == {}
-    assert not list((settings.output_dir / ".trash" / job_id).glob("*"))
+    assert resplit.status_code == 200
+    assert resplit_result["result"]["stems"] == {}
+    # 首次拆轨推进文件版本；删除与缓存命中都不再改动它。
+    assert resplit_result["result"]["audioRevision"] == 1
+    assert len(app.state.jobs[job_id].deleted_stems) == 4
 
 
 async def test_split_reserves_job_before_capacity_await(tmp_path, monkeypatch):
@@ -676,8 +681,8 @@ async def test_direct_failure_is_persisted(tmp_path):
     assert row.error == "provider died"
 
 
-async def test_resplit_invalidates_mix_and_replacement(tmp_path, monkeypatch):
-    """重新分轨后旧人声、合轨和试听不再对应当前分轨。"""
+async def test_first_split_resets_previous_project_state(tmp_path, monkeypatch):
+    """新工程不能恢复上一代工程的人声替换。"""
     settings = make_settings(tmp_path)
     orchestrator = make_orchestrator(settings)
     app = create_app(settings, orchestrator)
@@ -696,25 +701,30 @@ async def test_resplit_invalidates_mix_and_replacement(tmp_path, monkeypatch):
         assert (await http.post(f"/api/jobs/{job_id}/split?song=0")).status_code == 202
         await app.state.jobs[job_id].split_task
         completed = (await http.get(f"/api/jobs/{job_id}")).json()["result"]
-        stashed = dict(app.state.jobs[job_id].deleted_replaced_vocals["0"])
         restored = await http.request(
             "PUT",
             "/api/voice/result",
-            data={"filename": stashed["url"], "job_id": job_id, "song": "0"},
+            data={
+                "filename": replaced_path.name,
+                "job_id": job_id,
+                "song": "0",
+                # 首轮拆轨已经把文件版本推进到 1，旧版本号的撤回必须被拒。
+                "audio_revision": "0",
+            },
         )
 
     assert "mixedTrack" not in completed and "replacedVocal" not in completed
     assert "mixedTrack" not in completed["playback"]
     assert "replacedVocal" not in completed["playback"]
     assert set(completed["waveforms"]) == {"full", "vocal", "drums", "bass", "other"}
-    assert stashed["playback"] == "old-vocal.mp3"
-    assert stashed["model"] == "model-v1"
-    assert stashed["waveform"] == [0.4] * 640
-    assert restored.status_code == 200
-    assert app.state.jobs[job_id].result["replacedVocal"] == stashed["url"]
+    assert completed["audioRevision"] == 1
+    # 旧的工程控制状态字段不再出现在任务结果里。
+    assert "editorState" not in completed and "projectRevision" not in completed
+    assert app.state.jobs[job_id].deleted_replaced_vocals == {}
+    assert restored.status_code == 409
 
 
-async def test_resplit_without_active_replacement_keeps_previous_undo(tmp_path, monkeypatch):
+async def test_first_split_discards_previous_project_undo(tmp_path, monkeypatch):
     settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
     monkeypatch.setattr("app.main.extract_waveforms", AsyncMock(return_value=split_waveforms()))
@@ -724,7 +734,7 @@ async def test_resplit_without_active_replacement_keeps_previous_undo(tmp_path, 
         job.deleted_replaced_vocals["0"] = {"url": "previously-deleted.wav"}
         assert (await http.post(f"/api/jobs/{job_id}/split?song=0")).status_code == 202
         await job.split_task
-    assert job.deleted_replaced_vocals["0"]["url"] == "previously-deleted.wav"
+    assert job.deleted_replaced_vocals == {}
 
 
 async def test_job_title_is_listed_and_survives_restart(tmp_path):

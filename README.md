@@ -159,12 +159,14 @@ RVC 不暴露独立的特征分析回调或内部推理进度，只报告阶段�
 替换结果与 RVC 模型绑定：`RVC_MODEL_PATH`/`RVC_INDEX_PATH` 内容或 `RVC_MODEL_VERSION` 变化后，
 已缓存的结果会被判定为失效并自动重新推理。失效到新产物落位之间旧文件仍保留在磁盘上（不再
 被 `replacedVocal` 引用），因为新旧产物同名、成功时会被原子覆盖；这样即使重跑失败、超时或
-被取消，上一版可用的替换人声也不会被一并删除。删除该歌曲的 vocal 分轨会同时作废替换结果。
+被取消，上一版可用的替换人声也不会被一并删除。删除原 vocal 分轨保留已有替换人声。
 
 替换结果由 `/output/jobs/<jobId>/song_<n>/<原音轨名>_rvc_vocal.wav` 提供，接口返回的
 `replacedVocal` 就是该 URL，前端直接播放或下载。`DELETE /api/voice/result` 软删除替换产物，
-`PUT /api/voice/result` 恢复；两者均传 `job_id`、`filename` 和可选的 `song`，删除后可恢复，
-重新替换则会覆盖同一路径。
+`PUT /api/voice/result` 恢复；两者均传 `job_id`、`filename`、`audio_revision` 和可选的
+`song`，删除后可恢复，重新替换则会覆盖同一路径。这个入口只管理派生音频：母带 `fullTrack`
+与提交后的保留音轨（`stems` 里任一文件）返回 409 —— 保留音轨的软删除与撤回走 `/stems`，
+那里才记撤回记录、才检查版本。
 
 ## Docker 部署与 SSH 出网代理
 
@@ -242,97 +244,89 @@ docker compose up -d --force-recreate api
 sudo iptables -D INPUT ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
 ```
 
-## 合轨导出
+## 工程编辑与成品提交
 
-四轨分离并替换人声后，把替换后的人声与 drums/bass/other 合成一首成品。音频处理步骤与原
-实现沿用相同的响度补偿与限幅参数，执行器使用仓库统一的 async 子进程写法。
-RVC 单声道人声先显式复制为双声道并做 `equalizer f=3000 t=q w=1 g=2.5`，再四路
-`amix=inputs=4:duration=longest:dropout_transition=0:normalize=0`；随后用 `loudnorm`
-测出成品与原曲的响度差、按最大 ±12 dB 补偿，最后过一次
-`alimiter=limit=0.891251`（−1 dBFS 真峰、latency 补偿）。输出沿用原曲的采样率与声道数
-（PCM 原曲沿用位深，其它格式回退 16-bit）。**静音或响度测不出来的输入直接失败**，
-不会静默按 0 dB 出成品。
+`POST /api/jobs/<jobId>/mix?song=0|1` 用本次保留的音轨覆盖当前歌曲的成品与音轨文件，
+返回 202；进度和结果通过同一任务的 GET / SSE 获取。前端 Next 代理原样透传 JSON。
 
-入口与 `/split`、`/replace` 同构：任务级、异步执行、进度走任务状态与 SSE，可取消。
-音轨取自任务结果（`fullTrack`、`replacedVocal`、drums/bass/other），不需要请求体。
-**合轨必须基于已替换的人声**：没有 `replacedVocal`（未替换，或替换产物已被删除）时返回 409
-并提示先完成替换；不提供"用原始 vocal 分轨直接合轨"的回退。
+`tracks` 是完整的最终保留列表（不是部分更新）：前端已经排除删除、静音（M）以及音量为
+−∞ 的轨道。请求里没有 `editorState`/`muted`/`solo`/`projectRevision`，后端也不保存或
+恢复编辑状态 —— 再次编辑时 M/S 全部关闭、所有滑杆从 0 dB 开始。后端只按「有没有有效
+输入」判定：只排除人声、保留伴奏是合法提交（前端提交前用一次确认弹窗说明会消失的车道），
+空列表才返回 400。
 
-```bash
-curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/mix?song=0'
+```json
+{
+  "commit": true,
+  "audioRevision": 2,
+  "editor": "tracks",
+  "tracks": [
+    {"id": "vocal", "source": "stem", "stemId": "vocal", "gainDb": -6}
+  ]
+}
 ```
 
-- 成品写入 `output/jobs/<jobId>/song_<n>/<人声名>_rvc_mix.wav`（与 `fullTrack`、各分轨
-  同一目录），以 `mixedTrack` 暴露，并写入该歌曲 `waveforms` 的 `mix` 车道（640 bin）。
-  元数据先落盘、成品文件后原子替换；若进程恰好死在两步之间，重启时会摘掉指向不存在文件的
-  引用（不会对外报"有成品"却 404）。重启时还会清理被硬杀留下的 `.mix-*` 中间目录；隐藏目录
-  （`.trash`、`.mix-*`）一律不通过 `/output` 对外提供。
-  `GET /api/jobs` 的 history 投影里同样带 `mixedTrack` WAV 母带；播放优先使用
-  `playback.mixedTrack` MP3，缺失时才回退 WAV。历史列表按既有约定不返回波形，
-  也不返回合轨运行态。
-- 文件名固定、同名覆盖：混音在临时目录完成后才原子替换成品，因此**失败、超时、取消都不会
-  破坏上一版**。`job.json` 只在成功路径上更新 `mixedTrack` 与波形，顺序是先写元数据、再替换
-  文件（这样写盘失败时成品一个字节都没动）；两步之间被杀进程的窗口由上一条的重启修复兜底。
-- 音轨路径由任务结果给出，只校验形状（必须在 output 根内、正好在该歌曲目录、不在 `.trash`、
-  扩展名属于媒体白名单）；绝对 URL 按 `/output/` 之后的部分定位本地文件，与 `/split`、
-  `/replace` 处理分轨 URL 的方式一致，不会发起任何请求。
-- 与生成、拆轨、人声替换共享同一并发额度：额度用满返回 429；同一任务已有音频操作在跑返回
-  409。合轨进行中（含试听编码）会拒绝该任务的拆轨、替换人声、分轨删除/恢复与替换产物
-  删除/恢复。试听编码进入并发闸门前可能等待，此时仍占用合轨额度；编码本身最长 120 秒。
-- `operationStage` 合轨阶段依次为 `mixing`（`operationProgress=76`）、
-  `waveform`（`operationProgress=90`）、`preview`（`operationProgress=95`）
-  和 `completed`（`operationProgress=100`）。`preview` 时 WAV 已发布，
-  但 `mixStatus` 仍为 `running`；试听 MP3 就绪或回退处理完成后才发送 SSE `done`。
-  前端应容忍 `operationStage=preview`（运行期顶层也为 `stage=preview`）；试听失败时 `playback.mixedTrack` 缺失，继续使用 WAV。
-- 入参不合法时返回 400（路径形状/任务 id）、404（输入文件不存在/不可读、歌曲不存在）、
-  409（任务未完成、缺音轨、模型已变更、已有音频操作在跑）、429（额度用满）。超时阈值为
-  `RVC_MIX_TIMEOUT_SECONDS`（默认 180 秒），也可从 `GET /api/health` 的
-  `mixing.timeoutSeconds` 读取；同处还有 `mixing.modelGuardEnforced`，用于判断当前实例的
-  模型指纹守卫是否真的生效（缺资产时为 false）。混音本身的失败或超时（含静音输入）不改变 HTTP
-  状态：任务级入口已经返回 202，结果通过 `mixStatus=failed` 与 `mixError` 暴露，
-  错误只返回通用文案，细节写日志。`PATCH /api/jobs/<jobId>` 在 `mixing`/`waveform`
-  阶段取消会标记 `mixStatus=cancelled`、回收 FFmpeg 进程并丢弃半成品；在 `preview`
-  阶段只取消试听编码，已发布的 WAV 保留，任务仍以 `succeeded` 收尾。
-- 波形提取失败不影响成品：成品照常落盘可播放，只是该歌曲没有 `mix` 车道，日志里会记一条
-  warning。
-- 输入变了就作废引用，让"是否过期"机器可判定。以下四种情况都会清掉 `mixedTrack` 与该歌曲的
-  `mix` 车道，`mixStatus` 随之由结果推导为 `null`——客户端据此要求用户重新合轨，不必自己猜：
-  **重新替换人声成功**、**替换结果被判定失效**（模型指纹不符，见下）、**删除任一分轨**
-  （人声/鼓/贝斯/其它都是合轨输入）、以及 **`DELETE /api/voice/result` 软删除替换人声或成品
-  本身**。成品文件保留在磁盘上（与替换人声旧文件同一取舍：不删、只是不再被引用），下一次合轨
-  会覆盖同名文件。可逆操作（分轨 `PUT`、替换产物 `PUT`）会把作废的成品引用与车道一起还原。
-- **替换失败、超时或被取消时，成品引用会还原**：人声引用按既有契约不还原（判定失效即撤下，
-  见 `tests/integration/test_replace_history.py`），但成品是已经完成、文件也没被动过的产物，
-  还原后 `mixStatus` 仍为 `succeeded`、可继续播放，只是重新合轨会 409（需要先有有效的人声）。
-  只有替换**成功**才会真正作废成品，那时才需要重新合轨。
-- `DELETE /api/voice/result` 只用于派生音频：删母带（`fullTrack`）返回 409；删成品本身会让
-  记录停止宣称该成品，`PUT` 撤回时连引用与 `mix` 车道一起还原。
-- **重新拆轨不会作废成品**：重拆只是把同一批分轨重新提取一遍，成品内容仍然成立，`mix` 车道
-  也照旧保留。
-- `mixedTrack` 与 `mix` 车道成对出现，但有两个例外要按字面理解：波形提取失败时成品照常发布
-  而没有 `mix` 车道（见下）；`GET /api/jobs` 的 history 投影按约定不返回波形。客户端不要用
-  `waveforms["mix"]` 的存在与否判断"有没有成品"，请直接看 `mixedTrack`。
-- 替换执行期间若进程重启：准入阶段已把 `replacedVocal` 与 `mixedTrack` 的引用摘掉并落盘，
-  重启后保持"没有有效替换人声"（两份文件都还在盘上），需要重新替换。这是刻意的安全默认：
-  不复活一份无法验证的替换人声。
-- 替换人声的模型指纹（`RVC_MODEL_PATH`/`RVC_INDEX_PATH`/`RVC_MODEL_VERSION` 变了）与结果里
-  记录的不符时，合轨返回 409 并提示先重新替换：否则会用旧模型的人声渲染出一个看起来正常的
-  成品。这一点与 `/replace` 判定缓存失效的判据一致。
-  **只在模型资产确实存在时才做这层比较**：指纹在文件缺失时把 `missing` 拼进摘要，缺资产的
-  实例（`.dockerignore` 排除了 `assets/rvc`，权重靠运行时挂载）算出的指纹与记录值必然不同，
-  若据此拒绝，就会把只依赖 ffmpeg 的合轨锁死，还给出一个必然失败的补救动作。此时放行合轨
-  并记一条 warning。
+- `audioRevision` 是当前歌曲及可编辑文件的版本，初始缺省 0，成功覆盖后加 1；不匹配返回
+  409。它同时挡住过期提交和迟到响应覆盖新文件，与编辑状态无关。
+- `editor` 为 `tracks` 或 `replace`：合轨失败时前端据此退回原编辑页面，不用于恢复控制状态。
+- `source=stem` 读取当前歌曲的 `stems[stemId]`。保存时一律以请求的 `id` 为输出键、读取
+  文件时用 `stemId`，两者不能混淆：普通编辑器的 ID 等于 stemId；替换编辑器里原人声的 ID
+  为 `original:<stemId>`，但**已经带前缀**的键（重新分轨可能落下 `original:vocal`）保持
+  原样、不再叠加前缀，此时 id 与 stemId 都取它；只保留替换人声时新 stems 里只有
+  `replaced`。`replaced` 成为普通音轨后就是普通车道（`source=stem` + `stemId=replaced`，
+  读 `stems["replaced"]`），后端不能因为它叫 replaced 而拒绝 —— 它和 `source=replaced`
+  是两回事。
+- `source=replaced` 的 ID 为 `replaced`，读取当前替换结果 `replacedVocal`，仅在选择它时
+  校验 RVC 模型指纹、且本轮必须确实存在替换结果。`source=full` 的 ID 为 `full`，读取当前
+  `fullTrack`，只用于未分轨的单轨编辑且必须独占输入。
+- 轨道 ID 必须唯一且安全，空列表返回 400。`gainDb` 只接受有限数字，范围 `[-66, 6]`，
+  0 表示线性增益 1。
+- 每路输入先按 `volume=10**(gainDb/20)` 渲染出**新的音轨文件**，再对这些新文件
+  `amix=inputs=N:normalize=0` 合成成品（支持只有一路）：不再做人声 EQ 或原曲响度补偿，
+  所以调低音量不会被整体抬回。防削波限幅（−1 dBFS 真峰）**逐轨与成品各过一次**：保留
+  音轨要能直接试听而不削顶，成品由这些已带增益的文件求和，不会再把增益应用第二遍。
+  输出沿用当前歌曲的采样率、声道与 PCM 位深，并补齐或裁剪到歌曲长度（短轨补静音）。
+- 成品、保留音轨的预览与波形全部就绪后原子提交：`fullTrack` 与 `mixedTrack` 指向同一份
+  新成品 `master_v<版本>_<唯一标识>.wav`。分轨输入会**完整替换** `stems`、`stemUrls`、
+  `playback.stems` 与分轨波形，只保留请求 id 对应的增益后文件，`splitEnabled=true`，
+  不与旧 stems 做字典合并；单轨输入时 `stems`/`stemUrls` 为空、`splitEnabled=false`，
+  新 `fullTrack` 成为下次单轨编辑的输入。
+- 参与混音的替换人声提交后就是普通音轨：`replacedVocal`、`playback.replacedVocal`、替换
+  波形与 replace 操作结果一并清除；即使本轮没有选用替换结果也清除旧结果，避免下次重复
+  多出一条旧替换车道。
+- `audioRevision` 加 1 并持久化成功后才发布 `mixStatus=succeeded`；新文件用新 URL，避免
+  客户端缓存旧音频。混音、波形、试听、发布、保存失败或取消都不更新当前成品与版本，保留
+  本轮输入和可撤回文件，只清掉本轮新建的临时产物。成功后才清理无引用的旧文件，因此一次
+  覆盖之后不能撤回上一版删除的文件。
+- 已有 `splitEnabled=true` 的歌曲再次 `/split` 直接返回当前保留音轨，不重跑 Demucs、
+  也不补回被移除的轨道。未建立分轨时首次分离会推进 `audioRevision`，让前端丢弃旧单轨页面
+  的控制与撤回记录。
+- 分轨 DELETE/PUT 在修改前检查 `X-Audio-Revision`，替换产物 DELETE/PUT 检查 multipart
+  `audio_revision`；缺省按 0 校验，不一致返回 409。删除/恢复本身不增加版本，返回的任务
+  状态始终携带当前 `audioRevision`。独立删除原人声不连带删除当前替换结果（替换页对此只
+  隐藏车道，完成时以完整输入列表覆盖）；反过来，撤回一条普通音轨也只会恢复它自己 ——
+  已经软删除的替换结果由 `/api/voice/result` 自己的 PUT 恢复。
+- 合轨与生成、拆轨、人声替换共享容量；额度用满返回 429，已有音频操作返回 409。合轨期间
+  禁止该任务的输入文件删除/恢复、替换人声与拆轨。进度依次为 mixing=76、waveform=90、
+  preview=95、completed=100，超时使用 `RVC_MIX_TIMEOUT_SECONDS`。输入不可读返回 404；
+  缺少所选工程输入或版本过期返回 409；非法设置、文件归属或没有任何有效输入返回 400，
+  不会生成空白成品。
 
-任务状态里合轨以 `mixStatus`、`mixSong`、`mixError` 暴露，独立的 `operation*` 字段
-与拆轨、替换人声使用同一规则，包括成功、失败和取消；只有运行期兼容覆盖顶层字段，
-终态回到主生成状态。
-合轨保留既有百分比：混音阶段 `operationProgress` 从 76 起，波形阶段 90，完成 100。`mixStatus` 与 `replaceStatus` 一样不落盘：重启后由
-结果里的 `mixedTrack` 推导为 `succeeded`；此时若只有一首歌有成品才给出 `mixSong`，多首
-都有成品时 `mixSong` 为 `null`——客户端应直接读每首歌自己的 `mixedTrack` 判断。
+`mixConfig` 原样回显本轮完整请求（包括顺序、版本号与增益）：202 的对应歌曲结果就带着它，
+成功终态继续保留作为本次提交凭据，受理后的失败同样保留，前端据此退回对应的编辑页。
+前端不据此初始化控制：首次打开及文件版本更新后，M/S、音量与撤回栈都重新初始化。
 
-合轨沿用原版滤镜图，最后一步没有按原曲时长截断（`amix=duration=longest`），因此成品可能
-比原曲长几十毫秒（Demucs 输出的 mp3 分轨带编码器补零），`mix` 车道的时轴也随之略长于其它
-车道。这是原版既有特性，本次未做改动；需要严格对齐时应在最后一步加 `-t <原曲时长>`。
+旧客户端在成品版本仍为 0 时可以不带请求体，继续使用“替换人声 + drums/bass/other”的固定
+四轨导出。这条兼容路径保留原 EQ、响度补偿和固定文件名，仅更新 `mixedTrack`；它不会提交
+母带或编辑状态。只有结果里还没有 `audioRevision`（本次部署之前生成、且再次 `/split` 命中
+缓存因而没有推进版本）时才会被受理：首次分离音轨就会把版本推到 1 以上，此后无请求体的
+导出一律 409。旧记录里的 `projectRevision`/
+`editorState`/`editorFullTrack`（含 `playback.editorFullTrack`、`waveforms.editorFull`）
+在加载和响应渲染时被当作未提交设置丢弃并记日志，后端不会按旧设置重新渲染。
+
+`mixStatus` 等运行态不落盘，重启后从结果推导成功。历史列表保留 `audioRevision` 与
+`mixConfig`，按既有约定不返回波形或运行态。一首候选只有一条记录，播放与下载都用覆盖后的
+成品；多首都有成品时 `mixSong=null`，客户端按每首结果判断。
 
 生成音乐。`provider` 可传 `minimax_music` 或 `elevenlabs_music`，不传时使用
 `MUSIC_PROVIDER`：
@@ -569,7 +563,8 @@ JSON 语法错误包含解析说明与行列，字段错误用点分隔字段名
 
 ```text
 jobId, prompt, durationMinutes, structuredPrompt, fullTrack,
-stems, stemUrls, waveforms, splitEnabled, debug
+stems, stemUrls, waveforms, splitEnabled, debug,
+audioRevision, mixConfig, replacedVocal, mixedTrack, playback
 ```
 
 双格式下载沿用结果字段，`result.alternatives` 中每首候选使用相同映射：
@@ -612,7 +607,10 @@ WAV 被软删除或版本改变后，其旧 MP3 链接返回 404，撤回删除�
 ## 按需四轨分离
 
 音乐生成只产出完整混音，不会自动拆轨。从历史记录进入编辑时，调用分轨接口执行
-Demucs 四轨分离并通过任务 SSE 推送真实进度；已有 `stems` 时直接复用结果。
+Demucs 四轨分离并通过任务 SSE 推送真实进度；`splitEnabled=true`（或 `stems` 非空）时
+直接返回**当前保留的音轨**，不会重新运行 Demucs，也不会补回被移除的轨道 —— 再次编辑
+只编辑保留下来的文件。尚未建立分轨时首次分离会推进 `audioRevision`，让前端丢弃旧单轨
+页面的控制与撤回记录；分离出的原始人声与伴奏就是此后编辑与混音的输入。
 
 拆轨的 `operationStage` 依次经过 `starting_split`（读取输入，0）、`splitting`（Demucs，25）、
 `waveform`（真实波形，50–75）、`preview`（每轨试听 MP3，75–99）和 `completed`。
@@ -662,6 +660,10 @@ uv run pytest
 - `tests/unit`：配置、Prompt、Provider、Demucs 命令和基础设施接口
 - `tests/integration`：FastAPI API 契约、并发、音频下载
 - `tests/functional`：启动真实 Uvicorn TCP 服务完成生成与四轨下载
+
+`tests/functional/test_frontend_track_mix.py` 还会在临时副本里起同目录 `SHUJI-BAND`
+（可用 `SHUJI_FRONTEND_DIR` 指定）的真实 Next 路由，转发到真实 Uvicorn 与真实 FFmpeg，
+核对「完成创作」的覆盖提交链路。缺少前端检出、Node 或 ffmpeg 时该项跳过。
 
 真实 Demucs 冒烟测试默认跳过，因为首次运行需要下载模型且耗时较长：
 
