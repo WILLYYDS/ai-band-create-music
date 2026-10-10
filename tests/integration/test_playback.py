@@ -578,9 +578,11 @@ async def test_download_formats_consistent_across_responses_restart_and_expiry(
             "alternatives": songs[1:],
         },
     )
-    stored_result = copy.deepcopy(job.result)
     job.save(settings.output_dir)
     app.state.jobs = load_jobs(settings.output_dir)
+    # 加载时旧版 mixedTrack 迁成独立的替换后那首；之后读取不得再改动结果。
+    stored_result = copy.deepcopy(app.state.jobs["download"].result)
+    assert all("mixed" in output for output in [stored_result, *stored_result["alternatives"]])
 
     async def unexpected_encode(*_args, **_kwargs):
         raise AssertionError("reading results must not encode audio")

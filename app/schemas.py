@@ -108,6 +108,8 @@ class MusicOutput(BaseModel):
     waveforms: dict[str, list[float]]
     splitEnabled: bool
     debug: dict[str, Any]
+    # 「替换后」那首歌：与原曲分开编辑、分开覆盖，字段与原曲同构。
+    mixed: MusicOutput | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class GenerateResponse(MusicOutput):

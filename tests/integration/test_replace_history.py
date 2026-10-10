@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from pathlib import Path
 
@@ -395,12 +396,14 @@ async def test_rerun_commits_replacement_only_after_metadata_save(tmp_path, monk
     job.result["mixedTrack"] = mixed_file.relative_to(settings.output_dir).as_posix()
     job.save(settings.output_dir)
     metadata_path = settings.output_dir / "jobs" / job.job_id / "job.json"
-    previous_result = json.loads(metadata_path.read_text())["result"]
     changed_model = tmp_path / "changed-model.pth"
     changed_model.write_bytes(b"changed")
     settings.rvc_model_path = changed_model
     app = create_app(settings, make_orchestrator(settings), engine)
     job = app.state.jobs[job.job_id]
+    # 加载时旧版成品迁成独立的替换后那首；重新替换人声全程不碰它。
+    previous_result = json.loads(metadata_path.read_text())["result"]
+    mixed_song = copy.deepcopy(job.result["mixed"])
     started, release = asyncio.Event(), asyncio.Event()
 
     async def waveform(_paths):
@@ -436,7 +439,7 @@ async def test_rerun_commits_replacement_only_after_metadata_save(tmp_path, monk
         assert (await http.post(f"/api/jobs/{job.job_id}/replace")).status_code == 202
         if outcome.endswith("_cancel"):
             await asyncio.wait_for(started.wait(), 2)
-            assert "mixedTrack" not in job.result
+            assert job.result["mixed"] == mixed_song
             assert json.loads(metadata_path.read_text())["result"] == previous_result
             restarted = create_app(settings, make_orchestrator(settings), engine)
             async with client(restarted) as restarted_http:
@@ -457,7 +460,6 @@ async def test_rerun_commits_replacement_only_after_metadata_save(tmp_path, monk
         assert response["replaceStatus"] == "succeeded"
         assert replaced_file.read_bytes() == b"RIFF-replaced-2"
         assert stored["result"]["replacedVocal"] == job.result["replacedVocal"]
-        assert "mixedTrack" not in job.result
     else:
         expected_status = "cancelled" if outcome.endswith("_cancel") else "failed"
         assert response["replaceStatus"] == expected_status
@@ -467,7 +469,7 @@ async def test_rerun_commits_replacement_only_after_metadata_save(tmp_path, monk
             assert stored["result"] == previous_result
         else:
             assert "replacedVocal" not in stored["result"]
-        assert stored["result"]["mixedTrack"] == job.result["mixedTrack"]
+    assert stored["result"]["mixed"] == job.result["mixed"] == mixed_song
     assert app.state.orchestrator.capacity.active == 0
     assert not list(replaced_file.parent.glob(".rvc-*"))
 

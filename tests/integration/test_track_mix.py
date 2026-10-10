@@ -68,18 +68,27 @@ def pick(result, song=0):
     return result if song == 0 else result["alternatives"][song - 1]
 
 
-async def commit(http, job, mix, song=0):
-    """提交一轮并等它收尾：202 的回显与终态都必须带上本轮 mixConfig。"""
-    response = await http.post(mix_url(job, song), json=mix)
+def project(output, variant):
+    return output["mixed"] if variant == "mixed" else output
+
+
+async def commit(http, job, mix, song=0, variant="original"):
+    """提交一轮并等它收尾：202 的回显与终态都必须带上本轮 mixConfig。
+
+    回显在读输入的那首歌上；返回被覆盖的那首（替换编辑器写进替换后那首）。
+    """
+    url = mix_url(job, song) + ("&variant=mixed" if variant == "mixed" else "")
+    response = await http.post(url, json=mix)
     assert response.status_code == 202, response.text
-    accepted = pick(response.json()["result"], song)
+    accepted = project(pick(response.json()["result"], song), variant)
     assert accepted["mixConfig"] == mix
     # 受理时版本还没推进；audioRevision 也不能被序列化过滤掉。
     assert accepted["audioRevision"] == mix["audioRevision"]
     await job.mix_task
     detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
     assert detail["mixStatus"] == "succeeded", detail
-    output = pick(detail["result"], song)
+    target = "mixed" if mix["editor"] == "replace" else variant
+    output = project(pick(detail["result"], song), target)
     assert output["mixConfig"] == mix
     return output
 
@@ -110,7 +119,8 @@ async def test_commit_overwrites_the_song_with_the_retained_tracks(tmp_path, ins
         emitted = json.loads(event.split("data: ", 1)[1])
 
     # 成品与音轨都指向这一轮覆盖出来的新文件。
-    assert first["fullTrack"] == first["mixedTrack"]
+    # 原曲覆盖自己：不会顺带产出一首「替换后」。
+    assert "mixedTrack" not in first and "mixed" not in first
     assert "master_v1" in Path(first["fullTrack"]).name
     assert first["audioRevision"] == 1
     assert Path(first["fullTrack"]).parent.name == f"song_{song + 1}"
@@ -213,7 +223,7 @@ async def test_first_split_keeps_the_committed_product_and_its_credential(
     assert split["stems"] and split["splitEnabled"] is True
     assert split["audioRevision"] == 2
     # 重新分轨没有改动成品本身，所以引用与提交凭据都保留。
-    assert split["fullTrack"] == split["mixedTrack"] == committed["fullTrack"]
+    assert split["fullTrack"] == committed["fullTrack"] and "mixedTrack" not in split
     assert split["mixConfig"] == mix
     # 旧方案的工程状态字段仍然不会回到结果里。
     assert not {"editorState", "projectRevision", "editorFullTrack"} & set(split)
@@ -235,7 +245,7 @@ async def test_single_track_commit_keeps_the_song_unsplit(tmp_path, install_stub
 
     assert first["splitEnabled"] is False
     assert first["stems"] == {} and first["stemUrls"] == []
-    assert first["fullTrack"] == first["mixedTrack"]
+    assert "mixedTrack" not in first
     assert first["audioRevision"] == 1 and second["audioRevision"] == 2
     assert second["fullTrack"] != first["fullTrack"]
     # 第一次读原始母带，第二次读第一次覆盖出来的成品，增益都按本轮请求重算。
@@ -250,42 +260,102 @@ async def test_single_track_commit_keeps_the_song_unsplit(tmp_path, install_stub
 # --------------------------------------------------------------- deletion, undo, revisions
 
 
-async def test_track_deletion_before_a_commit_is_not_undoable_afterwards(tmp_path, install_stubs):
-    """已提交的手动删除不能被撤回，而且删原人声不连带删除当前的替换结果。"""
+async def test_replace_commit_creates_a_separate_song(tmp_path, install_stubs):
+    """替换编辑器的提交产出「替换后」那首；原曲的音轨、版本与可撤回删除都原样保留。"""
     install_stubs()
     settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
     job = seed_job(app, settings)
     replacement = job.result["replacedVocal"]
-    mix = commit_body([track("replaced", source="replaced")], editor="replace")
+    original_full = job.result["fullTrack"]
+    mix = commit_body(
+        [track("replaced", source="replaced", gain=-3), track("drums")], editor="replace"
+    )
 
     async with client(app) as http:
         deleted = await http.delete(
-            f"/api/jobs/{job.job_id}/stems/vocal", headers={"X-Audio-Revision": "0"}
+            f"/api/jobs/{job.job_id}/stems/bass", headers={"X-Audio-Revision": "0"}
         )
         assert deleted.status_code == 204
-        # 删原人声不是删替换结果（替换页只隐藏那条车道）。
-        assert job.result["replacedVocal"] == replacement
-        assert absolute(settings, replacement).is_file()
-        assert revocable_files(settings, job)
         committed = await commit(http, job, mix)
-        # 版本不一致的 PUT 先被挡下；版本对上时删除记录已被覆盖清空。
-        assert (
-            await http.put(f"/api/jobs/{job.job_id}/stems/vocal", headers={"X-Audio-Revision": "0"})
-        ).status_code == 409
-        assert (
-            await http.put(f"/api/jobs/{job.job_id}/stems/vocal", headers={"X-Audio-Revision": "1"})
-        ).status_code == 404
+        detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
+        listing = (await http.get("/api/jobs")).json()["jobs"]
+        # 原曲没有被覆盖：版本仍是 0，提交前的删除照样可以撤回。
+        restored = await http.put(
+            f"/api/jobs/{job.job_id}/stems/bass", headers={"X-Audio-Revision": "0"}
+        )
 
     assert committed["audioRevision"] == 1
-    assert set(committed["stems"]) == {"replaced"}
+    assert set(committed["stems"]) == {"replaced", "drums"}
     assert committed["splitEnabled"] is True
-    assert "replacedVocal" not in committed
-    # 替换产物成了普通音轨，文件保留；可撤回的删除文件随覆盖一起清掉。
-    assert absolute(settings, committed["stems"]["replaced"]).is_file()
-    assert not revocable_files(settings, job)
-    assert "vocal" not in job.result["stems"]
-    assert job.deleted_stems == {}
+    assert Path(committed["fullTrack"]).name.startswith("mixed_master_v1_")
+    assert all(Path(url).name.startswith("mixed_") for url in committed["stems"].values())
+    original = detail["result"]
+    assert original["audioRevision"] == 0
+    assert original["fullTrack"].endswith(Path(original_full).name)
+    assert set(original["stems"]) == {"vocal", "drums", "other"}
+    # 替换人声已经进了替换后那首，原曲上不再有未提交的替换产物。
+    assert "replacedVocal" not in original and "replacedVocal" not in job.result
+    assert not absolute(settings, replacement).exists()
+    # 兼容字段：生成记录按 mixedTrack 列出替换后那首。
+    assert original["mixedTrack"] == committed["fullTrack"]
+    assert listing[0]["result"]["mixed"]["fullTrack"] == committed["fullTrack"]
+    assert restored.status_code == 200
+    assert "bass" in job.result["stems"] and job.deleted_stems == {}
+
+
+async def test_the_two_songs_are_edited_and_overwritten_separately(tmp_path, install_stubs):
+    """原曲与替换后那首各自编辑、各自覆盖，版本号与撤回记录互不影响。"""
+    mixer = install_stubs()
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    job = seed_job(app, settings)
+
+    async with client(app) as http:
+        mixed = await commit(
+            http,
+            job,
+            commit_body([track("replaced", source="replaced"), track("drums")], editor="replace"),
+        )
+        mixed_url = f"/api/jobs/{job.job_id}/stems/drums?variant=mixed"
+        assert (await http.delete(mixed_url, headers={"X-Audio-Revision": "0"})).status_code == 409
+        assert (await http.delete(mixed_url, headers={"X-Audio-Revision": "1"})).status_code == 204
+        assert set(job.result["mixed"]["stems"]) == {"replaced"}
+        assert set(job.result["stems"]) == {"vocal", "drums", "bass", "other"}
+        assert (await http.put(mixed_url, headers={"X-Audio-Revision": "1"})).status_code == 200
+        # 编辑替换后那首：读它自己的音轨，只覆盖它自己。
+        edited = await commit(
+            http,
+            job,
+            commit_body([track("replaced", gain=-6), track("drums")], audio=1),
+            variant="mixed",
+        )
+        original_before = copy.deepcopy(
+            {key: value for key, value in job.result.items() if key != "mixed"}
+        )
+        # 编辑原曲：只覆盖原曲，替换后那首原样保留。
+        original = await commit(http, job, commit_body([track("vocal"), track("bass")]))
+        detail = (await http.get(f"/api/jobs/{job.job_id}")).json()["result"]
+
+    assert [call[0] for call in mixer.calls][1] == [
+        absolute(settings, mixed["stems"]["replaced"]),
+        absolute(settings, mixed["stems"]["drums"]),
+    ]
+    assert edited["audioRevision"] == 2 and set(edited["stems"]) == {"replaced", "drums"}
+    assert original_before.get("audioRevision", 0) == 0 and "mixed" not in original_before
+    assert original["audioRevision"] == 1 and set(original["stems"]) == {"vocal", "bass"}
+    assert detail["mixed"]["fullTrack"] == edited["fullTrack"]
+    assert detail["mixed"]["audioRevision"] == 2
+    # 原曲覆盖后的清理不能删掉替换后那首的文件。
+    for url in (edited["fullTrack"], *edited["stems"].values()):
+        assert absolute(settings, url).is_file(), url
+    # 替换编辑器只能基于原曲提交；替换后那首不再有独立的替换人声。
+    async with client(app) as http:
+        refused = await http.post(
+            mix_url(job) + "&variant=mixed",
+            json=commit_body([track("replaced", source="replaced")], editor="replace", audio=2),
+        )
+    assert refused.status_code == 400
 
 
 class RecordingReplaceEngine(StubReplaceEngine):
@@ -299,8 +369,10 @@ class RecordingReplaceEngine(StubReplaceEngine):
         await super().convert(input_path, output_path, **_params)
 
 
-async def test_committed_replacement_lane_can_be_replaced_again(tmp_path, install_stubs):
-    """`replaced` 提交后就是普通音轨，下一次替换直接拿它当输入。"""
+async def test_replacing_again_reads_the_original_and_overwrites_the_replaced_song(
+    tmp_path, install_stubs
+):
+    """再次替换读的是原曲人声；再次提交覆盖的是替换后那首，版本号继续递增。"""
     install_stubs()
     settings = make_settings(tmp_path)
     engine = RecordingReplaceEngine()
@@ -309,65 +381,32 @@ async def test_committed_replacement_lane_can_be_replaced_again(tmp_path, instal
     mix = commit_body([track("replaced", source="replaced")], editor="replace")
 
     async with client(app) as http:
-        committed = await commit(http, job, mix)
+        first = await commit(http, job, mix)
         again = await http.post(f"/api/jobs/{job.job_id}/replace")
         assert again.status_code == 202, again.text
         await job.replace_task
-        detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
+        replaced = (await http.get(f"/api/jobs/{job.job_id}")).json()["result"]
+        # 替换后那首在新一轮替换期间保持不变。
+        assert replaced["mixed"] == first
+        second = await commit(
+            http,
+            job,
+            commit_body(
+                [track("original:vocal", stem="vocal"), track("replaced", source="replaced")],
+                editor="replace",
+            ),
+        )
 
-    assert job.replace_status == "succeeded"
-    assert engine.inputs == [absolute(settings, committed["stems"]["replaced"])]
-    # 新一轮替换产生独立的 replacedVocal，等待用户在下一次提交里决定去留。
-    assert detail["result"]["replacedVocal"]
-    assert detail["result"]["replacedVocal"] != committed["stems"]["replaced"]
-    assert set(detail["result"]["stems"]) == {"replaced"}
-
-
-async def test_replace_editor_accepts_prefixed_and_replaced_lane_ids(tmp_path, install_stubs):
-    """第二轮替换提交：`original:vocal` 不再叠加前缀，`replaced` 作为普通车道也被接受。"""
-    mixer = install_stubs()
-    settings = make_settings(tmp_path)
-    app = create_app(settings, make_orchestrator(settings))
-    job = seed_job(app, settings)
-    # 第一轮：原人声还是原始键 vocal；提交后 stems 的键自己就成了 original:vocal / replaced。
-    first_mix = commit_body(
-        [track("original:vocal", stem="vocal"), track("replaced", source="replaced")],
-        editor="replace",
-    )
-    second_mix = commit_body(
-        [
-            track("original:vocal", stem="original:vocal"),
-            track("replaced", source="stem", stem="replaced"),
-        ],
-        editor="replace",
-        audio=1,
-    )
-
-    async with client(app) as http:
-        first = await commit(http, job, first_mix)
-        assert set(first["stems"]) == {"original:vocal", "replaced"}
-        second = await commit(http, job, second_mix)
-        listing = (await http.get("/api/jobs")).json()["jobs"]
-        event = (await http.get(f"/api/jobs/{job.job_id}/events")).text
-        emitted = json.loads(event.split("data: ", 1)[1])
-
-    assert set(second["stems"]) == {"original:vocal", "replaced"}
+    assert engine.inputs == [absolute(settings, job.result["stems"]["vocal"])]
+    assert replaced["replacedVocal"]
     assert second["audioRevision"] == 2
-    # 第二轮读的是第一轮覆盖出来的两个文件：读文件用 stemId，输出键用 id。
-    assert [call[0] for call in mixer.calls][1] == [
-        absolute(settings, first["stems"]["original:vocal"]),
-        absolute(settings, first["stems"]["replaced"]),
-    ]
-    # 落盘的 mixConfig 必须能被渲染：详情、列表与 SSE 都会重新校验它。
-    row = next(item for item in listing if item["jobId"] == job.job_id)["result"]
-    assert row["mixConfig"] == second_mix
-    assert emitted["result"]["mixConfig"] == second_mix
-    stored = json.loads((settings.output_dir / "jobs" / job.job_id / "job.json").read_text())
-    assert stored["result"]["mixConfig"] == second_mix
+    assert set(second["stems"]) == {"original:vocal", "replaced"}
+    assert not absolute(settings, first["fullTrack"]).exists()
+    assert job.result.get("audioRevision", 0) == 0
 
 
 async def test_restoring_a_track_does_not_revive_a_deleted_replacement(tmp_path, install_stubs):
-    """撤回一条普通音轨只恢复它自己：不会顺手把刚软删除的替换结果搬回来。"""
+    """撤回替换后那首的一条音轨只恢复它自己：不会顺手把原曲上软删除的替换结果搬回来。"""
     install_stubs()
     settings = make_settings(tmp_path)
     engine = RecordingReplaceEngine()
@@ -388,24 +427,19 @@ async def test_restoring_a_track_does_not_revive_a_deleted_replacement(tmp_path,
             data={
                 "job_id": job.job_id,
                 "filename": Path(standalone).name,
-                "audio_revision": "1",
+                "audio_revision": "0",
             },
         )
         assert deleted.status_code == 200
         assert "replacedVocal" not in job.result
-        assert (
-            await http.delete(
-                f"/api/jobs/{job.job_id}/stems/replaced", headers={"X-Audio-Revision": "1"}
-            )
-        ).status_code == 204
-        restored = await http.put(
-            f"/api/jobs/{job.job_id}/stems/replaced", headers={"X-Audio-Revision": "1"}
-        )
+        stem_url = f"/api/jobs/{job.job_id}/stems/replaced?variant=mixed"
+        assert (await http.delete(stem_url, headers={"X-Audio-Revision": "1"})).status_code == 204
+        restored = await http.put(stem_url, headers={"X-Audio-Revision": "1"})
         assert restored.status_code == 200
         restored_result = pick(restored.json()["result"])
 
-    assert set(restored_result["stems"]) == {"replaced"}
-    assert restored_result["stems"]["replaced"] not in (standalone, None)
+    assert set(restored_result["mixed"]["stems"]) == {"replaced"}
+    assert restored_result["mixed"]["stems"]["replaced"] not in (standalone, None)
     # 替换结果仍然留在回收站里，等它自己的 PUT；存档也还在。
     assert "replacedVocal" not in restored_result
     assert "replacedVocal" not in restored_result["playback"]

@@ -208,11 +208,12 @@ async def test_job_route_mixes_song_and_reports_state(tmp_path, install_stubs, s
     selected = song_result(job, song)
     original = before if song == 0 else before["alternatives"][song - 1]
     # 成品落在该歌曲目录下、用原版固定名；原始音频与分轨都不动。
-    assert selected["mixedTrack"] == f"jobs/{job.job_id}/song_{song + 1}/demo_rvc_mix.wav"
+    assert selected["mixed"]["fullTrack"] == f"jobs/{job.job_id}/song_{song + 1}/demo_rvc_mix.wav"
     assert (settings.output_dir / selected["fullTrack"]).read_bytes() == (
         f"stub-{song}-fullTrack".encode()
     )
-    assert selected["waveforms"] == {**original["waveforms"], "mix": MIX_WAVEFORM}
+    assert selected["waveforms"] == original["waveforms"]
+    assert selected["mixed"]["waveforms"] == {"full": MIX_WAVEFORM}
     assert (detail["mixStatus"], detail["mixSong"], detail["progress"]) == ("succeeded", song, 100)
     assert audio.content == b"RIFF-mixed-stub"
     assert rendered["mixedTrack"].startswith("http://testserver/output/")
@@ -411,7 +412,7 @@ async def test_failures_keep_the_previous_mix_intact(tmp_path, install_stubs, mo
     job = seed_job(app, settings)
     async with client(app) as http:
         await run_job_mix(http, job)
-        published = settings.output_dir / job.result["mixedTrack"]
+        published = settings.output_dir / job.result["mixed"]["fullTrack"]
         published.write_bytes(b"RIFF-previous-mix")
         stored = record_path(settings, job).read_bytes()
         previous = copy.deepcopy(job.result)
@@ -498,12 +499,12 @@ async def test_history_load_drops_a_mix_reference_without_a_file(tmp_path, insta
     job = seed_job(app, settings)
     async with client(app) as http:
         await run_job_mix(http, job)
-    (settings.output_dir / job.result["mixedTrack"]).unlink()
+    (settings.output_dir / job.result["mixed"]["fullTrack"]).unlink()
 
     reloaded = load_jobs(settings.output_dir)[job.job_id]
-    assert "mixedTrack" not in reloaded.result
+    assert "mixed" not in reloaded.result
     assert "mix" not in reloaded.result["waveforms"]
-    assert "mixedTrack" not in json.loads(record_path(settings, job).read_text())["result"]
+    assert "mixed" not in json.loads(record_path(settings, job).read_text())["result"]
 
 
 # ------------------------------------------------------------------------ admission
@@ -660,7 +661,7 @@ async def test_bad_inputs_are_refused(tmp_path, install_stubs, mutation, status)
         )
         response = await http.post(url)
     assert response.status_code == status, (mutation, response.text)
-    assert not mixer.calls and "mixedTrack" not in job.result
+    assert not mixer.calls and "mixed" not in job.result
 
 
 async def test_url_shaped_values_resolve_locally_without_any_fetch(
@@ -722,7 +723,7 @@ async def test_unreadable_artifact_never_hides_the_whole_job(tmp_path, install_s
     job = seed_job(app, settings)
     async with client(app) as http:
         await run_job_mix(http, job)
-    artifact = settings.output_dir / job.result["mixedTrack"]
+    artifact = settings.output_dir / job.result["mixed"]["fullTrack"]
     real_is_file = Path.is_file
 
     def guarded(self):
@@ -733,7 +734,8 @@ async def test_unreadable_artifact_never_hides_the_whole_job(tmp_path, install_s
     monkeypatch.setattr(Path, "is_file", guarded)
     reloaded = load_jobs(settings.output_dir)
     assert job.job_id in reloaded
-    assert reloaded[job.job_id].result["mixedTrack"] == job.result["mixedTrack"]
+    # 加载时旧版成品迁成独立的替换后那首，引用照旧保留。
+    assert reloaded[job.job_id].result["mixed"]["fullTrack"] == job.result["mixed"]["fullTrack"]
 
 
 async def test_mix_code_path_stays_local_only(tmp_path, install_stubs):
@@ -852,7 +854,7 @@ async def test_cancel_during_preview_keeps_published_mix_succeeded(
     assert detail["mixStatus"] == "succeeded"
     assert detail["result"]["mixedTrack"].endswith(".wav")
     assert "mixedTrack" not in detail["result"].get("playback", {})
-    assert (settings.output_dir / job.result["mixedTrack"]).is_file()
+    assert (settings.output_dir / job.result["mixed"]["fullTrack"]).is_file()
 
 
 async def test_preview_save_failure_keeps_published_mix_succeeded(
@@ -883,10 +885,11 @@ async def test_preview_save_failure_keeps_published_mix_succeeded(
         assert (await http.post(mix_url(job))).status_code == 202
         await job.mix_task
         detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
-    assert calls == 2
+    # 第三次落盘是把旧版成品迁成替换后那首。
+    assert calls == 3
     assert detail["mixStatus"] == "succeeded"
-    assert "mixedTrack" not in job.result.get("playback", {})
-    assert (settings.output_dir / job.result["mixedTrack"]).is_file()
+    assert "fullTrack" not in job.result["mixed"].get("playback", {})
+    assert (settings.output_dir / job.result["mixed"]["fullTrack"]).is_file()
 
 
 # ------------------------------------------------------- replacement model / provenance
@@ -907,7 +910,7 @@ async def test_replacement_model_fingerprint_guard(tmp_path, install_stubs):
         allowed = await run_job_mix(http, job)
 
     assert blocked.status_code == 409 and "模型" in blocked.json()["message"]
-    assert allowed.status_code == 202 and job.result["mixedTrack"]
+    assert allowed.status_code == 202 and job.result["mixed"]["fullTrack"]
     assert len(mixer.calls) == 1
 
 
@@ -934,7 +937,7 @@ async def test_replacement_outcomes_against_the_exported_mix(tmp_path, install_s
     install_stubs()
     settings = make_settings(tmp_path)
 
-    # 成功：人声变了，成品引用与车道一并作废（文件留着，下次合轨覆盖）。
+    # 成功：替换后那首是独立的歌，原曲重新替换人声不会作废它，下一次提交才覆盖。
     app = build_app(settings, StubReplaceEngine())
     job = seed_job(app, settings)
     async with client(app) as http:
@@ -944,8 +947,8 @@ async def test_replacement_outcomes_against_the_exported_mix(tmp_path, install_s
         await job.replace_task
         detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
     assert detail["replaceStatus"] == "succeeded"
-    assert "mixedTrack" not in detail["result"] and detail["mixStatus"] is None
-    assert (settings.output_dir / "jobs" / job.job_id / "song_1" / "demo_rvc_mix.wav").is_file()
+    assert detail["result"]["mixedTrack"].endswith("/demo_rvc_mix.wav")
+    assert detail["mixStatus"] == "succeeded"
 
     # 引擎失败：人声引用撤下（既有契约），但成品必须还能播。
     app = build_app(settings, FailingReplaceEngine())
@@ -986,18 +989,18 @@ async def test_replacement_outcomes_against_the_exported_mix(tmp_path, install_s
     reloaded = load_jobs(settings.output_dir)[job.job_id]
     assert "replacedVocal" not in reloaded.result
     assert previous_vocal.read_bytes() == previous_audio
-    assert reloaded.result["mixedTrack"] == job.result["mixedTrack"]
-    assert (settings.output_dir / reloaded.result["mixedTrack"]).read_bytes() == b"RIFF-mixed-stub"
+    assert reloaded.result["mixed"]["fullTrack"] == job.result["mixed"]["fullTrack"]
+    assert (
+        settings.output_dir / reloaded.result["mixed"]["fullTrack"]
+    ).read_bytes() == b"RIFF-mixed-stub"
 
 
 # ------------------------------------------------------------- invalidation & restore
 
 
 @pytest.mark.parametrize("deleted", ["stem", "replacement"])
-async def test_deleting_an_input_invalidates_and_restore_brings_the_mix_back(
-    tmp_path, install_stubs, deleted
-):
-    """分轨与替换人声都是合轨输入：删掉即作废成品，撤回删除时连成品一起还原。"""
+async def test_deleting_an_original_input_keeps_the_replaced_song(tmp_path, install_stubs, deleted):
+    """替换后那首是独立的歌：删掉原曲的分轨或替换人声、再撤回，都不影响它。"""
     install_stubs()
     settings = make_settings(tmp_path)
     app = build_app(settings)
@@ -1005,116 +1008,46 @@ async def test_deleting_an_input_invalidates_and_restore_brings_the_mix_back(
     vocal = Path(job.result["replacedVocal"]).name
     async with client(app) as http:
         await run_job_mix(http, job)
-        mix_path = settings.output_dir / job.result["mixedTrack"]
-        mix_preview = mix_path.parent / "playtrack" / _playback_name(mix_path)
-        mix_preview.parent.mkdir(exist_ok=True)
-        mix_preview.write_bytes(b"ID3-mix-preview")
-        job.result.setdefault("playback", {})["mixedTrack"] = mix_preview.relative_to(
-            settings.output_dir
-        ).as_posix()
         before = (await http.get(f"/api/jobs/{job.job_id}")).json()["result"]
         if deleted == "stem":
             removed = await http.request("DELETE", f"/api/jobs/{job.job_id}/stems/drums")
-            while_invalid = (await http.get(f"/api/jobs/{job.job_id}")).json()
-            app.state.jobs = load_jobs(settings.output_dir)
-            assert app.state.jobs[job.job_id].deleted_stems["0:drums"]["mixPlayback"] == (
-                mix_preview.relative_to(settings.output_dir).as_posix()
-            )
+            while_deleted = (await http.get(f"/api/jobs/{job.job_id}")).json()
             undone = await http.put(f"/api/jobs/{job.job_id}/stems/drums")
         else:
             removed = await http.request(
                 "DELETE", "/api/voice/result", data={"job_id": job.job_id, "filename": vocal}
             )
-            while_invalid = (await http.get(f"/api/jobs/{job.job_id}")).json()
+            while_deleted = (await http.get(f"/api/jobs/{job.job_id}")).json()
             undone = await http.request(
                 "PUT", "/api/voice/result", data={"job_id": job.job_id, "filename": vocal}
             )
         restored = (await http.get(f"/api/jobs/{job.job_id}")).json()
 
-    assert removed.status_code in {200, 204}
-    assert "mixedTrack" not in while_invalid["result"]
-    assert "mixedTrack" not in while_invalid["result"]["playback"]
-    assert while_invalid["mixStatus"] is None
-    assert undone.status_code in {200, 204}
-    assert restored["mixStatus"] == "succeeded"
-    assert restored["result"]["waveforms"]["mix"] == MIX_WAVEFORM
-    assert restored["result"]["playback"]["mixedTrack"] == before["playback"]["mixedTrack"]
-
-    # 还原自带防护：已有更新的成品时不得覆盖（这条路径目前经 API 不可达——分轨被删时
-    # /mix 必然 409——但准入规则一旦放宽就会立刻暴露，所以把语义钉住）。
-    from app.services.job_files import restore_mix_artifact
-
-    fresh = {"mixedTrack": "jobs/x/song_1/new_rvc_mix.wav", "waveforms": {"mix": [0.9] * 640}}
-    stale = {"mixTrack": "jobs/x/song_1/old_rvc_mix.wav", "mixWaveform": [0.5] * 640}
-    assert restore_mix_artifact(fresh, stale) is False
-    assert fresh["mixedTrack"].endswith("new_rvc_mix.wav")
-    assert fresh["waveforms"]["mix"][0] == 0.9
-    assert restore_mix_artifact({}, {}) is False
+    assert removed.status_code in {200, 204} and undone.status_code in {200, 204}
+    for detail in (while_deleted, restored):
+        assert detail["mixStatus"] == "succeeded"
+        assert detail["result"]["mixed"] == before["mixed"]
+        assert detail["result"]["mixedTrack"] == before["mixedTrack"]
+        assert detail["result"]["waveforms"]["mix"] == MIX_WAVEFORM
 
 
-async def test_voice_result_manages_only_derived_audio(tmp_path, install_stubs):
-    """这个入口只该管派生音频：母带拒绝；删成品要作废引用，PUT 再还原。"""
+async def test_voice_result_refuses_the_replaced_song(tmp_path, install_stubs):
+    """这个入口只管派生音频：原曲母带与替换后那首的成品都是歌，一律拒绝。"""
     install_stubs()
     settings = make_settings(tmp_path)
     app = build_app(settings)
     job = seed_job(app, settings)
     async with client(app) as http:
         await run_job_mix(http, job)
-        refused = await http.request(
-            "DELETE",
-            "/api/voice/result",
-            data={"job_id": job.job_id, "filename": Path(job.result["fullTrack"]).name},
-        )
-        deleted = await http.request(
-            "DELETE",
-            "/api/voice/result",
-            data={"job_id": job.job_id, "filename": "demo_rvc_mix.wav"},
-        )
-        while_deleted = (await http.get(f"/api/jobs/{job.job_id}")).json()
-        restored = await http.request(
-            "PUT",
-            "/api/voice/result",
-            data={"job_id": job.job_id, "filename": "demo_rvc_mix.wav"},
-        )
-        after_restore = (await http.get(f"/api/jobs/{job.job_id}")).json()
-        audio = await http.get(after_restore["result"]["mixedTrack"])
-
-    assert refused.status_code == 409
-    assert (settings.output_dir / job.result["fullTrack"]).is_file()
-    assert deleted.status_code == 200
-    assert "mixedTrack" not in while_deleted["result"] and while_deleted["mixStatus"] is None
-    assert restored.status_code == 200 and after_restore["mixStatus"] == "succeeded"
-    assert after_restore["result"]["waveforms"]["mix"] == MIX_WAVEFORM
-    assert audio.content == b"RIFF-mixed-stub"
-
-
-async def test_withdrawing_replacement_first_keeps_the_mix_stash_for_its_own_put(
-    tmp_path, install_stubs
-):
-    """两份存档分两次 PUT 回来：先撤回人声不能把成品的存档吃掉。"""
-    install_stubs()
-    settings = make_settings(tmp_path)
-    app = build_app(settings)
-    job = seed_job(app, settings)
-    vocal = Path(job.result["replacedVocal"]).name
-    async with client(app) as http:
-        await run_job_mix(http, job)
-        for filename in ("demo_rvc_mix.wav", vocal):
+        refused = [
             await http.request(
                 "DELETE", "/api/voice/result", data={"job_id": job.job_id, "filename": filename}
             )
-        await http.request(
-            "PUT", "/api/voice/result", data={"job_id": job.job_id, "filename": vocal}
-        )
-        stash = dict(job.deleted_replaced_vocals.get("0", {}))
-        restored = await http.request(
-            "PUT",
-            "/api/voice/result",
-            data={"job_id": job.job_id, "filename": "demo_rvc_mix.wav"},
-        )
+            for filename in (Path(job.result["fullTrack"]).name, "demo_rvc_mix.wav")
+        ]
         detail = (await http.get(f"/api/jobs/{job.job_id}")).json()
 
-    # 成品还在回收站里：存档必须留着，等它自己的 PUT。
-    assert set(stash) == {"mixTrack", "mixWaveform"}
-    assert restored.status_code == 200 and detail["mixStatus"] == "succeeded"
-    assert "0" not in job.deleted_replaced_vocals
+    assert [response.status_code for response in refused] == [409, 409]
+    assert (settings.output_dir / job.result["fullTrack"]).is_file()
+    assert (settings.output_dir / job.result["mixed"]["fullTrack"]).is_file()
+    assert detail["mixStatus"] == "succeeded"

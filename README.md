@@ -246,8 +246,25 @@ sudo iptables -D INPUT ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
 
 ## 工程编辑与成品提交
 
-`POST /api/jobs/<jobId>/mix?song=0|1` 用本次保留的音轨覆盖当前歌曲的成品与音轨文件，
-返回 202；进度和结果通过同一任务的 GET / SSE 获取。前端 Next 代理原样透传 JSON。
+`POST /api/jobs/<jobId>/mix?song=0|1[&variant=mixed]` 用本次保留的音轨覆盖一首歌的成品与
+音轨文件，返回 202；进度和结果通过同一任务的 GET / SSE 获取。前端 Next 代理原样透传 JSON。
+
+**替换前后是两首歌。** 每首候选里，原曲就是结果本身（`fullTrack`/`stems`/`audioRevision`），
+「替换后」那首是 `mixed` 字段里一份同构的结果（自己的 `fullTrack`、`stems`、`stemUrls`、
+`playback`、`waveforms`、`splitEnabled`、`audioRevision`、`mixConfig`），两首分别编辑、
+分别覆盖，互不影响：
+
+- `editor=replace`（只能 `variant=original`）读原曲的音轨与 `replacedVocal`，产出写进
+  `mixed`（第一次提交时新建，之后每次覆盖它），原曲的成品、音轨、版本与可撤回删除都不变。
+- `editor=tracks` 读哪首覆盖哪首：缺省 `variant=original` 覆盖原曲，`variant=mixed` 读并
+  覆盖替换后那首；`variant=mixed` 时没有 `source=replaced`（那里的 `replaced` 已是普通音轨）。
+- 替换后那首的文件与原曲在同一歌曲目录，带 `mixed_` 前缀；分轨 DELETE/PUT 同样接受
+  `variant=mixed`，`X-Audio-Revision` 按所选那首校验，撤回记录分开记。
+- 原曲重新替换人声、删除/恢复原曲音轨都不再作废替换后那首；`/api/voice/result` 拒绝删除
+  两首歌的成品与保留音轨。
+- 兼容字段：响应里 `mixedTrack`、`playback.mixedTrack`、`waveforms.mix` 镜像替换后那首的
+  成品、试听与波形。旧记录里挂在原曲上的 `mixedTrack` 在加载时迁成单轨的 `mixed`；与原曲
+  `fullTrack` 相同（覆盖式提交的旧形状）时只是同一首歌，直接丢弃。
 
 `tracks` 是完整的最终保留列表（不是部分更新）：前端已经排除删除、静音（M）以及音量为
 −∞ 的轨道。请求里没有 `editorState`/`muted`/`solo`/`projectRevision`，后端也不保存或
@@ -286,14 +303,15 @@ sudo iptables -D INPUT ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
   所以调低音量不会被整体抬回。防削波限幅（−1 dBFS 真峰）**逐轨与成品各过一次**：保留
   音轨要能直接试听而不削顶，成品由这些已带增益的文件求和，不会再把增益应用第二遍。
   输出沿用当前歌曲的采样率、声道与 PCM 位深，并补齐或裁剪到歌曲长度（短轨补静音）。
-- 成品、保留音轨的预览与波形全部就绪后原子提交：`fullTrack` 与 `mixedTrack` 指向同一份
-  新成品 `master_v<版本>_<唯一标识>.wav`。分轨输入会**完整替换** `stems`、`stemUrls`、
+- 成品、保留音轨的预览与波形全部就绪后原子提交：被覆盖那首的 `fullTrack` 指向新成品
+  `[mixed_]master_v<版本>_<唯一标识>.wav`。分轨输入会**完整替换** `stems`、`stemUrls`、
   `playback.stems` 与分轨波形，只保留请求 id 对应的增益后文件，`splitEnabled=true`，
   不与旧 stems 做字典合并；单轨输入时 `stems`/`stemUrls` 为空、`splitEnabled=false`，
   新 `fullTrack` 成为下次单轨编辑的输入。
-- 参与混音的替换人声提交后就是普通音轨：`replacedVocal`、`playback.replacedVocal`、替换
-  波形与 replace 操作结果一并清除；即使本轮没有选用替换结果也清除旧结果，避免下次重复
-  多出一条旧替换车道。
+- 基于原曲的提交（替换编辑器、原曲的普通编辑器）都清除原曲上的 `replacedVocal`、
+  `playback.replacedVocal`、替换波形与 replace 操作结果：替换编辑器已经把它写进替换后那首，
+  原曲覆盖后它对应的人声也已经变了。编辑替换后那首不碰这些字段。
+- `audioRevision` 对每首歌单调递增：替换编辑器写出的版本是 `max(替换后那首的版本, 请求版本) + 1`。
 - `audioRevision` 加 1 并持久化成功后才发布 `mixStatus=succeeded`；新文件用新 URL，避免
   客户端缓存旧音频。混音、波形、试听、发布、保存失败或取消都不更新当前成品与版本，保留
   本轮输入和可撤回文件，只清掉本轮新建的临时产物。成功后才清理无引用的旧文件，因此一次
@@ -317,7 +335,7 @@ sudo iptables -D INPUT ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
 前端不据此初始化控制：首次打开及文件版本更新后，M/S、音量与撤回栈都重新初始化。
 
 旧客户端在成品版本仍为 0 时可以不带请求体，继续使用“替换人声 + drums/bass/other”的固定
-四轨导出。这条兼容路径保留原 EQ、响度补偿和固定文件名，仅更新 `mixedTrack`；它不会提交
+四轨导出。这条兼容路径保留原 EQ、响度补偿和固定文件名，产出落成单轨的替换后那首；它不会提交
 母带或编辑状态。只有结果里还没有 `audioRevision`（本次部署之前生成、且再次 `/split` 命中
 缓存因而没有推进版本）时才会被受理：首次分离音轨就会把版本推到 1 以上，此后无请求体的
 导出一律 409。旧记录里的 `projectRevision`/
@@ -325,8 +343,9 @@ sudo iptables -D INPUT ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
 在加载和响应渲染时被当作未提交设置丢弃并记日志，后端不会按旧设置重新渲染。
 
 `mixStatus` 等运行态不落盘，重启后从结果推导成功。历史列表保留 `audioRevision` 与
-`mixConfig`，按既有约定不返回波形或运行态。一首候选只有一条记录，播放与下载都用覆盖后的
-成品；多首都有成品时 `mixSong=null`，客户端按每首结果判断。
+`mixConfig`，按既有约定不返回波形或运行态。一首候选有替换后那首时列出两条记录（原曲与
+替换后），各自播放、下载与编辑；多首都有替换后那首时 `mixSong=null`，客户端按每首结果判断。
+202 回显的 `mixConfig` 在读输入的那首上（替换编辑器即原曲），成功后同时写在被覆盖的那首上。
 
 生成音乐。`provider` 可传 `minimax_music` 或 `elevenlabs_music`，不传时使用
 `MUSIC_PROVIDER`：

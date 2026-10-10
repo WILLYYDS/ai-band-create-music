@@ -204,9 +204,12 @@ def install_voice_api(
         # （stems 里的 *_v<rev>_*.wav）该走 /stems 的软删除 —— 那里才记撤回、才检查版本。
         # 两者都必须拒绝，否则会留下"结果仍引用、文件已进回收站、还没有撤回记录"的死链。
         protected = [job_result.get("fullTrack"), job_result.get("editorFullTrack")]
-        stems = job_result.get("stems")
-        if isinstance(stems, dict):
-            protected.extend(stems.values())
+        for project in (job_result, job_result.get("mixed")):
+            stems = project.get("stems") if isinstance(project, dict) else None
+            if isinstance(stems, dict):
+                protected.extend(stems.values())
+        if isinstance(job_result.get("mixed"), dict):
+            protected.append(job_result["mixed"].get("fullTrack"))
         if any(_resolves_to(settings, value, result_path) for value in protected):
             raise HTTPException(status_code=409, detail="完整音频或保留音轨不能作为替换产物删除。")
         if not result_path.is_file():

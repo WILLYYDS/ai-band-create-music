@@ -193,3 +193,43 @@ def stored_path_exists(output_dir: Path, value: object) -> bool:
         return output_path_from_url(value, output_dir).is_file()
     except (OSError, ValueError):
         return False
+
+
+def normalize_mixed_song(output: dict[str, Any]) -> bool:
+    """「替换后」是一首独立的歌，存在 `output["mixed"]`，有自己的成品、音轨与版本号。
+
+    旧结果（以及无请求体的旧版导出）把成品挂在原曲的 `mixedTrack` 上：用到替换后那首时
+    （`song_project`、加载、渲染）迁成单轨的 `mixed`。
+    与原曲母带是同一个文件时（覆盖式提交的旧形状）只是同一首歌，直接摘掉。返回是否改过。
+    """
+    if not isinstance(output, dict) or not isinstance(output.get("mixedTrack"), str):
+        return False
+    track = output.pop("mixedTrack")
+    playback = output.get("playback")
+    preview = playback.pop("mixedTrack", None) if isinstance(playback, dict) else None
+    waveforms = output.get("waveforms")
+    waveform = waveforms.pop("mix", None) if isinstance(waveforms, dict) else None
+    if track != output.get("fullTrack"):
+        output["mixed"] = {
+            "audioRevision": (output.get("mixed") or {}).get("audioRevision", 0),
+            "fullTrack": track,
+            "playback": {"fullTrack": preview} if isinstance(preview, str) else {},
+            "durationSeconds": output.get("durationSeconds"),
+            "stems": {},
+            "stemUrls": [],
+            "waveforms": {"full": waveform} if isinstance(waveform, list) else {},
+            "splitEnabled": False,
+            "debug": {},
+        }
+    return True
+
+
+def song_project(output: dict[str, Any] | None, variant: str) -> dict[str, Any] | None:
+    """一首候选里要编辑的那首歌：`original` 是原曲本身，`mixed` 是替换后的那首。"""
+    if not isinstance(output, dict):
+        return None
+    if variant == "original":
+        return output
+    normalize_mixed_song(output)
+    mixed = output.get("mixed")
+    return mixed if variant == "mixed" and isinstance(mixed, dict) else None
