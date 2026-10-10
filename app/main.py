@@ -1819,6 +1819,8 @@ def create_app(
                     target["waveforms"]["full"] = fresh_waveforms["mix"]
                 target["audioRevision"] = revision
                 target["mixConfig"] = mix.model_dump()
+                # 生成记录按它显示这首歌最近一次完成创作的时间。
+                target["updatedAt"] = datetime.now(timezone.utc).isoformat()
                 target.setdefault("debug", {})
                 drop_editor_state(target)
                 if target_variant == "mixed":

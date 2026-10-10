@@ -130,8 +130,8 @@ async function mix(job, song, config, variant = "original") {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(config),
   });
   assert.equal(accepted.response.status, 202, JSON.stringify(accepted.body));
-  assert.ok(trackMixMatches(project(variant)(selected(song)(accepted.body.result)).mixConfig, config),
-    "202 must echo the exact request");
+  const echoed = project(variant)(selected(song)(accepted.body.result));
+  assert.ok(trackMixMatches(echoed.mixConfig, config), "202 must echo the exact request");
   const target = config.editor === "replace" ? "mixed" : variant;
   const sse = await request(`${path}/events`);
   assert.equal(sse.response.status, 200);
@@ -140,7 +140,8 @@ async function mix(job, song, config, variant = "original") {
   assert.equal(detail.mixStatus, "succeeded", JSON.stringify(detail));
   const outputs = [detail.result, ...detail.result.alternatives];
   const output = project(target)(selected(song)(detail.result));
-  assert.equal(completionMixStateFor(detail, outputs, song, target), "done", JSON.stringify(output));
+  assert.equal(completionMixStateFor(detail, outputs, song, target), "done",
+    JSON.stringify(output));
   assert.ok(trackMixMatches(output.mixConfig, config));
   assert.equal(output.audioRevision, config.audioRevision + 1);
   assert.match(output.fullTrack, /^\/api\/music\/output\//);
@@ -156,7 +157,9 @@ async function mix(job, song, config, variant = "original") {
 }
 
 /* ------------------------------------------- 替换人声：产出独立的「替换后」那首歌 */
-const replaceLanes = [{ id: "replaced", source: "replaced" }, { id: "drums", source: "stem", stemId: "drums" }];
+const replaceLanes = [
+  { id: "replaced", source: "replaced" }, { id: "drums", source: "stem", stemId: "drums" },
+];
 const replacedSong = await mix("project-live", 0,
   trackMixRequest("replace", replaceLanes, controls([], [], { replaced: -3 }), 0));
 assert.deepEqual(Object.keys(replacedSong.stems).sort(), ["drums", "replaced"]);
@@ -168,7 +171,8 @@ assert.equal(originalSong.replacedVocal ?? null, null);
 assert.equal(originalSong.mixedTrack, replacedSong.fullTrack);
 // 替换后那首的分轨删除/撤回走同一个代理，按它自己的版本校验。
 const mixedStem = (method, revision) => request("/api/music/jobs/project-live/stems/drums", {
-  method, headers: { "X-Song-Index": "0", "X-Song-Variant": "mixed", "X-Audio-Revision": String(revision) },
+  method,
+  headers: { "X-Song-Index": "0", "X-Song-Variant": "mixed", "X-Audio-Revision": String(revision) },
 });
 assert.equal((await mixedStem("DELETE", 0)).response.status, 409);
 assert.equal((await mixedStem("DELETE", 1)).response.status, 204);

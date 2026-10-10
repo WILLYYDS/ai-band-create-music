@@ -97,6 +97,8 @@ class PlaybackUrls(BaseModel):
 class MusicOutput(BaseModel):
     audioRevision: int = Field(default=0, ge=0)
     mixConfig: TrackMixRequest | None = Field(default=None, exclude_if=lambda value: value is None)
+    # 最近一次完成创作（覆盖）的时间；从未覆盖过时缺省。
+    updatedAt: str | None = Field(default=None, exclude_if=lambda value: value is None)
     songNumber: int | None = Field(default=None, ge=1, le=2, exclude_if=lambda value: value is None)
     fullTrack: str
     playback: PlaybackUrls | None = Field(default=None, exclude_if=lambda value: value is None)

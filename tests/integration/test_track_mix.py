@@ -342,6 +342,10 @@ async def test_the_two_songs_are_edited_and_overwritten_separately(tmp_path, ins
         absolute(settings, mixed["stems"]["drums"]),
     ]
     assert edited["audioRevision"] == 2 and set(edited["stems"]) == {"replaced", "drums"}
+    # 两首各记自己最近一次完成创作的时间，历史列表也带着它。
+    assert mixed["updatedAt"] and edited["updatedAt"] and original["updatedAt"]
+    assert detail["mixed"]["updatedAt"] == edited["updatedAt"]
+    assert detail["updatedAt"] == original["updatedAt"]
     assert original_before.get("audioRevision", 0) == 0 and "mixed" not in original_before
     assert original["audioRevision"] == 1 and set(original["stems"]) == {"vocal", "bass"}
     assert detail["mixed"]["fullTrack"] == edited["fullTrack"]
