@@ -1856,7 +1856,17 @@ def create_app(
             # 清理放在落盘之后（异常时根本走不到这里）：进程若恰好死在这两行之间，只会留下
             # 一批无引用的旧文件，等这首下一次成功提交时再删；反过来先删后写盘，一旦写盘失败
             # 回滚回去的元数据就会指向已经被删掉的文件。
-            cleanup_replaced_files()
+            # 清理只是尽力而为：提交已经落盘，清理失败只记日志，不能把合轨报成失败
+            # （否则前端会拿着旧版本号退回编辑页，重试只会得到 409）。
+            try:
+                cleanup_replaced_files()
+            except Exception:
+                logger.warning(
+                    "post-commit cleanup failed job_id=%s song=%s",
+                    job.job_id,
+                    song,
+                    exc_info=True,
+                )
 
         def restore_result(
             previous_track: object, previous_waveforms: object, previous_playback: object
