@@ -759,3 +759,27 @@ async def test_first_split_failure_keeps_the_previous_song_and_undo(tmp_path, mo
     stored = json.loads((settings.output_dir / "jobs" / job.job_id / "job.json").read_text())
     assert stored["result"] == before
     assert app.state.orchestrator.capacity.active == 0
+
+
+async def test_cleanup_failure_after_a_commit_keeps_the_mix_succeeded(
+    tmp_path, install_stubs, monkeypatch
+):
+    """清理在提交落盘之后：它出错只能记日志，合轨仍然成功、版本照常推进。"""
+    install_stubs()
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    job = seed_job(app, settings)
+    real_glob = Path.glob
+
+    def failing_glob(self, pattern, *args, **kwargs):
+        # 只有提交后的清理会扫 playtrack/；OSError 以外的异常原样冒出来。
+        if self.name == "playtrack":
+            raise RuntimeError("symlink loop")
+        return real_glob(self, pattern, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "glob", failing_glob)
+    async with client(app) as http:
+        output = await commit(http, job, commit_body([track("vocal"), track("drums")]))
+
+    assert output["audioRevision"] == 1
+    assert job.mix_status == "succeeded"
